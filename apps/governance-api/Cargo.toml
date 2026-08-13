@@ -13,6 +13,7 @@ governance-config.workspace = true
 governance-corpus.workspace = true
 governance-domain.workspace = true
 governance-evaluator.workspace = true
+governance-ingestion.workspace = true
 governance-persistence.workspace = true
 governance-policy.workspace = true
 governance-telemetry.workspace = true

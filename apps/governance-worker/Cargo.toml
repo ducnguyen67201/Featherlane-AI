@@ -6,13 +6,19 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
+anyhow.workspace = true
 governance-application.workspace = true
+governance-config.workspace = true
 governance-domain.workspace = true
+governance-ingestion.workspace = true
 governance-persistence.workspace = true
 loco-rs.workspace = true
+sea-orm.workspace = true
 serde.workspace = true
+time.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -3,11 +3,17 @@
 use async_trait::async_trait;
 use governance_domain::{
     EvalRunId, EvaluationSummary, EvidenceBundle, OrganizationId, PolicyBundle, PolicyPack,
-    PolicyPackApproval, PolicyPackId, RuleResult, RunVerdict,
+    PolicyPackApproval, PolicyPackId, PolicyPackStatusChange, RuleResult, RunVerdict,
 };
 use governance_evaluator::evaluate_pack;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod evaluation_runs;
+mod policy_import;
+
+pub use evaluation_runs::*;
+pub use policy_import::*;
 
 #[derive(Debug, Error)]
 pub enum ApplicationError {
@@ -19,6 +25,10 @@ pub enum ApplicationError {
     Forbidden(String),
     #[error("invalid application request: {0}")]
     InvalidRequest(String),
+    #[error("resource state conflicts with this operation: {0}")]
+    Conflict(String),
+    #[error("required service is unavailable: {0}")]
+    Unavailable(String),
 }
 
 #[async_trait]
@@ -38,6 +48,18 @@ pub trait PolicyPackRepository: Send + Sync {
         organization_id: OrganizationId,
         id: PolicyPackId,
         approval: &PolicyPackApproval,
+    ) -> Result<PolicyPack, ApplicationError>;
+    async fn disable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
+    ) -> Result<PolicyPack, ApplicationError>;
+    async fn enable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
     ) -> Result<PolicyPack, ApplicationError>;
 }
 

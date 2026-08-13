@@ -8,6 +8,7 @@ pub struct Model {
     pub id: Uuid,
     pub organization_id: Uuid,
     pub kind: String,
+    pub dedupe_key: Option<String>,
     pub status: String,
     pub payload: Json,
     pub attempts: i32,
@@ -15,6 +16,7 @@ pub struct Model {
     pub lease_expires_at: Option<OffsetDateTime>,
     pub last_error: Option<String>,
     pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

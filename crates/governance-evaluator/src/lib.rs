@@ -12,6 +12,19 @@ pub fn evaluate_rule(rule: &CompiledRule, evidence: &EvidenceBundle) -> RuleResu
         return missing_evidence_result(rule, "trace quality is insufficient for this rule");
     }
 
+    let missing: Vec<&str> = rule
+        .evidence_required
+        .iter()
+        .map(String::as_str)
+        .filter(|requirement| !has_required_evidence(requirement, evidence))
+        .collect();
+    if !missing.is_empty() {
+        return missing_evidence_result(
+            rule,
+            &format!("required evidence was not observed: {}", missing.join(", ")),
+        );
+    }
+
     let triggers: Vec<&NormalizedEvent> = evidence
         .events
         .iter()
@@ -31,7 +44,7 @@ pub fn evaluate_rule(rule: &CompiledRule, evidence: &EvidenceBundle) -> RuleResu
     for trigger in triggers {
         cited.push(trigger.id);
         for assertion in &rule.assertions {
-            match evaluate_assertion(assertion, trigger, &evidence.events) {
+            match evaluate_assertion(assertion, trigger, evidence) {
                 AssertionOutcome::Pass(event_ids) => cited.extend(event_ids),
                 AssertionOutcome::Fail(message, event_ids) => {
                     cited.extend(event_ids);
@@ -106,8 +119,9 @@ enum AssertionOutcome {
 fn evaluate_assertion(
     assertion: &RuleAssertion,
     trigger: &NormalizedEvent,
-    events: &[NormalizedEvent],
+    evidence: &EvidenceBundle,
 ) -> AssertionOutcome {
+    let events = &evidence.events;
     match assertion {
         RuleAssertion::ExistsBefore { matcher } => {
             let matching = events
@@ -162,7 +176,7 @@ fn evaluate_assertion(
             }
         }
         RuleAssertion::TerminalState { state } => match &trigger.ended_at {
-            Some(_) if state_matches(state, events) => AssertionOutcome::Pass(vec![trigger.id]),
+            Some(_) if state_matches(state, evidence) => AssertionOutcome::Pass(vec![trigger.id]),
             Some(_) => AssertionOutcome::Fail(
                 format!("required terminal state {state} was not observed"),
                 vec![],
@@ -174,14 +188,17 @@ fn evaluate_assertion(
     }
 }
 
-fn state_matches(state: &str, events: &[NormalizedEvent]) -> bool {
-    events.iter().any(|event| {
-        event
-            .attributes
-            .get("terminal_state")
-            .and_then(Value::as_str)
-            == Some(state)
-    })
+fn state_matches(state: &str, evidence: &EvidenceBundle) -> bool {
+    evidence.terminal_state.as_deref() == Some(state)
+        || evidence.events.iter().any(|event| {
+            event
+                .attributes
+                .get("terminal_state")
+                .or_else(|| event.attributes.get("featherlane.run.terminal_state"))
+                .or_else(|| event.attributes.get("governance.terminal_state"))
+                .and_then(Value::as_str)
+                == Some(state)
+        })
 }
 
 fn event_matches(event: &NormalizedEvent, matcher: &EventMatcher) -> bool {
@@ -216,6 +233,72 @@ fn event_matches(event: &NormalizedEvent, matcher: &EventMatcher) -> bool {
 fn value_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.')
         .try_fold(value, |current, part| current.get(part))
+}
+
+fn has_required_evidence(requirement: &str, evidence: &EvidenceBundle) -> bool {
+    let requirement = requirement.trim();
+    if requirement == "terminal_state" {
+        return evidence.terminal_state.is_some();
+    }
+
+    if let Some(attribute) = requirement.strip_prefix("attribute:") {
+        let (key, expected) = attribute
+            .split_once('=')
+            .map_or((attribute, None), |(key, value)| (key, Some(value)));
+        return evidence.events.iter().any(|event| {
+            event.attributes.get(key).is_some_and(|value| {
+                expected.is_none_or(|expected| {
+                    value.as_str() == Some(expected)
+                        || serde_json::from_str::<Value>(expected)
+                            .is_ok_and(|parsed| parsed == *value)
+                })
+            })
+        });
+    }
+
+    if let Some((event_type, path)) = requirement.split_once('.')
+        && let Ok(event_type) = serde_json::from_value::<governance_domain::EventType>(
+            Value::String(event_type.to_owned()),
+        )
+    {
+        let supported_path = path.starts_with("input.")
+            || path.starts_with("output.")
+            || path.starts_with("attributes.");
+        if supported_path {
+            return evidence
+                .events
+                .iter()
+                .filter(|event| event.event_type == event_type)
+                .any(|event| event_has_path(event, path));
+        }
+    }
+
+    evidence.events.iter().any(|event| {
+        serde_json::to_value(event.event_type)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .as_deref()
+            == Some(requirement)
+            || event.attributes.contains_key(requirement)
+    })
+}
+
+fn event_has_path(event: &NormalizedEvent, path: &str) -> bool {
+    if let Some(path) = path.strip_prefix("input.") {
+        return value_at_path(&event.input, path).is_some();
+    }
+    if let Some(path) = path.strip_prefix("output.") {
+        return value_at_path(&event.output, path).is_some();
+    }
+    if let Some(path) = path.strip_prefix("attributes.") {
+        return event.attributes.contains_key(path)
+            || value_at_path(
+                &Value::Object(event.attributes.clone().into_iter().collect()),
+                path,
+            )
+            .is_some();
+    }
+    false
 }
 
 fn display_event_type(matcher: &EventMatcher) -> String {
@@ -302,6 +385,7 @@ mod tests {
             trace_id: "trace".to_owned(),
             id: EventId::new(),
             parent_event_id: None,
+            linked_event_ids: vec![],
             sequence,
             started_at: OffsetDateTime::now_utc(),
             ended_at: Some(OffsetDateTime::now_utc()),
@@ -321,16 +405,22 @@ mod tests {
 
     fn evidence(events: Vec<NormalizedEvent>) -> EvidenceBundle {
         EvidenceBundle {
+            schema_version: "1.1".to_owned(),
             organization_id: OrganizationId::new(),
             eval_run_id: EvalRunId::new(),
             invocation_id: InvocationId::new(),
+            invocation_ids: vec![],
             scenario_id: ScenarioId::new(),
             target_version: "git:test".to_owned(),
+            policy_content_sha256: "policy-test".to_owned(),
+            trace_ids: vec!["trace".to_owned()],
+            completion_reason: None,
             terminal_state: Some("completed".to_owned()),
             events,
             side_effects: vec![],
             trace_quality: TraceQualityStatus::Complete,
             trace_defects: vec![],
+            finalized_at: Some(OffsetDateTime::now_utc()),
             evidence_sha256: "test".to_owned(),
         }
     }
@@ -367,5 +457,89 @@ mod tests {
         bundle.trace_quality = TraceQualityStatus::Insufficient;
         let result = evaluate_rule(&rule(), &bundle);
         assert_eq!(result.status, RuleStatus::NotObservable);
+    }
+
+    #[test]
+    fn missing_required_approval_is_not_a_vacuous_pass() {
+        let mut required_rule = rule();
+        required_rule.evidence_required = vec!["human_approval_decision".to_owned()];
+
+        let result = evaluate_rule(&required_rule, &evidence(vec![]));
+
+        assert_eq!(result.status, RuleStatus::NotObservable);
+        assert!(result.message.contains("human_approval_decision"));
+    }
+
+    #[test]
+    fn missing_required_evidence_honors_fail_policy() {
+        let mut required_rule = rule();
+        required_rule.evidence_required = vec!["human_approval_decision".to_owned()];
+        required_rule.on_missing_evidence = MissingEvidencePolicy::Fail;
+
+        let result = evaluate_rule(&required_rule, &evidence(vec![]));
+
+        assert_eq!(result.status, RuleStatus::Fail);
+    }
+
+    #[test]
+    fn approval_from_another_trace_satisfies_required_evidence() {
+        let mut required_rule = rule();
+        required_rule.evidence_required = vec!["human_approval_decision".to_owned()];
+        let mut approval = event(1, EventType::HumanApprovalDecision, "approval");
+        approval.trace_id = "approval-trace".to_owned();
+        approval
+            .attributes
+            .insert("decision".to_owned(), json!("approved"));
+        let mut refund = event(2, EventType::ToolCall, "issue_refund");
+        refund.trace_id = "execution-trace".to_owned();
+        refund.input = json!({"amount": 700.0});
+
+        let result = evaluate_rule(&required_rule, &evidence(vec![approval, refund]));
+
+        assert_eq!(result.status, RuleStatus::Pass);
+    }
+
+    #[test]
+    fn dotted_required_evidence_paths_resolve_against_typed_events() {
+        let mut required_rule = rule();
+        required_rule.evidence_required = vec![
+            "tool_call.input.amount".to_owned(),
+            "human_approval_decision.attributes.decision".to_owned(),
+        ];
+        let mut approval = event(1, EventType::HumanApprovalDecision, "approval");
+        approval
+            .attributes
+            .insert("decision".to_owned(), json!("approved"));
+        let mut refund = event(2, EventType::ToolCall, "issue_refund");
+        refund.input = json!({"amount": 700.0});
+
+        let result = evaluate_rule(&required_rule, &evidence(vec![approval, refund]));
+
+        assert_eq!(result.status, RuleStatus::Pass);
+    }
+
+    #[test]
+    fn attribute_requirements_support_presence_and_typed_values() {
+        let mut observed = event(1, EventType::HumanApprovalDecision, "approval");
+        observed
+            .attributes
+            .insert("decision".to_owned(), json!("approved"));
+        observed
+            .attributes
+            .insert("retry_attempt".to_owned(), json!(2));
+
+        for requirement in [
+            "attribute:decision",
+            "attribute:decision=approved",
+            "attribute:retry_attempt=2",
+        ] {
+            let mut required_rule = rule();
+            required_rule.evidence_required = vec![requirement.to_owned()];
+            assert_eq!(
+                evaluate_rule(&required_rule, &evidence(vec![observed.clone()])).status,
+                RuleStatus::Pass,
+                "{requirement} should match"
+            );
+        }
     }
 }

@@ -13,6 +13,9 @@ server:
       enable: false
     static:
       enable: false
+    limit_payload:
+      enable: true
+      body_limit: 27mb
 
 workers:
   mode: ForegroundBlocking

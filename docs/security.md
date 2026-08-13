@@ -4,6 +4,16 @@
 
 - organization-scoped repository queries and foreign keys;
 - schema-validated JSON policy imports with deterministic rule types and no embedded scripts;
+- bounded multipart policy uploads with magic-byte format checks and sanitized filenames;
+- ZIP entry/count and decompression limits for DOCX; encrypted and oversized PDFs fail closed;
+- content-addressed object keys and SHA-256 verification before every worker parse;
+- ID-only PostgreSQL queue payloads and compare-and-set import state transitions;
+- source text is untrusted data: extraction has no tools, uses strict structured output,
+  verifies exact excerpt substrings, deduplicates candidates, and requires human review;
+- model-provider controls default to zero-retention requirements, deny data collection,
+  and disable provider/model fallbacks; no provider is enabled by default outside Compose;
+- model names, prompt versions, parser versions, coverage, source decisions, and candidate
+  before/after payloads are persisted as audit provenance;
 - transactional policy aggregates in PostgreSQL; no runtime filesystem policy loader;
 - secret references instead of secret values in target manifests;
 - synthetic targets and a resettable mock side-effect ledger;
@@ -31,6 +41,12 @@ events, and PostgreSQL row-level security as a second tenant boundary. Also add
 envelope encryption for retained evidence, object-store retention policies,
 signed report exports, KMS-backed secret references, rate limits, request-body
 limits, audit-log export, and a reviewed deletion workflow.
+
+Before enabling a hosted extraction provider, complete vendor review, approve the
+exact model, verify retention and training terms, restrict egress, rotate the API
+key through a secret manager, and calibrate candidates against a human-labeled set.
+The deterministic local heuristic exists for development only and is visibly
+disclosed in each import's coverage warnings.
 
 Do not capture raw prompts, model outputs, audio, or tool payloads by default.
 Customers must explicitly allowlist content fields needed by an approved rule.

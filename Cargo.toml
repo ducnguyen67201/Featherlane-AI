@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/governance-domain",
+  "crates/governance-ingestion",
   "crates/governance-application",
   "crates/governance-persistence",
   "crates/governance-policy",
@@ -29,13 +30,14 @@ rust-version = "1.95"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["json", "macros"] }
+axum = { version = "0.8", features = ["json", "macros", "multipart"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 governance-application = { path = "crates/governance-application" }
 governance-config = { path = "crates/governance-config" }
 governance-corpus = { path = "crates/governance-corpus" }
 governance-domain = { path = "crates/governance-domain" }
 governance-evaluator = { path = "crates/governance-evaluator" }
+governance-ingestion = { path = "crates/governance-ingestion" }
 governance-persistence = { path = "crates/governance-persistence" }
 governance-policy = { path = "crates/governance-policy" }
 governance-reports = { path = "crates/governance-reports" }
@@ -43,8 +45,17 @@ governance-targets = { path = "crates/governance-targets" }
 governance-telemetry = { path = "crates/governance-telemetry" }
 hex = "0.4"
 http = "1.3"
+httpdate = "1.0"
 futures-util = "0.3"
+docx-rs = { version = "0.4.22", default-features = false }
+base64 = "0.23.1"
+flate2 = "1.1.9"
 loco-rs = { version = "1.0.0", default-features = false, features = ["cli", "with-db", "worker"] }
+opendal = { version = "0.58.1", default-features = false, features = ["executors-tokio", "reqwest-rustls-tls", "services-memory", "services-s3"] }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }
+pdf-extract = "0.12.0"
+prost = "0.14.4"
+rand = "0.10.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 schemars = { version = "1.0", features = ["uuid1"] }
 sea-orm = { version = "2.0", features = ["sqlx-postgres", "runtime-tokio-rustls", "with-json", "with-time", "with-uuid"] }
@@ -60,7 +71,8 @@ tower-http = { version = "0.6", features = ["cors", "limit", "request-id", "trac
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2.5", features = ["serde"] }
-uuid = { version = "1.18", features = ["serde", "v4", "v7"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5", "v7"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

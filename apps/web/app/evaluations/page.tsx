@@ -2,17 +2,18 @@ import { Download, Filter } from "lucide-react";
 import { PageHeader, SectionHeader } from "@/components/ui";
 import { RunEvaluationButton } from "@/components/run-evaluation-button";
 import { RunTable } from "@/components/run-table";
-import { getEvaluations } from "@/lib/api";
+import { getEvaluations, getPolicies } from "@/lib/api";
 
 export default async function EvaluationsPage() {
-  const runs = await getEvaluations();
+  const [runs, policies] = await Promise.all([getEvaluations(), getPolicies()]);
+  const policyPackId = policies.data?.find((policy) => policy.status === "approved")?.id;
   return (
     <div className="page">
       <PageHeader
         eyebrow="Evidence / Evaluations"
         title="Evaluation runs"
         description="CI-triggered and active test executions, with separate pass, fail, and inconclusive outcomes."
-        action={<RunEvaluationButton />}
+        action={<RunEvaluationButton policyPackId={policyPackId} />}
       />
       <section className="panel">
         <div className="table-toolbar">

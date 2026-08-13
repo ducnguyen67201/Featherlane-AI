@@ -1,0 +1,44 @@
+{
+  "resourceSpans": [{
+    "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "refund-workflow"}}]},
+    "scopeSpans": [{
+      "scope": {"name": "featherlane.fixture", "version": "1.0"},
+      "spans": [
+        {
+          "traceId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "spanId": "bbbbbbbbbbbbbbb1",
+          "name": "issue_refund",
+          "kind": 1,
+          "startTimeUnixNano": "1786597200020000000",
+          "endTimeUnixNano": "1786597200030000000",
+          "links": [{"traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "spanId": "aaaaaaaaaaaaaaaa"}],
+          "attributes": [
+            {"key": "featherlane.eval_run.id", "value": {"stringValue": "01914f10-6c00-7c3e-8ed8-32408de93a02"}},
+            {"key": "featherlane.invocation.id", "value": {"stringValue": "01914f10-6c00-7c3e-8ed8-32408de93a03"}},
+            {"key": "featherlane.scenario.id", "value": {"stringValue": "01914f10-6c00-7c3e-8ed8-32408de93a04"}},
+            {"key": "featherlane.external_run.id", "value": {"stringValue": "workflow-fixture-42"}},
+            {"key": "featherlane.event.type", "value": {"stringValue": "tool_call"}},
+            {"key": "governance.input", "value": {"stringValue": "{\"amount\":700}"}}
+          ]
+        },
+        {
+          "traceId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "spanId": "bbbbbbbbbbbbbbb2",
+          "parentSpanId": "bbbbbbbbbbbbbbb1",
+          "name": "refund completed",
+          "kind": 1,
+          "startTimeUnixNano": "1786597200040000000",
+          "endTimeUnixNano": "1786597200050000000",
+          "attributes": [
+            {"key": "featherlane.eval_run.id", "value": {"stringValue": "01914f10-6c00-7c3e-8ed8-32408de93a02"}},
+            {"key": "featherlane.invocation.id", "value": {"stringValue": "01914f10-6c00-7c3e-8ed8-32408de93a03"}},
+            {"key": "featherlane.scenario.id", "value": {"stringValue": "01914f10-6c00-7c3e-8ed8-32408de93a04"}},
+            {"key": "featherlane.event.type", "value": {"stringValue": "final_output"}},
+            {"key": "featherlane.run.terminal", "value": {"boolValue": true}},
+            {"key": "featherlane.run.terminal_state", "value": {"stringValue": "completed"}}
+          ]
+        }
+      ]
+    }]
+  }]
+}

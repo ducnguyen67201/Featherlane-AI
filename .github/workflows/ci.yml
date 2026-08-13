@@ -11,6 +11,22 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: featherlane_test
+          POSTGRES_USER: featherlane
+          POSTGRES_PASSWORD: featherlane
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U featherlane -d featherlane_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgres://featherlane:featherlane@localhost:5432/featherlane_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,6 +37,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: cargo build --workspace --release --locked
 
   web:
     runs-on: ubuntu-latest
@@ -54,4 +71,9 @@ jobs:
           echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
           echo "GOOGLE_CLIENT_ID=ci-build-only.apps.googleusercontent.com" >> "$GITHUB_ENV"
           echo "GOOGLE_CLIENT_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "MINIO_ROOT_USER=ci-minio-admin" >> "$GITHUB_ENV"
+          echo "MINIO_ROOT_PASSWORD=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "OBJECT_STORE_ACCESS_KEY_ID=ci-featherlane-service" >> "$GITHUB_ENV"
+          echo "OBJECT_STORE_SECRET_ACCESS_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
       - run: docker compose config --quiet
