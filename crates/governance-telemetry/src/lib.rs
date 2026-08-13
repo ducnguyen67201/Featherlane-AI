@@ -4,11 +4,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use governance_domain::{
     Actor, ActorType, EvalRunId, EventId, EventType, EvidenceBundle, InvocationId, NormalizedEvent,
-    OrganizationId, ScenarioId, TraceDefect, TraceQualityStatus,
+    ObservedEvent, OrganizationId, ScenarioId, TraceDefect, TraceQualityStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +46,7 @@ impl Default for RedactionPolicy {
                 "governance.invocation_id".to_owned(),
                 "governance.scenario_id".to_owned(),
                 "governance.terminal_state".to_owned(),
+                "terminal_state".to_owned(),
                 "decision".to_owned(),
                 "retry_attempt".to_owned(),
             ]),
@@ -58,6 +60,74 @@ impl Default for RedactionPolicy {
             ],
         }
     }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum NormalizationError {
+    #[error("inline evidence contains more than 1000 observations")]
+    TooManyObservations,
+    #[error("inline evidence contains an empty event name")]
+    EmptyEventName,
+}
+
+/// Converts untrusted wrapper observations into server-owned normalized events.
+///
+/// # Errors
+///
+/// Returns an error when the observation count exceeds the contract limit or
+/// an observation has no name.
+pub fn normalize_observations(
+    context: NormalizationContext,
+    trace_id: &str,
+    target_id: &str,
+    mut observations: Vec<ObservedEvent>,
+    policy: &RedactionPolicy,
+) -> Result<Vec<NormalizedEvent>, NormalizationError> {
+    if observations.len() > 1_000 {
+        return Err(NormalizationError::TooManyObservations);
+    }
+    if observations
+        .iter()
+        .any(|event| event.name.trim().is_empty())
+    {
+        return Err(NormalizationError::EmptyEventName);
+    }
+    let ids: Vec<EventId> = observations.iter().map(|_| EventId::new()).collect();
+    let root_id = ids.first().copied();
+    let now = OffsetDateTime::now_utc();
+    Ok(observations
+        .iter_mut()
+        .enumerate()
+        .map(|(index, observation)| {
+            redact_nested(&mut observation.input, &policy.sensitive_key_fragments);
+            redact_nested(&mut observation.output, &policy.sensitive_key_fragments);
+            policy.redact_attributes(&mut observation.attributes);
+            if observation.actor.id.trim().is_empty() {
+                target_id.clone_into(&mut observation.actor.id);
+            }
+            NormalizedEvent {
+                schema_version: "1.0".to_owned(),
+                organization_id: context.organization_id,
+                eval_run_id: context.eval_run_id,
+                invocation_id: context.invocation_id,
+                scenario_id: context.scenario_id,
+                trace_id: trace_id.to_owned(),
+                id: ids[index],
+                parent_event_id: if index == 0 { None } else { root_id },
+                sequence: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                started_at: now,
+                ended_at: Some(now),
+                actor: observation.actor.clone(),
+                event_type: observation.event_type,
+                name: observation.name.clone(),
+                input: observation.input.clone(),
+                output: observation.output.clone(),
+                attributes: observation.attributes.clone(),
+                source_span_id: None,
+                redacted: true,
+            }
+        })
+        .collect())
 }
 
 impl RedactionPolicy {
@@ -374,6 +444,51 @@ mod tests {
             defects
                 .iter()
                 .any(|defect| defect.code == "missing_terminal")
+        );
+    }
+
+    #[test]
+    fn inline_normalization_owns_context_and_redacts_nested_secrets() {
+        let context = NormalizationContext {
+            organization_id: OrganizationId::new(),
+            eval_run_id: EvalRunId::new(),
+            invocation_id: InvocationId::new(),
+            scenario_id: ScenarioId::new(),
+        };
+        let observations = vec![ObservedEvent {
+            event_type: EventType::FinalOutput,
+            name: "done".to_owned(),
+            actor: Actor {
+                actor_type: ActorType::Agent,
+                id: String::new(),
+            },
+            input: serde_json::json!({"nested": {"api_key": "remove", "safe": true}}),
+            output: serde_json::json!({"token": "remove", "message": "ok"}),
+            attributes: BTreeMap::from([
+                ("terminal_state".to_owned(), serde_json::json!("completed")),
+                ("raw.prompt".to_owned(), serde_json::json!("remove")),
+            ]),
+        }];
+        let events = normalize_observations(
+            context,
+            "server-trace",
+            "registered-target",
+            observations,
+            &RedactionPolicy::default(),
+        )
+        .expect("observations should normalize");
+        assert_eq!(events[0].organization_id, context.organization_id);
+        assert_eq!(events[0].eval_run_id, context.eval_run_id);
+        assert_eq!(events[0].trace_id, "server-trace");
+        assert_eq!(events[0].actor.id, "registered-target");
+        assert_eq!(
+            events[0].input,
+            serde_json::json!({"nested": {"safe": true}})
+        );
+        assert_eq!(events[0].output, serde_json::json!({"message": "ok"}));
+        assert_eq!(
+            events[0].attributes,
+            BTreeMap::from([("terminal_state".to_owned(), serde_json::json!("completed"))])
         );
     }
 }

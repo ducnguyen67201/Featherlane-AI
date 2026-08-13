@@ -1,6 +1,9 @@
 import type { ActivityPoint } from "@/lib/types";
 
 export function ActivityChart({ data }: { data: ActivityPoint[] }) {
+  if (data.length === 0) {
+    return <div className="policy-empty"><p>No evaluation activity has been persisted yet.</p></div>;
+  }
   const max = Math.max(...data.map((point) => point.passed + point.failed + point.inconclusive), 1);
   return (
     <div className="chart-wrap">

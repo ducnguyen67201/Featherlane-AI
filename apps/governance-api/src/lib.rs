@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock};
 
 pub mod loco_app;
 
@@ -12,19 +9,23 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use governance_application::{ActivityPoint, DashboardSnapshot, RunListItem};
+use governance_application::{ActivityPoint, DashboardSnapshot, RunListItem, StoredEvaluationRun};
 use governance_corpus::PINNED_SNAPSHOT;
 use governance_domain::{
-    Actor, ActorType, CompiledRule, EvalRunId, EventId, EventType, EvidenceBundle, InvocationId,
-    NormalizedEvent, Obligation, ObligationId, OrganizationId, PolicyBundle, PolicyPack,
-    PolicyPackId, ReviewStatus, ReviewerApproval, RunVerdict, ScenarioId, Source, SourceConfidence,
-    SourceId, SourceLocator, SourceType, TraceQualityStatus,
+    CompiledRule, EvalRunId, EventType, NormalizedEvent, Obligation, ObligationId, OrganizationId,
+    PolicyBundle, PolicyPack, PolicyPackId, ReviewStatus, ReviewerApproval, RunVerdict, Source,
+    SourceConfidence, SourceId, SourceLocator, SourceType, TargetId, TraceQualityStatus,
 };
 use governance_policy::{PolicyDocument, compile_policy_document};
+use governance_targets::{
+    CapabilityReport, DriverType, EvidenceMode, RegisteredTarget, ScenarioDefinition,
+    TargetEnvironment, TargetManifest, validate_registration,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
@@ -48,8 +49,17 @@ pub struct TargetView {
     pub driver: String,
     pub environment: String,
     pub status: String,
-    pub trace_coverage: f64,
-    pub last_evaluated: String,
+    pub issues: Vec<String>,
+    pub checked_at: String,
+    pub latest_trace_quality: Option<TraceQualityStatus>,
+    pub last_evaluated: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TargetDetailView {
+    #[serde(flatten)]
+    pub summary: TargetView,
+    pub manifest: TargetManifest,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -63,11 +73,12 @@ pub struct EvaluationView {
     pub failed: usize,
     pub inconclusive: usize,
     pub duration_ms: u64,
-    pub cost_usd: f64,
+    pub cost_usd: Option<f64>,
     pub created_at: String,
     pub trace_quality: TraceQualityStatus,
     pub findings: Vec<FindingView>,
     pub timeline: Vec<TimelineItem>,
+    pub summary: governance_domain::EvaluationSummary,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -121,16 +132,27 @@ pub struct JurisdictionView {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateEvaluationRequest {
+    pub target_id: TargetId,
+    pub policy_pack_id: PolicyPackId,
+    pub scenario: ScenarioDefinition,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CreateTargetRequest {
+    pub name: String,
+    pub key: String,
+    pub version: String,
+    pub environment: TargetEnvironment,
+    pub driver_type: DriverType,
+    pub endpoint: String,
     #[serde(default)]
-    pub policy_pack_id: Option<PolicyPackId>,
-    #[serde(default = "default_target")]
-    pub target: String,
+    pub reset_endpoint: Option<String>,
     #[serde(default)]
-    pub simulate_missing_approval: bool,
-    #[serde(default)]
-    pub simulate_missing_trace: bool,
+    pub auth_secret_ref: Option<String>,
+    #[serde(default = "default_target_timeout")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -175,8 +197,8 @@ pub struct ApprovePolicyPackRequest {
     pub notes: String,
 }
 
-fn default_target() -> String {
-    "refund-agent-staging".to_owned()
+fn default_target_timeout() -> u64 {
+    30
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -206,7 +228,7 @@ impl ApiError {
     fn bad_request(detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            title: "Invalid policy import",
+            title: "Invalid request",
             detail: detail.into(),
         }
     }
@@ -230,6 +252,76 @@ impl ApiError {
 
 pub(crate) fn default_organization_id() -> OrganizationId {
     OrganizationId(Uuid::from_u128(1))
+}
+
+pub(crate) fn build_registered_target(
+    organization_id: OrganizationId,
+    request: CreateTargetRequest,
+    capability: CapabilityReport,
+) -> Result<RegisteredTarget, ApiError> {
+    let manifest = TargetManifest {
+        schema_version: "1.0".to_owned(),
+        target_id: request.key,
+        target_version: request.version,
+        driver_type: request.driver_type,
+        endpoint: request.endpoint,
+        reset_endpoint: request.reset_endpoint,
+        auth_secret_ref: request.auth_secret_ref,
+        timeout_seconds: request.timeout_seconds,
+        evidence_mode: EvidenceMode::Inline,
+        production_credentials_allowed: false,
+    };
+    validate_registration(&request.name, request.environment, &manifest)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(RegisteredTarget {
+        id: TargetId::new(),
+        organization_id,
+        name: request.name.trim().to_owned(),
+        environment: request.environment,
+        manifest,
+        capability,
+        created_at: OffsetDateTime::now_utc(),
+    })
+}
+
+pub(crate) fn target_view(
+    target: &RegisteredTarget,
+    latest: Option<&StoredEvaluationRun>,
+) -> TargetView {
+    TargetView {
+        id: target.id.to_string(),
+        name: target.name.clone(),
+        version: target.manifest.target_version.clone(),
+        driver: enum_label(target.manifest.driver_type),
+        environment: enum_label(target.environment),
+        status: if target.capability.reachable {
+            "healthy"
+        } else {
+            "degraded"
+        }
+        .to_owned(),
+        issues: target.capability.issues.clone(),
+        checked_at: rfc3339(target.capability.checked_at),
+        latest_trace_quality: latest.map(|run| run.evidence.trace_quality),
+        last_evaluated: latest.map(|run| rfc3339(run.completed_at)),
+    }
+}
+
+pub(crate) fn target_detail_view(
+    target: &RegisteredTarget,
+    latest: Option<&StoredEvaluationRun>,
+) -> TargetDetailView {
+    TargetDetailView {
+        summary: target_view(target, latest),
+        manifest: target.manifest.clone(),
+    }
+}
+
+fn enum_label<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 pub(crate) fn build_policy_bundle(
@@ -350,26 +442,22 @@ pub(crate) fn policy_pack_view(
     }
 }
 
-pub(crate) fn evaluation_view(
-    request: CreateEvaluationRequest,
-    pack: &PolicyPack,
-    evidence: &EvidenceBundle,
-    summary: &governance_domain::EvaluationSummary,
-) -> EvaluationView {
+pub(crate) fn evaluation_view(run: &StoredEvaluationRun) -> EvaluationView {
     EvaluationView {
-        id: summary.eval_run_id,
-        target: request.target,
-        target_version: evidence.target_version.clone(),
-        policy_pack: pack.key.clone(),
-        verdict: summary.verdict,
-        passed: summary.passed,
-        failed: summary.failed,
-        inconclusive: summary.inconclusive,
-        duration_ms: 2_418,
-        cost_usd: 0.18,
-        created_at: OffsetDateTime::now_utc().to_string(),
-        trace_quality: evidence.trace_quality,
-        findings: summary
+        id: run.summary.eval_run_id,
+        target: run.target_name.clone(),
+        target_version: run.target_version.clone(),
+        policy_pack: run.policy_pack_key.clone(),
+        verdict: run.summary.verdict,
+        passed: run.summary.passed,
+        failed: run.summary.failed,
+        inconclusive: run.summary.inconclusive,
+        duration_ms: run.duration_ms(),
+        cost_usd: None,
+        created_at: rfc3339(run.created_at),
+        trace_quality: run.evidence.trace_quality,
+        findings: run
+            .summary
             .results
             .iter()
             .map(|result| FindingView {
@@ -379,8 +467,13 @@ pub(crate) fn evaluation_view(
                 message: result.message.clone(),
             })
             .collect(),
-        timeline: evidence.events.iter().map(timeline_item).collect(),
+        timeline: run.evidence.events.iter().map(timeline_item).collect(),
+        summary: run.summary.clone(),
     }
+}
+
+pub(crate) fn rfc3339(value: OffsetDateTime) -> String {
+    value.format(&Rfc3339).unwrap_or_else(|_| value.to_string())
 }
 
 impl IntoResponse for ApiError {
@@ -538,128 +631,6 @@ fn corpus_catalog() -> Vec<CorpusView> {
     }]
 }
 
-pub(crate) fn demo_evidence(
-    organization_id: OrganizationId,
-    missing_approval: bool,
-    missing_trace: bool,
-) -> EvidenceBundle {
-    let eval_run_id = EvalRunId::new();
-    let invocation_id = InvocationId::new();
-    let scenario_id = ScenarioId::new();
-    let now = OffsetDateTime::now_utc();
-    let mut events = Vec::new();
-    events.push(event(
-        organization_id,
-        eval_run_id,
-        invocation_id,
-        scenario_id,
-        1,
-        EventType::ScenarioInput,
-        "refund request",
-        json!({"amount": 700}),
-        BTreeMap::new(),
-    ));
-    if !missing_approval {
-        events.push(event(
-            organization_id,
-            eval_run_id,
-            invocation_id,
-            scenario_id,
-            2,
-            EventType::HumanApprovalDecision,
-            "approval",
-            Value::Null,
-            BTreeMap::from([("decision".to_owned(), json!("approved"))]),
-        ));
-    }
-    events.push(event(
-        organization_id,
-        eval_run_id,
-        invocation_id,
-        scenario_id,
-        3,
-        EventType::ToolCall,
-        "issue_refund",
-        json!({"amount": 700.0, "currency": "USD"}),
-        BTreeMap::new(),
-    ));
-    if !missing_trace {
-        events.push(event(
-            organization_id,
-            eval_run_id,
-            invocation_id,
-            scenario_id,
-            4,
-            EventType::FinalOutput,
-            "refund completed",
-            Value::Null,
-            BTreeMap::from([("terminal_state".to_owned(), json!("completed"))]),
-        ));
-    }
-    EvidenceBundle {
-        organization_id,
-        eval_run_id,
-        invocation_id,
-        scenario_id,
-        target_version: "git:demo-new".to_owned(),
-        terminal_state: (!missing_trace).then(|| "completed".to_owned()),
-        events,
-        side_effects: vec![json!({"type": "refund", "amount": 700})],
-        trace_quality: if missing_trace {
-            TraceQualityStatus::Insufficient
-        } else {
-            TraceQualityStatus::Complete
-        },
-        trace_defects: vec![],
-        evidence_sha256: format!("demo-{now}"),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn event(
-    organization_id: OrganizationId,
-    eval_run_id: EvalRunId,
-    invocation_id: InvocationId,
-    scenario_id: ScenarioId,
-    sequence: u64,
-    event_type: EventType,
-    name: &str,
-    input: Value,
-    attributes: BTreeMap<String, Value>,
-) -> NormalizedEvent {
-    NormalizedEvent {
-        schema_version: "1.0".to_owned(),
-        organization_id,
-        eval_run_id,
-        invocation_id,
-        scenario_id,
-        trace_id: "demo-trace".to_owned(),
-        id: EventId::new(),
-        parent_event_id: None,
-        sequence,
-        started_at: OffsetDateTime::now_utc(),
-        ended_at: Some(OffsetDateTime::now_utc()),
-        actor: Actor {
-            actor_type: if matches!(
-                event_type,
-                EventType::HumanApprovalRequest | EventType::HumanApprovalDecision
-            ) {
-                ActorType::Human
-            } else {
-                ActorType::Agent
-            },
-            id: "refund-agent".to_owned(),
-        },
-        event_type,
-        name: name.to_owned(),
-        input,
-        output: Value::Null,
-        attributes,
-        source_span_id: Some(format!("span-{sequence}")),
-        redacted: true,
-    }
-}
-
 pub(crate) fn timeline_item(event: &NormalizedEvent) -> TimelineItem {
     TimelineItem {
         sequence: event.sequence,
@@ -676,80 +647,11 @@ pub(crate) fn timeline_item(event: &NormalizedEvent) -> TimelineItem {
 }
 
 fn demo_targets() -> Vec<TargetView> {
-    vec![
-        TargetView {
-            id: "refund-agent-staging".to_owned(),
-            name: "Refund Agent".to_owned(),
-            version: "git:4e6a9c1".to_owned(),
-            driver: "HTTP text".to_owned(),
-            environment: "Staging".to_owned(),
-            status: "healthy".to_owned(),
-            trace_coverage: 98.4,
-            last_evaluated: "4 minutes ago".to_owned(),
-        },
-        TargetView {
-            id: "claims-workflow".to_owned(),
-            name: "Claims Workflow".to_owned(),
-            version: "git:9bd21f0".to_owned(),
-            driver: "Webhook".to_owned(),
-            environment: "Staging".to_owned(),
-            status: "degraded".to_owned(),
-            trace_coverage: 82.7,
-            last_evaluated: "31 minutes ago".to_owned(),
-        },
-        TargetView {
-            id: "support-triage".to_owned(),
-            name: "Support Triage".to_owned(),
-            version: "git:2c51aa4".to_owned(),
-            driver: "HTTP text".to_owned(),
-            environment: "Preview".to_owned(),
-            status: "healthy".to_owned(),
-            trace_coverage: 96.1,
-            last_evaluated: "2 hours ago".to_owned(),
-        },
-    ]
+    Vec::new()
 }
 
 fn demo_runs() -> Vec<EvaluationView> {
-    [
-        ("Refund Agent", RunVerdict::Pass, 14, 0, 0, 2_184, 0.21),
-        (
-            "Claims Workflow",
-            RunVerdict::Inconclusive,
-            9,
-            0,
-            3,
-            5_821,
-            0.46,
-        ),
-        ("Support Triage", RunVerdict::Fail, 11, 2, 0, 3_405, 0.29),
-        ("Refund Agent", RunVerdict::Pass, 14, 0, 0, 2_361, 0.22),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(
-        |(index, (target, verdict, passed, failed, inconclusive, duration, cost))| EvaluationView {
-            id: EvalRunId::new(),
-            target: target.to_owned(),
-            target_version: format!("git:demo-{index}"),
-            policy_pack: "agent-operational-governance-v1".to_owned(),
-            verdict,
-            passed,
-            failed,
-            inconclusive,
-            duration_ms: duration,
-            cost_usd: cost,
-            created_at: format!("2026-08-13T0{}:00:00Z", 4_usize.saturating_sub(index)),
-            trace_quality: if verdict == RunVerdict::Inconclusive {
-                TraceQualityStatus::Degraded
-            } else {
-                TraceQualityStatus::Complete
-            },
-            findings: vec![],
-            timeline: vec![],
-        },
-    )
-    .collect()
+    Vec::new()
 }
 
 fn demo_activity() -> Vec<ActivityPoint> {

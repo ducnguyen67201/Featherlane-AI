@@ -29,10 +29,10 @@ describe("evaluation BFF", () => {
   it("forwards an authorized evaluation and preserves the upstream response", async () => {
     getCurrentSessionMock.mockResolvedValue({ user: { id: "user-1" } });
     fetchMock.mockResolvedValue(new Response("{\"id\":\"run-1\"}", {
-      status: 202,
+      status: 201,
       headers: { "content-type": "application/json; charset=utf-8" },
     }));
-    const body = "{\"target\":\"refund-agent-staging\"}";
+    const body = "{\"target_id\":\"target-1\",\"policy_pack_id\":\"pack-1\",\"scenario\":{}}";
 
     const response = await POST(new Request("http://localhost/api/evaluations", {
       method: "POST",
@@ -47,7 +47,7 @@ describe("evaluation BFF", () => {
         body,
       }),
     );
-    expect(response.status).toBe(202);
+    expect(response.status).toBe(201);
     expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
     await expect(response.json()).resolves.toEqual({ id: "run-1" });
   });

@@ -1,5 +1,6 @@
 import type {
   AgentTarget,
+  AgentTargetDetail,
   Corpus,
   DashboardSnapshot,
   Evaluation,
@@ -25,17 +26,35 @@ async function getJson<T>(path: string, fallback: T): Promise<T> {
   }
 }
 
+async function getJsonRequired<T>(path: string): Promise<T> {
+  await requireSession();
+  const response = await fetch(`${API_URL}${path}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(3_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Governance API request failed with status ${response.status}.`);
+  }
+  return (await response.json()) as T;
+}
+
 export function getOverview(): Promise<DashboardSnapshot> {
   return getJson("/v1/overview", seed.overview);
 }
 
 export function getEvaluations(): Promise<Evaluation[]> {
-  return getJson("/v1/evaluations", seed.evaluations);
+  return getJsonRequired("/v1/evaluations");
 }
 
-export function getEvaluation(id: string): Promise<Evaluation> {
-  const fallback = seed.evaluations.find((run) => run.id === id) ?? seed.evaluations[0];
-  return getJson(`/v1/evaluations/${encodeURIComponent(id)}`, fallback);
+export async function getEvaluation(id: string): Promise<Evaluation | null> {
+  await requireSession();
+  const response = await fetch(`${API_URL}/v1/evaluations/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(3_000),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Governance API request failed with status ${response.status}.`);
+  return (await response.json()) as Evaluation;
 }
 
 export function getPolicies(): Promise<PolicyPack[]> {
@@ -47,7 +66,18 @@ export function getPolicyPack(id: string): Promise<PolicyPackDetail | null> {
 }
 
 export function getAgents(): Promise<AgentTarget[]> {
-  return getJson("/v1/targets", seed.agents);
+  return getJsonRequired("/v1/targets");
+}
+
+export async function getAgent(id: string): Promise<AgentTargetDetail | null> {
+  await requireSession();
+  const response = await fetch(`${API_URL}/v1/targets/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(3_000),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Governance API request failed with status ${response.status}.`);
+  return (await response.json()) as AgentTargetDetail;
 }
 
 export function getCorpus(setName: string): Promise<Corpus> {

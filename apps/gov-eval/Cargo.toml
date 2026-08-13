@@ -11,7 +11,9 @@ clap.workspace = true
 governance-domain.workspace = true
 governance-evaluator.workspace = true
 governance-reports.workspace = true
+governance-targets.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

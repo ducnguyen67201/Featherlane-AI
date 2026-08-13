@@ -1701,7 +1701,9 @@ dependencies = [
  "governance-domain",
  "governance-evaluator",
  "governance-reports",
+ "governance-targets",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -1720,6 +1722,7 @@ dependencies = [
  "governance-migration",
  "governance-persistence",
  "governance-policy",
+ "governance-targets",
  "governance-telemetry",
  "governance-worker",
  "http",
@@ -1743,8 +1746,13 @@ dependencies = [
  "async-trait",
  "governance-domain",
  "governance-evaluator",
+ "governance-targets",
+ "governance-telemetry",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
+ "time",
+ "tracing",
 ]
 
 [[package]]
@@ -1805,6 +1813,8 @@ dependencies = [
  "async-trait",
  "governance-application",
  "governance-domain",
+ "governance-targets",
+ "governance-telemetry",
  "sea-orm",
  "serde",
  "serde_json",
@@ -1851,12 +1861,15 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "futures-util",
  "governance-domain",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "time",
  "tokio",
+ "url",
  "uuid",
 ]
 
@@ -1868,6 +1881,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -3552,6 +3566,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "governance-domain",
+ "governance-targets",
  "serde",
  "serde_json",
  "tokio",
@@ -5211,6 +5227,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

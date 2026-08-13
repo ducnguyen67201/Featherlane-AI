@@ -56,11 +56,21 @@ export interface Evaluation {
   failed: number;
   inconclusive: number;
   duration_ms: number;
-  cost_usd: number;
+  cost_usd: number | null;
   created_at: string;
   trace_quality: TraceQuality;
   findings: Finding[];
   timeline: TimelineItem[];
+  summary: EvaluationSummary;
+}
+
+export interface EvaluationSummary {
+  eval_run_id: string;
+  verdict: Verdict;
+  results: Array<Finding & { id: string; evidence_event_ids: string[] }>;
+  passed: number;
+  failed: number;
+  inconclusive: number;
 }
 
 export interface PolicyPack {
@@ -101,8 +111,52 @@ export interface AgentTarget {
   driver: string;
   environment: string;
   status: string;
-  trace_coverage: number;
-  last_evaluated: string;
+  issues: string[];
+  checked_at: string;
+  latest_trace_quality: TraceQuality | null;
+  last_evaluated: string | null;
+}
+
+export type DriverType = "http_text" | "webhook";
+export type TargetEnvironment = "staging" | "preview" | "sandbox";
+
+export interface TargetManifest {
+  schema_version: "1.0";
+  target_id: string;
+  target_version: string;
+  driver_type: DriverType;
+  endpoint: string;
+  reset_endpoint: string | null;
+  auth_secret_ref: string | null;
+  timeout_seconds: number;
+  evidence_mode: "inline";
+  production_credentials_allowed: false;
+}
+
+export interface AgentTargetDetail extends AgentTarget {
+  manifest: TargetManifest;
+}
+
+export interface CreateTargetInput {
+  name: string;
+  key: string;
+  version: string;
+  environment: TargetEnvironment;
+  driver_type: DriverType;
+  endpoint: string;
+  reset_endpoint: string | null;
+  auth_secret_ref: string | null;
+  timeout_seconds: number;
+}
+
+export interface ScenarioDefinition {
+  schema_version: "1.0";
+  name: string;
+  events: Array<
+    | { type: "user_text"; text: string }
+    | { type: "webhook"; payload: unknown }
+    | { type: "system"; payload: unknown }
+  >;
 }
 
 export interface Jurisdiction {

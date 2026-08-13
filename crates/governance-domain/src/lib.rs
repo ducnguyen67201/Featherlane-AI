@@ -255,6 +255,23 @@ pub struct Actor {
     pub id: String,
 }
 
+/// Untrusted, SDK-neutral observation returned by an active test target.
+///
+/// Featherlane assigns all tenancy, run, trace, and event identifiers while
+/// normalizing these observations into immutable evidence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObservedEvent {
+    pub event_type: EventType,
+    pub name: String,
+    pub actor: Actor,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub output: Value,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NormalizedEvent {
     pub schema_version: String,
