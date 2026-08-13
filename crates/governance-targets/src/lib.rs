@@ -174,6 +174,17 @@ fn with_correlation_headers(
         .header("x-governance-scenario-id", &scenario_id)
 }
 
+fn response_is_terminal(manifest: &TargetManifest, body: &Value) -> bool {
+    body.get(
+        manifest
+            .terminal_response_key
+            .as_deref()
+            .unwrap_or("terminal"),
+    )
+    .and_then(Value::as_bool)
+    .unwrap_or(false)
+}
+
 #[async_trait]
 impl TargetDriver for HttpTargetDriver {
     async fn validate(&self, manifest: &TargetManifest) -> Result<CapabilityReport, DriverError> {
@@ -261,15 +272,7 @@ impl TargetDriver for HttpTargetDriver {
         }
         let body: Value = response.json().await?;
         Ok(TargetOutput {
-            terminal: body
-                .get(
-                    manifest
-                        .terminal_response_key
-                        .as_deref()
-                        .unwrap_or("terminal"),
-                )
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            terminal: response_is_terminal(manifest, &body),
             body,
         })
     }
@@ -318,6 +321,28 @@ mod tests {
         assert!(matches!(
             driver.validate(&manifest).await,
             Err(DriverError::UnsafeConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn configured_response_key_marks_a_target_call_terminal() {
+        let manifest = TargetManifest {
+            target_id: "sandbox".to_owned(),
+            target_version: "test".to_owned(),
+            driver_type: DriverType::HttpText,
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            reset_endpoint: None,
+            status_endpoint: None,
+            terminal_response_key: Some("approval_observed".to_owned()),
+            auth_secret_ref: None,
+            timeout_seconds: 1,
+            otlp_required: false,
+            production_credentials_allowed: false,
+            telemetry_boundary: TelemetryBoundaryConfig::default(),
+        };
+        assert!(response_is_terminal(
+            &manifest,
+            &json!({"approval_observed": true})
         ));
     }
 }

@@ -66,4 +66,19 @@ describe("governance proxy", () => {
       detail: "The governance API is unavailable. The request outcome is unknown; refresh before retrying.",
     });
   });
+
+  it("reports that a failed read did not change policy data", async () => {
+    getCurrentSession.mockResolvedValue({ user: { id: "user-1" } });
+    fetchMock.mockRejectedValue(new Error("offline"));
+
+    const response = await proxyGovernanceRequest(
+      new Request("http://localhost/api/policy-packs"),
+      "/v1/policy-packs",
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      detail: "The governance API is unavailable. No policy data was changed.",
+    });
+  });
 });

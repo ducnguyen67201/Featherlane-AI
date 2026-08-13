@@ -447,13 +447,11 @@ async fn loco_create_evaluation(
         .execute(command)
         .await
     {
-        Ok(run) => {
-            (
-                StatusCode::CREATED,
-                Json(CreatedEvaluationRun::new(run, endpoint)),
-            )
-                .into_response()
-        }
+        Ok(run) => (
+            StatusCode::CREATED,
+            Json(CreatedEvaluationRun::new(run, endpoint)),
+        )
+            .into_response(),
         Err(error) => database_error(error),
     }
 }

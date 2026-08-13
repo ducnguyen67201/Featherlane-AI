@@ -1,5 +1,6 @@
 import Link from "next/link";
-import { ArrowLeft, Braces, GitCommitHorizontal, RadioTower } from "lucide-react";
+import { ArrowLeft, GitCommitHorizontal, RadioTower } from "lucide-react";
+import { EvidenceDownload } from "@/components/evidence-download";
 import { RunRefresh } from "@/components/run-refresh";
 import { MetricCard, StateBadge, VerdictBadge } from "@/components/ui";
 import { getEvaluation } from "@/lib/api";
@@ -23,15 +24,7 @@ export default async function EvaluationDetailPage({ params }: { params: Promise
           <div className="run-title"><h1>{run.target_id}</h1>{verdict ? <VerdictBadge verdict={verdict} /> : <StateBadge state={run.state} />}</div>
           <p>Evaluating <strong>{run.policy_pack_key} v{run.policy_pack_version}</strong>. This is evidence relevant to policy conformance, not a certification.</p>
         </div>
-        {evidence && (
-          <a
-            className="secondary-button"
-            download={`featherlane-evidence-${run.id}.json`}
-            href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(evidence, null, 2))}`}
-          >
-            <Braces size={15} />Download JSON
-          </a>
-        )}
+        {evidence && <EvidenceDownload evidence={evidence} runId={run.id} />}
       </div>
 
       <section className="metric-grid run-metrics">

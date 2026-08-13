@@ -340,8 +340,13 @@ fn retry_delay(retry_after: Option<std::time::Duration>, attempt: usize) -> std:
     if let Some(delay) = retry_after {
         return delay;
     }
-    let jitter = u64::from(std::process::id())
-        .wrapping_add(u64::try_from(attempt).unwrap_or_default() * 37)
+    let jitter = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos(),
+    )
+    .wrapping_add(u64::try_from(attempt).unwrap_or_default() * 37)
         % 100;
     std::time::Duration::from_millis(250 + jitter)
 }
@@ -430,5 +435,19 @@ mod tests {
         let mut config = config();
         config.llm_model = "openai/gpt-latest".to_owned();
         assert!(OpenRouterPolicyExtractionModel::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_dates() {
+        assert_eq!(
+            parse_retry_after("3"),
+            Some(std::time::Duration::from_secs(3))
+        );
+        let date = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+        );
+        let delay = parse_retry_after(&date).expect("future HTTP date should parse");
+        assert!(delay >= std::time::Duration::from_secs(28));
+        assert!(delay <= std::time::Duration::from_secs(30));
     }
 }
