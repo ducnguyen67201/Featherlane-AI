@@ -35,7 +35,7 @@ pub struct ScenarioDefinition {
     pub events: Vec<TestEvent>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RunContext {
     pub eval_run_id: EvalRunId,
     pub scenario_id: ScenarioId,
@@ -61,39 +61,20 @@ pub struct TargetResponseEnvelope {
     pub side_effects: Vec<Value>,
 }
 
-#[derive(Clone, Debug)]
-pub struct TargetOutput {
-    pub terminal: bool,
-    pub terminal_state: Option<String>,
-    pub output: Value,
-    pub events: Vec<ObservedEvent>,
-    pub side_effects: Vec<Value>,
-}
+pub type TargetOutput = TargetResponseEnvelope;
 
-impl TryFrom<TargetResponseEnvelope> for TargetOutput {
-    type Error = ScenarioError;
-
-    fn try_from(value: TargetResponseEnvelope) -> Result<Self, Self::Error> {
-        if value.schema_version != SCENARIO_SCHEMA_VERSION {
+impl TargetResponseEnvelope {
+    pub(crate) fn validate(self) -> Result<Self, ScenarioError> {
+        if self.schema_version != SCENARIO_SCHEMA_VERSION {
             return Err(ScenarioError::UnsupportedResponseSchema);
         }
-        if value.events.len() > MAX_OBSERVATIONS {
+        if self.events.len() > MAX_OBSERVATIONS {
             return Err(ScenarioError::TooManyObservations);
         }
-        if value
-            .events
-            .iter()
-            .any(|event| event.name.trim().is_empty())
-        {
+        if self.events.iter().any(|event| event.name.trim().is_empty()) {
             return Err(ScenarioError::EmptyObservationName);
         }
-        Ok(Self {
-            terminal: value.terminal,
-            terminal_state: value.terminal_state,
-            output: value.output,
-            events: value.events,
-            side_effects: value.side_effects,
-        })
+        Ok(self)
     }
 }
 

@@ -58,7 +58,7 @@ export async function getEvaluation(id: string): Promise<Evaluation | null> {
 }
 
 export function getPolicies(): Promise<PolicyPack[]> {
-  return getJson("/v1/policy-packs", seed.policies);
+  return getJson<PolicyPack[]>("/v1/policy-packs", []);
 }
 
 export function getPolicyPack(id: string): Promise<PolicyPackDetail | null> {

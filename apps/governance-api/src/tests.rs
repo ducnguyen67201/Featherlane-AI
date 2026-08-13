@@ -8,7 +8,6 @@ use super::*;
 #[tokio::test]
 async fn health_route_is_available() {
     let response = app()
-        .expect("router should build")
         .oneshot(
             Request::builder()
                 .uri("/health")
@@ -23,7 +22,6 @@ async fn health_route_is_available() {
 #[tokio::test]
 async fn unknown_evaluation_returns_problem_response() {
     let response = app()
-        .expect("router should build")
         .oneshot(
             Request::builder()
                 .uri("/v1/evaluations/missing")
@@ -37,7 +35,7 @@ async fn unknown_evaluation_returns_problem_response() {
 
 #[tokio::test]
 async fn empty_overview_does_not_fabricate_metrics() {
-    let Json(snapshot) = overview(State(demo_state())).await;
+    let Json(snapshot) = overview().await;
 
     assert_eq!(snapshot.active_agents, 0);
     assert_eq!(snapshot.evaluations_30d, 0);
@@ -51,7 +49,6 @@ async fn empty_overview_does_not_fabricate_metrics() {
 #[tokio::test]
 async fn corpus_is_resolved_by_set_name() {
     let response = app()
-        .expect("router should build")
         .oneshot(
             Request::builder()
                 .uri("/v1/corpora/open-us-law")
@@ -66,7 +63,6 @@ async fn corpus_is_resolved_by_set_name() {
 #[tokio::test]
 async fn unknown_corpus_set_returns_not_found() {
     let response = app()
-        .expect("router should build")
         .oneshot(
             Request::builder()
                 .uri("/v1/corpora/not-imported")

@@ -1,15 +1,13 @@
-use std::sync::{Arc, OnceLock};
-
 pub mod loco_app;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
-use governance_application::{DashboardSnapshot, RunListItem, StoredEvaluationRun};
+use governance_application::{DashboardSnapshot, StoredEvaluationRun};
 use governance_corpus::PINNED_SNAPSHOT;
 use governance_domain::{
     CompiledRule, EvalRunId, EventType, NormalizedEvent, Obligation, ObligationId, OrganizationId,
@@ -26,28 +24,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
-
-#[derive(Clone, Debug)]
-pub struct AppState {
-    store: Arc<RwLock<DemoStore>>,
-}
-
-#[derive(Clone, Debug)]
-struct DemoStore {
-    targets: Vec<TargetView>,
-    runs: Vec<EvaluationView>,
-}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TargetView {
     pub id: String,
     pub name: String,
     pub version: String,
-    pub driver: String,
-    pub environment: String,
+    pub driver: DriverType,
+    pub environment: TargetEnvironment,
     pub status: String,
     pub issues: Vec<String>,
     pub checked_at: String,
@@ -271,7 +257,7 @@ pub(crate) fn build_registered_target(
         evidence_mode: EvidenceMode::Inline,
         production_credentials_allowed: false,
     };
-    validate_registration(&request.name, request.environment, &manifest)
+    validate_registration(&request.name, &manifest)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(RegisteredTarget {
         id: TargetId::new(),
@@ -292,8 +278,8 @@ pub(crate) fn target_view(
         id: target.id.to_string(),
         name: target.name.clone(),
         version: target.manifest.target_version.clone(),
-        driver: enum_label(target.manifest.driver_type),
-        environment: enum_label(target.environment),
+        driver: target.manifest.driver_type,
+        environment: target.environment,
         status: if target.capability.reachable {
             "healthy"
         } else {
@@ -315,13 +301,6 @@ pub(crate) fn target_detail_view(
         summary: target_view(target, latest),
         manifest: target.manifest.clone(),
     }
-}
-
-fn enum_label<T: Serialize>(value: T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 pub(crate) fn build_policy_bundle(
@@ -489,42 +468,20 @@ impl IntoResponse for ApiError {
 }
 
 /// Builds the in-memory router used by integration tests and local embedding.
-///
-/// # Errors
-///
-/// Returns an error if application state cannot be constructed.
-pub fn app() -> Result<Router, ApiError> {
-    let state = demo_state();
-
-    Ok(Router::new()
+pub fn app() -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/v1/overview", get(overview))
         .route("/v1/targets", get(targets))
         .route("/v1/evaluations", get(evaluations))
         .route("/v1/evaluations/{id}", get(evaluation))
         .route("/v1/corpora/{set_name}", get(corpus))
-        .with_state(state)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_headers(Any)
                 .allow_methods(Any),
-        ))
-}
-
-pub(crate) fn demo_state() -> AppState {
-    static STATE: OnceLock<AppState> = OnceLock::new();
-    STATE.get_or_init(build_demo_state).clone()
-}
-
-fn build_demo_state() -> AppState {
-    let store = DemoStore {
-        targets: demo_targets(),
-        runs: demo_runs(),
-    };
-    AppState {
-        store: Arc::new(RwLock::new(store)),
-    }
+        )
 }
 
 pub(crate) async fn health() -> Json<HealthResponse> {
@@ -535,68 +492,29 @@ pub(crate) async fn health() -> Json<HealthResponse> {
     })
 }
 
-pub(crate) async fn overview(State(state): State<AppState>) -> Json<DashboardSnapshot> {
-    let store = state.store.read().await;
-    let count = store.runs.len();
-    let passed = store
-        .runs
-        .iter()
-        .filter(|run| run.verdict == RunVerdict::Pass)
-        .count();
-    let complete = store
-        .runs
-        .iter()
-        .filter(|run| run.trace_quality == TraceQualityStatus::Complete)
-        .count();
-    let recent_runs = store
-        .runs
-        .iter()
-        .take(5)
-        .map(|run| RunListItem {
-            id: run.id,
-            target: run.target.clone(),
-            policy_pack: run.policy_pack.clone(),
-            verdict: run.verdict,
-            passed: run.passed,
-            failed: run.failed,
-            inconclusive: run.inconclusive,
-            duration_ms: run.duration_ms,
-            created_at: run.created_at.clone(),
-        })
-        .collect();
+pub(crate) async fn overview() -> Json<DashboardSnapshot> {
     Json(DashboardSnapshot {
-        active_agents: u32::try_from(store.targets.len()).unwrap_or(u32::MAX),
+        active_agents: 0,
         policy_packs: 0,
-        evaluations_30d: u32::try_from(count).unwrap_or(u32::MAX),
-        pass_rate: percentage(passed, count),
-        open_findings: u32::try_from(store.runs.iter().map(|run| run.failed).sum::<usize>())
-            .unwrap_or(u32::MAX),
-        trace_coverage: percentage(complete, count),
-        recent_runs,
+        evaluations_30d: 0,
+        pass_rate: 0.0,
+        open_findings: 0,
+        trace_coverage: 0.0,
+        recent_runs: Vec::new(),
         daily_activity: Vec::new(),
     })
 }
 
-pub(crate) async fn targets(State(state): State<AppState>) -> Json<Vec<TargetView>> {
-    Json(state.store.read().await.targets.clone())
+pub(crate) async fn targets() -> Json<Vec<TargetView>> {
+    Json(Vec::new())
 }
 
-pub(crate) async fn evaluations(State(state): State<AppState>) -> Json<Vec<EvaluationView>> {
-    Json(state.store.read().await.runs.clone())
+pub(crate) async fn evaluations() -> Json<Vec<EvaluationView>> {
+    Json(Vec::new())
 }
 
-pub(crate) async fn evaluation(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<EvaluationView>, ApiError> {
-    let store = state.store.read().await;
-    store
-        .runs
-        .iter()
-        .find(|run| run.id.to_string() == id)
-        .cloned()
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(&format!("evaluation {id}")))
+pub(crate) async fn evaluation(Path(id): Path<String>) -> Result<Json<EvaluationView>, ApiError> {
+    Err(ApiError::not_found(&format!("evaluation {id}")))
 }
 
 pub(crate) async fn corpus(Path(set_name): Path<String>) -> Result<Json<CorpusView>, ApiError> {
@@ -655,24 +573,6 @@ pub(crate) fn timeline_item(event: &NormalizedEvent) -> TimelineItem {
             "observed"
         }
         .to_owned(),
-    }
-}
-
-fn demo_targets() -> Vec<TargetView> {
-    Vec::new()
-}
-
-fn demo_runs() -> Vec<EvaluationView> {
-    Vec::new()
-}
-
-fn percentage(numerator: usize, denominator: usize) -> f64 {
-    if denominator == 0 {
-        0.0
-    } else {
-        let numerator = u32::try_from(numerator).unwrap_or(u32::MAX);
-        let denominator = u32::try_from(denominator).unwrap_or(u32::MAX);
-        100.0 * f64::from(numerator) / f64::from(denominator)
     }
 }
 

@@ -197,10 +197,7 @@ where
         };
         let invocation_id = InvocationId::new();
         let driver = self.drivers.driver_for(target.manifest.driver_type);
-        let session = driver
-            .start_session(context.clone())
-            .await
-            .map_err(application_driver_error)?;
+        let session = driver.start_session(context);
         driver
             .reset(&target.manifest, &session)
             .await

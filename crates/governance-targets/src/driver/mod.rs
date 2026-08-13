@@ -42,7 +42,7 @@ impl SecretResolver for EnvironmentSecretResolver {
 #[async_trait]
 pub trait TargetDriver: Send + Sync {
     async fn validate(&self, manifest: &TargetManifest) -> Result<CapabilityReport, DriverError>;
-    async fn start_session(&self, context: RunContext) -> Result<TargetSession, DriverError>;
+    fn start_session(&self, context: RunContext) -> TargetSession;
     async fn reset(
         &self,
         manifest: &TargetManifest,
@@ -138,17 +138,15 @@ pub(crate) async fn validate_common(
     })
 }
 
-pub(crate) async fn start_session_common(
-    context: RunContext,
-) -> Result<TargetSession, DriverError> {
+pub(crate) fn start_session_common(context: RunContext) -> TargetSession {
     let trace_id = Uuid::new_v4().simple().to_string();
     let parent_source = Uuid::new_v4().simple().to_string();
     let parent_id = &parent_source[..16];
-    Ok(TargetSession {
+    TargetSession {
         id: Uuid::now_v7().to_string(),
         traceparent: format!("00-{trace_id}-{parent_id}-01"),
         context,
-    })
+    }
 }
 
 pub(crate) async fn reset_common(
@@ -199,7 +197,9 @@ pub(crate) async fn send_json(
     }
     let envelope: TargetResponseEnvelope =
         serde_json::from_slice(&bytes).map_err(|_| DriverError::InvalidResponse)?;
-    TargetOutput::try_from(envelope).map_err(|error| DriverError::Contract(error.to_string()))
+    envelope
+        .validate()
+        .map_err(|error| DriverError::Contract(error.to_string()))
 }
 
 fn client(timeout_seconds: u64) -> Result<Client, DriverError> {
@@ -296,9 +296,7 @@ mod tests {
         let session = start_session_common(RunContext {
             eval_run_id: EvalRunId::new(),
             scenario_id: ScenarioId::new(),
-        })
-        .await
-        .expect("session should start");
+        });
         let parts: Vec<&str> = session.traceparent.split('-').collect();
         assert_eq!(parts.len(), 4);
         assert_eq!(parts[1].len(), 32);
@@ -365,13 +363,10 @@ mod tests {
                 .expect("readiness")
                 .reachable
         );
-        let session = driver
-            .start_session(RunContext {
-                eval_run_id: EvalRunId::new(),
-                scenario_id: ScenarioId::new(),
-            })
-            .await
-            .expect("session");
+        let session = driver.start_session(RunContext {
+            eval_run_id: EvalRunId::new(),
+            scenario_id: ScenarioId::new(),
+        });
         driver.reset(&manifest, &session).await.expect("reset");
         let output = driver
             .send(
@@ -446,13 +441,10 @@ mod tests {
         });
         let manifest = test_manifest(address, "/webhook", DriverType::Webhook);
         let driver = WebhookDriver::new(Arc::new(FakeSecretResolver));
-        let session = driver
-            .start_session(RunContext {
-                eval_run_id: EvalRunId::new(),
-                scenario_id: ScenarioId::new(),
-            })
-            .await
-            .expect("session");
+        let session = driver.start_session(RunContext {
+            eval_run_id: EvalRunId::new(),
+            scenario_id: ScenarioId::new(),
+        });
         let payload = json!({"ticket": "T-1", "nested": {"ready": true}});
 
         driver
@@ -503,13 +495,10 @@ mod tests {
             axum::serve(listener, app).await.expect("test server");
         });
         let driver = HttpTextDriver::new(Arc::new(FakeSecretResolver));
-        let session = driver
-            .start_session(RunContext {
-                eval_run_id: EvalRunId::new(),
-                scenario_id: ScenarioId::new(),
-            })
-            .await
-            .expect("session");
+        let session = driver.start_session(RunContext {
+            eval_run_id: EvalRunId::new(),
+            scenario_id: ScenarioId::new(),
+        });
         let event = TestEvent::UserText {
             text: "hello".to_owned(),
         };

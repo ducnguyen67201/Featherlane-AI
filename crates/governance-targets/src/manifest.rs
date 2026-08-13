@@ -84,8 +84,6 @@ pub enum ManifestError {
     InvalidTimeout,
     #[error("auth_secret_ref must be an uppercase environment-variable name")]
     InvalidSecretReference,
-    #[error("only inline evidence is supported for active CI targets")]
-    UnsupportedEvidenceMode,
     #[error("production credentials must be disabled")]
     ProductionCredentials,
     #[error("an authenticated reset_endpoint must use the same origin as endpoint")]
@@ -98,11 +96,7 @@ pub enum ManifestError {
 ///
 /// Returns a contract-specific validation error for an unsafe or malformed
 /// registration.
-pub fn validate_registration(
-    name: &str,
-    _environment: TargetEnvironment,
-    manifest: &TargetManifest,
-) -> Result<(), ManifestError> {
+pub fn validate_registration(name: &str, manifest: &TargetManifest) -> Result<(), ManifestError> {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.chars().count() > 80 {
         return Err(ManifestError::InvalidName);
@@ -143,9 +137,6 @@ pub fn validate_manifest(manifest: &TargetManifest) -> Result<(), ManifestError>
     {
         return Err(ManifestError::InvalidSecretReference);
     }
-    if manifest.evidence_mode != EvidenceMode::Inline {
-        return Err(ManifestError::UnsupportedEvidenceMode);
-    }
     if manifest.production_credentials_allowed {
         return Err(ManifestError::ProductionCredentials);
     }
@@ -156,20 +147,10 @@ fn valid_slug(value: &str) -> bool {
     let bytes = value.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 63
-        && bytes[0].is_ascii_lowercase_or_digit()
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
         && bytes
             .iter()
-            .all(|byte| byte.is_ascii_lowercase_or_digit() || *byte == b'-')
-}
-
-trait AsciiSlugByte {
-    fn is_ascii_lowercase_or_digit(&self) -> bool;
-}
-
-impl AsciiSlugByte for u8 {
-    fn is_ascii_lowercase_or_digit(&self) -> bool {
-        self.is_ascii_lowercase() || self.is_ascii_digit()
-    }
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 fn valid_secret_reference(value: &str) -> bool {
@@ -224,9 +205,7 @@ mod tests {
 
     #[test]
     fn safe_manifest_is_valid() {
-        assert!(
-            validate_registration("Refund Agent", TargetEnvironment::Staging, &manifest()).is_ok()
-        );
+        assert!(validate_registration("Refund Agent", &manifest()).is_ok());
     }
 
     #[test]

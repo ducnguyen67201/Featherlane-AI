@@ -1,12 +1,7 @@
 import type {
-  AgentTarget,
   Corpus,
   DashboardSnapshot,
-  Evaluation,
-  PolicyPack,
 } from "./types";
-
-export const evaluations: Evaluation[] = [];
 
 export const overview: DashboardSnapshot = {
   active_agents: 0,
@@ -18,11 +13,6 @@ export const overview: DashboardSnapshot = {
   recent_runs: [],
   daily_activity: [],
 };
-
-// Policies deliberately have no offline seed: PostgreSQL is their runtime source of truth.
-export const policies: PolicyPack[] = [];
-
-export const agents: AgentTarget[] = [];
 
 export const corpus: Corpus = {
   set_name: "open-us-law",

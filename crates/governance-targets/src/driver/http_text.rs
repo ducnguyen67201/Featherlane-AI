@@ -26,8 +26,8 @@ impl TargetDriver for HttpTextDriver {
         validate_common(self.resolver.as_ref(), manifest).await
     }
 
-    async fn start_session(&self, context: RunContext) -> Result<TargetSession, DriverError> {
-        start_session_common(context).await
+    fn start_session(&self, context: RunContext) -> TargetSession {
+        start_session_common(context)
     }
 
     async fn reset(
