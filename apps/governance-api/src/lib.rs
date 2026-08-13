@@ -495,11 +495,16 @@ pub(crate) async fn evaluation(
 }
 
 pub(crate) async fn corpus(Path(set_name): Path<String>) -> Result<Json<CorpusView>, ApiError> {
-    if set_name != "open-us-law" {
-        return Err(ApiError::not_found(&format!("corpus {set_name}")));
-    }
-    Ok(Json(CorpusView {
-        set_name,
+    corpus_catalog()
+        .into_iter()
+        .find(|corpus| corpus.set_name == set_name)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(&format!("corpus {set_name}")))
+}
+
+fn corpus_catalog() -> Vec<CorpusView> {
+    vec![CorpusView {
+        set_name: "open-us-law".to_owned(),
         dataset: "Open US Law".to_owned(),
         snapshot: PINNED_SNAPSHOT.to_owned(),
         snapshot_date: "2026-07-21".to_owned(),
@@ -530,7 +535,7 @@ pub(crate) async fn corpus(Path(set_name): Path<String>) -> Result<Json<CorpusVi
             },
         ],
         attribution: "Structured US primary-law data from the Open US Law corpus by Vaquill AI, used under CC BY 4.0.".to_owned(),
-    }))
+    }]
 }
 
 pub(crate) fn demo_evidence(
