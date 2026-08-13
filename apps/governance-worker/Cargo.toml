@@ -1,0 +1,18 @@
+[package]
+name = "governance-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+governance-application.workspace = true
+governance-domain.workspace = true
+governance-persistence.workspace = true
+loco-rs.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

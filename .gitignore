@@ -1,0 +1,14 @@
+/target/
+node_modules/
+/.next/
+/apps/web/.next/
+/apps/web/out/
+/.env
+/.env.local
+/.DS_Store
+/coverage/
+*.lcov
+*.log
+/.idea/
+/.vscode/
+/.claude/PRPs/

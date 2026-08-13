@@ -1,0 +1,11 @@
+{
+  "name": "featherlane",
+  "private": true,
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "dev": "pnpm --dir apps/web dev",
+    "lint": "pnpm --dir apps/web lint",
+    "test": "pnpm --dir apps/web test",
+    "build": "pnpm --dir apps/web build"
+  }
+}
