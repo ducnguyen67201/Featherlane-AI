@@ -12,7 +12,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
-    ports: ["5432:5432"]
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
     volumes: ["postgres-data:/var/lib/postgresql/data"]
 
   governance-api:
@@ -22,14 +22,25 @@ services:
       args:
         RUST_PACKAGE: governance-api
         RUST_BINARY: governance-api
-    command: ["start"]
+    command: ["start", "--server-and-worker"]
     environment:
       DATABASE_URL: postgres://featherlane:featherlane@postgres:5432/featherlane
+      LOCO_QUEUE_URL: postgres://featherlane:featherlane@postgres:5432/featherlane
+      OBJECT_STORE_URL: http://minio:9000
+      OBJECT_STORE_BUCKET: featherlane
+      OBJECT_STORE_REGION: us-east-1
+      OBJECT_STORE_ACCESS_KEY_ID: featherlane-dev
+      OBJECT_STORE_SECRET_ACCESS_KEY: featherlane-dev-only
+      POLICY_LLM_ENABLED: "true"
+      POLICY_LLM_PROVIDER: heuristic
+      POLICY_LLM_PROMPT_VERSION: policy-extract-v1
       PORT: "8080"
       RUST_LOG: info
     depends_on:
       postgres:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     ports: ["8080:8080"]
 
   telemetry-gateway:
@@ -41,8 +52,26 @@ services:
         RUST_BINARY: governance-telemetry-gateway
     environment:
       GOVERNANCE_GATEWAY_ADDR: 0.0.0.0:4318
+      DATABASE_URL: postgres://featherlane:featherlane@postgres:5432/featherlane
       RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports: ["4318:4318"]
+
+  governance-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      args:
+        RUST_PACKAGE: governance-worker
+        RUST_BINARY: governance-worker
+    environment:
+      DATABASE_URL: postgres://featherlane:featherlane@postgres:5432/featherlane
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   sandbox:
     build:
@@ -91,7 +120,16 @@ services:
       MINIO_ROOT_PASSWORD: featherlane-dev-only
     ports: ["9000:9000", "9001:9001"]
     volumes: ["minio-data:/data"]
-    profiles: ["evidence-store"]
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        until mc alias set local http://minio:9000 featherlane-dev featherlane-dev-only; do sleep 1; done;
+        mc mb --ignore-existing local/featherlane;
+        mc anonymous set none local/featherlane
+    depends_on: [minio]
 
 volumes:
   postgres-data:

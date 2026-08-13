@@ -1,6 +1,11 @@
 //! `SeaORM` persistence adapters. ORM models never cross this crate boundary.
 
 pub mod entities;
+mod evaluation_runs;
+mod policy_imports;
+
+pub use evaluation_runs::SeaOrmEvaluationRunRepository;
+pub use policy_imports::SeaOrmPolicyImportRepository;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,7 +24,7 @@ use uuid::Uuid;
 
 use crate::entities::{
     eval_runs, obligations, organizations, policy_pack_sources, policy_packs, policy_reviews,
-    policy_rules, sources,
+    policy_rules, rule_results, sources,
 };
 
 #[derive(Clone, Debug)]
@@ -158,14 +163,8 @@ impl PolicyPackRepository for SeaOrmPolicyPackRepository {
     }
 
     async fn save_bundle(&self, bundle: &PolicyBundle) -> Result<(), ApplicationError> {
-        validate_policy_bundle(bundle)?;
         let transaction = self.database.begin().await.map_err(repository_error)?;
-        ensure_organization(&transaction, bundle.pack.organization_id).await?;
-        ensure_version_available(&transaction, &bundle.pack).await?;
-        insert_pack(&transaction, &bundle.pack).await?;
-        insert_rules(&transaction, &bundle.pack).await?;
-        insert_sources(&transaction, bundle).await?;
-        insert_obligations(&transaction, bundle).await?;
+        persist_bundle(&transaction, bundle).await?;
         transaction.commit().await.map_err(repository_error)
     }
 
@@ -250,6 +249,19 @@ impl PolicyPackRepository for SeaOrmPolicyPackRepository {
     }
 }
 
+pub(crate) async fn persist_bundle<C: ConnectionTrait>(
+    connection: &C,
+    bundle: &PolicyBundle,
+) -> Result<(), ApplicationError> {
+    validate_policy_bundle(bundle)?;
+    ensure_organization(connection, bundle.pack.organization_id).await?;
+    ensure_version_available(connection, &bundle.pack).await?;
+    insert_pack(connection, &bundle.pack).await?;
+    insert_rules(connection, &bundle.pack).await?;
+    insert_sources(connection, bundle).await?;
+    insert_obligations(connection, bundle).await
+}
+
 fn validate_policy_bundle(bundle: &PolicyBundle) -> Result<(), ApplicationError> {
     if bundle.pack.rules.is_empty() || bundle.sources.is_empty() || bundle.obligations.is_empty() {
         return Err(ApplicationError::InvalidRequest(
@@ -321,7 +333,7 @@ async fn ensure_organization<C: ConnectionTrait>(
             .do_nothing()
             .to_owned(),
     )
-    .exec(connection)
+    .exec_without_returning(connection)
     .await
     .map_err(repository_error)?;
     Ok(())
@@ -510,20 +522,88 @@ impl EvaluationRepository for SeaOrmEvaluationRepository {
         summary: &EvaluationSummary,
     ) -> Result<(), ApplicationError> {
         let payload = serde_json::to_value(summary).map_err(serialization_error)?;
-        eval_runs::ActiveModel {
-            id: Set(summary.eval_run_id.0),
-            organization_id: Set(organization_id.0),
-            target_id: Set("unknown".to_owned()),
-            policy_pack_key: Set("unknown".to_owned()),
-            verdict: Set(enum_string(summary.verdict)?),
-            summary: Set(payload),
-            created_at: Set(OffsetDateTime::now_utc()),
-            completed_at: Set(Some(OffsetDateTime::now_utc())),
+        let now = OffsetDateTime::now_utc();
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        let existing = eval_runs::Entity::find()
+            .filter(eval_runs::Column::OrganizationId.eq(organization_id.0))
+            .filter(eval_runs::Column::Id.eq(summary.eval_run_id.0))
+            .one(&transaction)
+            .await
+            .map_err(repository_error)?;
+        if let Some(existing) = existing {
+            if let Some(stored) = existing.summary.as_ref() {
+                let stored: EvaluationSummary =
+                    serde_json::from_value(stored.clone()).map_err(serialization_error)?;
+                return if stored == *summary {
+                    Ok(())
+                } else {
+                    Err(ApplicationError::Conflict(
+                        "run already has a different evaluation summary".to_owned(),
+                    ))
+                };
+            }
+            let mut active: eval_runs::ActiveModel = existing.into();
+            active.verdict = Set(Some(enum_string(summary.verdict)?));
+            active.summary = Set(Some(payload));
+            active.completed_at = Set(Some(now));
+            active.updated_at = Set(now);
+            active
+                .update(&transaction)
+                .await
+                .map_err(repository_error)?;
+        } else {
+            eval_runs::ActiveModel {
+                id: Set(summary.eval_run_id.0),
+                organization_id: Set(organization_id.0),
+                target_id: Set("unknown".to_owned()),
+                target_version: Set(Some("legacy".to_owned())),
+                policy_pack_key: Set("unknown".to_owned()),
+                policy_pack_id: Set(None),
+                policy_pack_version: Set(Some(0)),
+                policy_content_sha256: Set(Some("legacy".to_owned())),
+                scenario_id: Set(Some(summary.eval_run_id.0)),
+                rule_ids: Set(serde_json::json!([])),
+                boundary_kind: Set("explicit_ci".to_owned()),
+                external_run_id: Set(None),
+                primary_invocation_id: Set(Some(summary.eval_run_id.0)),
+                state: Set("completed".to_owned()),
+                completion_reason: Set(None),
+                terminal_state: Set(None),
+                verdict: Set(Some(enum_string(summary.verdict)?)),
+                summary: Set(Some(payload)),
+                settle_until: Set(None),
+                hard_deadline_at: Set(Some(now)),
+                last_seen_at: Set(None),
+                finalized_at: Set(Some(now)),
+                updated_at: Set(now),
+                span_count: Set(0),
+                trace_count: Set(0),
+                event_count: Set(0),
+                trace_quality: Set(None),
+                evidence_sha256: Set(None),
+                created_at: Set(now),
+                completed_at: Set(Some(now)),
+            }
+            .insert(&transaction)
+            .await
+            .map_err(repository_error)?;
         }
-        .insert(&self.database)
-        .await
-        .map_err(repository_error)?;
-        Ok(())
+        for result in &summary.results {
+            rule_results::ActiveModel {
+                id: Set(result.id.0),
+                organization_id: Set(organization_id.0),
+                eval_run_id: Set(summary.eval_run_id.0),
+                rule_id: Set(result.rule_id.clone()),
+                severity: Set(enum_string(result.severity)?),
+                status: Set(enum_string(result.status)?),
+                payload: Set(serde_json::to_value(result).map_err(serialization_error)?),
+                created_at: Set(now),
+            }
+            .insert(&transaction)
+            .await
+            .map_err(repository_error)?;
+        }
+        transaction.commit().await.map_err(repository_error)
     }
 
     async fn get_summary(
@@ -538,7 +618,8 @@ impl EvaluationRepository for SeaOrmEvaluationRepository {
             .await
             .map_err(repository_error)?;
         model
-            .map(|model| serde_json::from_value(model.summary).map_err(serialization_error))
+            .and_then(|model| model.summary)
+            .map(|summary| serde_json::from_value(summary).map_err(serialization_error))
             .transpose()
     }
 }

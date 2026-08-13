@@ -4,6 +4,7 @@ use std::{
 };
 
 pub mod loco_app;
+mod policy_imports;
 
 use axum::{
     Json, Router,
@@ -15,19 +16,17 @@ use axum::{
 use governance_application::{ActivityPoint, DashboardSnapshot, RunListItem};
 use governance_corpus::PINNED_SNAPSHOT;
 use governance_domain::{
-    Actor, ActorType, CompiledRule, EvalRunId, EventId, EventType, EvidenceBundle, InvocationId,
-    NormalizedEvent, Obligation, ObligationId, OrganizationId, PolicyBundle, PolicyPack,
-    PolicyPackId, ReviewStatus, ReviewerApproval, RunVerdict, ScenarioId, Source, SourceConfidence,
-    SourceId, SourceLocator, SourceType, TraceQualityStatus,
+    CompletionReason, EvalRunId, EvaluationRun, EvaluationSummary, EventType, EvidenceBundle,
+    InvocationId, OrganizationId, PolicyBundle, PolicyPack, PolicyPackId, RunBoundaryKind,
+    RunVerdict, ScenarioId, SourceConfidence, TraceQualityStatus,
 };
-use governance_policy::{PolicyDocument, compile_policy_document};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
+
+pub use governance_policy::{ObligationImport, PolicyImportRequest, PolicySourceImport};
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -123,49 +122,83 @@ pub struct JurisdictionView {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateEvaluationRequest {
-    #[serde(default)]
-    pub policy_pack_id: Option<PolicyPackId>,
+    pub policy_pack_id: PolicyPackId,
     #[serde(default = "default_target")]
-    pub target: String,
+    pub target_id: String,
+    #[serde(default = "default_target_version")]
+    pub target_version: String,
     #[serde(default)]
-    pub simulate_missing_approval: bool,
+    pub scenario_id: ScenarioId,
     #[serde(default)]
-    pub simulate_missing_trace: bool,
+    pub rule_ids: Vec<String>,
+    #[serde(default = "default_boundary_kind")]
+    pub boundary_kind: RunBoundaryKind,
+    #[serde(default)]
+    pub external_run_id: Option<String>,
+    #[serde(default)]
+    pub invocation_id: Option<InvocationId>,
+    #[serde(default = "default_max_duration_seconds")]
+    pub max_duration_seconds: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PolicyImportRequest {
-    pub key: String,
-    pub version: u32,
-    pub title: String,
-    pub rules: Vec<CompiledRule>,
-    pub sources: Vec<PolicySourceImport>,
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompleteEvaluationRequest {
+    #[serde(default = "default_completion_reason")]
+    pub reason: CompletionReason,
+    pub terminal_state: Option<String>,
+    #[serde(default = "default_settle_seconds")]
+    pub settle_seconds: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PolicySourceImport {
-    pub source_type: SourceType,
-    pub title: String,
-    pub jurisdiction: String,
-    pub content_sha256: String,
-    pub confidence: SourceConfidence,
-    pub obligations: Vec<ObligationImport>,
+#[derive(Clone, Debug, Serialize)]
+pub struct EvaluationRunDetail {
+    pub run: EvaluationRun,
+    pub summary: Option<EvaluationSummary>,
+    pub evidence: Option<EvidenceBundle>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ObligationImport {
-    pub key: String,
-    pub statement: String,
-    pub locator: SourceLocator,
-    #[serde(default)]
-    pub applicability: Value,
-    #[serde(default)]
-    pub exceptions: Vec<String>,
-    #[serde(default)]
-    pub required_evidence: Vec<String>,
-    pub reviewer_id: Option<String>,
+#[derive(Clone, Debug, Serialize)]
+pub struct CreatedEvaluationRun {
+    #[serde(flatten)]
+    pub run: EvaluationRun,
+    pub telemetry: EvaluationTelemetryInstructions,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EvaluationTelemetryInstructions {
+    pub endpoint: String,
+    pub protocol: &'static str,
+    pub attributes: BTreeMap<String, String>,
+}
+
+impl CreatedEvaluationRun {
+    pub fn new(run: EvaluationRun, endpoint: String) -> Self {
+        let attributes = BTreeMap::from([
+            ("featherlane.eval_run.id".to_owned(), run.id.to_string()),
+            (
+                "featherlane.invocation.id".to_owned(),
+                run.primary_invocation_id.to_string(),
+            ),
+            (
+                "featherlane.scenario.id".to_owned(),
+                run.scenario_id.to_string(),
+            ),
+        ]);
+        Self {
+            run,
+            telemetry: EvaluationTelemetryInstructions {
+                endpoint,
+                protocol: "otlp_http",
+                attributes,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RotateTelemetryKeyRequest {
     #[serde(default, with = "time::serde::rfc3339::option")]
-    pub reviewed_at: Option<OffsetDateTime>,
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -179,11 +212,32 @@ fn default_target() -> String {
     "refund-agent-staging".to_owned()
 }
 
+fn default_target_version() -> String {
+    "unversioned".to_owned()
+}
+
+const fn default_boundary_kind() -> RunBoundaryKind {
+    RunBoundaryKind::ExplicitCi
+}
+
+const fn default_completion_reason() -> CompletionReason {
+    CompletionReason::Explicit
+}
+
+const fn default_settle_seconds() -> u64 {
+    10
+}
+
+const fn default_max_duration_seconds() -> u64 {
+    3_600
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
     pub service: &'static str,
     pub version: &'static str,
+    pub policy_import_worker: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -218,14 +272,6 @@ impl ApiError {
             detail: resource.to_owned(),
         }
     }
-
-    fn internal(detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            title: "Internal error",
-            detail: detail.into(),
-        }
-    }
 }
 
 pub(crate) fn default_organization_id() -> OrganizationId {
@@ -236,101 +282,8 @@ pub(crate) fn build_policy_bundle(
     organization_id: OrganizationId,
     request: &PolicyImportRequest,
 ) -> Result<PolicyBundle, ApiError> {
-    if request.key.trim().is_empty() || request.rules.is_empty() || request.sources.is_empty() {
-        return Err(ApiError::bad_request(
-            "key, at least one rule, and at least one source are required",
-        ));
-    }
-    let canonical =
-        serde_json::to_vec(request).map_err(|error| ApiError::internal(error.to_string()))?;
-    let pack = compile_policy_document(
-        organization_id,
-        PolicyDocument {
-            key: request.key.clone(),
-            version: request.version,
-            title: request.title.clone(),
-            status: ReviewStatus::Draft,
-            rules: request.rules.clone(),
-        },
-        format!("{:x}", Sha256::digest(canonical)),
-    )
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let mut sources = Vec::with_capacity(request.sources.len());
-    let mut obligations = Vec::new();
-    for imported_source in &request.sources {
-        if !valid_sha256(&imported_source.content_sha256) {
-            return Err(ApiError::bad_request(
-                "every source content_sha256 must be a 64-character hexadecimal digest",
-            ));
-        }
-        let source_id = SourceId::new();
-        sources.push(Source {
-            id: source_id,
-            organization_id,
-            source_type: imported_source.source_type,
-            title: imported_source.title.clone(),
-            jurisdiction: imported_source.jurisdiction.clone(),
-            effective_from: None,
-            content_sha256: imported_source.content_sha256.clone(),
-            confidence: imported_source.confidence,
-        });
-        for imported_obligation in &imported_source.obligations {
-            if !valid_sha256(&imported_obligation.locator.excerpt_sha256) {
-                return Err(ApiError::bad_request(
-                    "every obligation excerpt_sha256 must be a 64-character hexadecimal digest",
-                ));
-            }
-            let review = match (
-                imported_obligation.reviewer_id.as_ref(),
-                imported_obligation.reviewed_at,
-            ) {
-                (Some(reviewer_id), Some(reviewed_at)) => Some(ReviewerApproval {
-                    status: ReviewStatus::Approved,
-                    reviewer_id: reviewer_id.clone(),
-                    reviewed_at,
-                }),
-                (None, None) => None,
-                _ => {
-                    return Err(ApiError::bad_request(
-                        "obligation reviewer_id and reviewed_at must be supplied together",
-                    ));
-                }
-            };
-            obligations.push(Obligation {
-                id: ObligationId::new(),
-                organization_id,
-                source_id,
-                key: imported_obligation.key.clone(),
-                statement: imported_obligation.statement.clone(),
-                locator: imported_obligation.locator.clone(),
-                applicability: imported_obligation.applicability.clone(),
-                exceptions: imported_obligation.exceptions.clone(),
-                required_evidence: imported_obligation.required_evidence.clone(),
-                review,
-            });
-        }
-    }
-    let obligation_keys: std::collections::BTreeSet<&str> =
-        obligations.iter().map(|item| item.key.as_str()).collect();
-    if let Some(rule) = request
-        .rules
-        .iter()
-        .find(|rule| !obligation_keys.contains(rule.obligation_key.as_str()))
-    {
-        return Err(ApiError::bad_request(format!(
-            "rule {} references missing obligation {}",
-            rule.id, rule.obligation_key
-        )));
-    }
-    Ok(PolicyBundle {
-        pack,
-        sources,
-        obligations,
-    })
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    governance_policy::build_policy_bundle(organization_id, request)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 pub(crate) fn policy_pack_view(
@@ -347,39 +300,6 @@ pub(crate) fn policy_pack_view(
         rules: pack.rules.len(),
         source_count,
         reviewer: reviewer.unwrap_or("Awaiting approval").to_owned(),
-    }
-}
-
-pub(crate) fn evaluation_view(
-    request: CreateEvaluationRequest,
-    pack: &PolicyPack,
-    evidence: &EvidenceBundle,
-    summary: &governance_domain::EvaluationSummary,
-) -> EvaluationView {
-    EvaluationView {
-        id: summary.eval_run_id,
-        target: request.target,
-        target_version: evidence.target_version.clone(),
-        policy_pack: pack.key.clone(),
-        verdict: summary.verdict,
-        passed: summary.passed,
-        failed: summary.failed,
-        inconclusive: summary.inconclusive,
-        duration_ms: 2_418,
-        cost_usd: 0.18,
-        created_at: OffsetDateTime::now_utc().to_string(),
-        trace_quality: evidence.trace_quality,
-        findings: summary
-            .results
-            .iter()
-            .map(|result| FindingView {
-                rule_id: result.rule_id.clone(),
-                severity: format!("{:?}", result.severity).to_ascii_lowercase(),
-                status: format!("{:?}", result.status).to_ascii_lowercase(),
-                message: result.message.clone(),
-            })
-            .collect(),
-        timeline: evidence.events.iter().map(timeline_item).collect(),
     }
 }
 
@@ -439,6 +359,7 @@ pub(crate) async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "governance-api",
         version: env!("CARGO_PKG_VERSION"),
+        policy_import_worker: "not_checked",
     })
 }
 
@@ -536,143 +457,6 @@ fn corpus_catalog() -> Vec<CorpusView> {
         ],
         attribution: "Structured US primary-law data from the Open US Law corpus by Vaquill AI, used under CC BY 4.0.".to_owned(),
     }]
-}
-
-pub(crate) fn demo_evidence(
-    organization_id: OrganizationId,
-    missing_approval: bool,
-    missing_trace: bool,
-) -> EvidenceBundle {
-    let eval_run_id = EvalRunId::new();
-    let invocation_id = InvocationId::new();
-    let scenario_id = ScenarioId::new();
-    let now = OffsetDateTime::now_utc();
-    let mut events = Vec::new();
-    events.push(event(
-        organization_id,
-        eval_run_id,
-        invocation_id,
-        scenario_id,
-        1,
-        EventType::ScenarioInput,
-        "refund request",
-        json!({"amount": 700}),
-        BTreeMap::new(),
-    ));
-    if !missing_approval {
-        events.push(event(
-            organization_id,
-            eval_run_id,
-            invocation_id,
-            scenario_id,
-            2,
-            EventType::HumanApprovalDecision,
-            "approval",
-            Value::Null,
-            BTreeMap::from([("decision".to_owned(), json!("approved"))]),
-        ));
-    }
-    events.push(event(
-        organization_id,
-        eval_run_id,
-        invocation_id,
-        scenario_id,
-        3,
-        EventType::ToolCall,
-        "issue_refund",
-        json!({"amount": 700.0, "currency": "USD"}),
-        BTreeMap::new(),
-    ));
-    if !missing_trace {
-        events.push(event(
-            organization_id,
-            eval_run_id,
-            invocation_id,
-            scenario_id,
-            4,
-            EventType::FinalOutput,
-            "refund completed",
-            Value::Null,
-            BTreeMap::from([("terminal_state".to_owned(), json!("completed"))]),
-        ));
-    }
-    EvidenceBundle {
-        organization_id,
-        eval_run_id,
-        invocation_id,
-        scenario_id,
-        target_version: "git:demo-new".to_owned(),
-        terminal_state: (!missing_trace).then(|| "completed".to_owned()),
-        events,
-        side_effects: vec![json!({"type": "refund", "amount": 700})],
-        trace_quality: if missing_trace {
-            TraceQualityStatus::Insufficient
-        } else {
-            TraceQualityStatus::Complete
-        },
-        trace_defects: vec![],
-        evidence_sha256: format!("demo-{now}"),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn event(
-    organization_id: OrganizationId,
-    eval_run_id: EvalRunId,
-    invocation_id: InvocationId,
-    scenario_id: ScenarioId,
-    sequence: u64,
-    event_type: EventType,
-    name: &str,
-    input: Value,
-    attributes: BTreeMap<String, Value>,
-) -> NormalizedEvent {
-    NormalizedEvent {
-        schema_version: "1.0".to_owned(),
-        organization_id,
-        eval_run_id,
-        invocation_id,
-        scenario_id,
-        trace_id: "demo-trace".to_owned(),
-        id: EventId::new(),
-        parent_event_id: None,
-        sequence,
-        started_at: OffsetDateTime::now_utc(),
-        ended_at: Some(OffsetDateTime::now_utc()),
-        actor: Actor {
-            actor_type: if matches!(
-                event_type,
-                EventType::HumanApprovalRequest | EventType::HumanApprovalDecision
-            ) {
-                ActorType::Human
-            } else {
-                ActorType::Agent
-            },
-            id: "refund-agent".to_owned(),
-        },
-        event_type,
-        name: name.to_owned(),
-        input,
-        output: Value::Null,
-        attributes,
-        source_span_id: Some(format!("span-{sequence}")),
-        redacted: true,
-    }
-}
-
-pub(crate) fn timeline_item(event: &NormalizedEvent) -> TimelineItem {
-    TimelineItem {
-        sequence: event.sequence,
-        event_type: event.event_type,
-        name: event.name.clone(),
-        actor: event.actor.id.clone(),
-        outcome: if event.event_type == EventType::Error {
-            "error"
-        } else {
-            "observed"
-        }
-        .to_owned(),
-    }
 }
 
 fn demo_targets() -> Vec<TargetView> {
@@ -777,6 +561,7 @@ mod tests {
     use std::fs;
 
     use axum::{body::Body, http::Request};
+    use governance_domain::ReviewStatus;
     use tower::ServiceExt;
 
     use super::*;

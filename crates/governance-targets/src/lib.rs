@@ -1,7 +1,7 @@
 //! Framework-neutral target manifests and HTTP/webhook drivers.
 
 use async_trait::async_trait;
-use governance_domain::{EvalRunId, ScenarioId};
+use governance_domain::{EvalRunId, InvocationId, PolicyPackId, RunBoundaryKind, ScenarioId};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,6 +27,42 @@ pub struct TargetManifest {
     pub timeout_seconds: u64,
     pub otlp_required: bool,
     pub production_credentials_allowed: bool,
+    #[serde(default)]
+    pub telemetry_boundary: TelemetryBoundaryConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TelemetryBoundaryConfig {
+    pub boundary_kind: RunBoundaryKind,
+    #[serde(default)]
+    pub external_id_attributes: Vec<String>,
+    pub terminal_attribute: Option<String>,
+    pub default_policy_pack_id: Option<PolicyPackId>,
+    #[serde(default = "default_settle_seconds")]
+    pub settle_seconds: u64,
+    pub idle_timeout_seconds: Option<u64>,
+    pub max_duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub conversation_id_is_task_boundary: bool,
+}
+
+const fn default_settle_seconds() -> u64 {
+    10
+}
+
+impl Default for TelemetryBoundaryConfig {
+    fn default() -> Self {
+        Self {
+            boundary_kind: RunBoundaryKind::ExplicitCi,
+            external_id_attributes: vec!["featherlane.external_run.id".to_owned()],
+            terminal_attribute: Some("featherlane.run.terminal".to_owned()),
+            default_policy_pack_id: None,
+            settle_seconds: default_settle_seconds(),
+            idle_timeout_seconds: None,
+            max_duration_seconds: None,
+            conversation_id_is_task_boundary: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,6 +78,7 @@ pub enum TestEvent {
 #[derive(Clone, Debug)]
 pub struct RunContext {
     pub eval_run_id: EvalRunId,
+    pub invocation_id: InvocationId,
     pub scenario_id: ScenarioId,
 }
 
@@ -49,6 +86,7 @@ pub struct RunContext {
 pub struct TargetSession {
     pub id: String,
     pub traceparent: String,
+    pub baggage: String,
     pub context: RunContext,
 }
 
@@ -153,7 +191,18 @@ impl TargetDriver for HttpTargetDriver {
         let response = self
             .client
             .post(endpoint)
+            .header("x-featherlane-eval-run-id", context.eval_run_id.to_string())
+            .header(
+                "x-featherlane-invocation-id",
+                context.invocation_id.to_string(),
+            )
+            .header("x-featherlane-scenario-id", context.scenario_id.to_string())
             .header("x-governance-eval-run-id", context.eval_run_id.to_string())
+            .header(
+                "x-governance-invocation-id",
+                context.invocation_id.to_string(),
+            )
+            .header("x-governance-scenario-id", context.scenario_id.to_string())
             .send()
             .await?;
         if !response.status().is_success() {
@@ -169,6 +218,10 @@ impl TargetDriver for HttpTargetDriver {
         Ok(TargetSession {
             id: Uuid::now_v7().to_string(),
             traceparent: format!("00-{trace_id}-{parent_id}-01"),
+            baggage: format!(
+                "featherlane.eval_run.id={},featherlane.invocation.id={},featherlane.scenario.id={}",
+                context.eval_run_id, context.invocation_id, context.scenario_id
+            ),
             context,
         })
     }
@@ -189,9 +242,26 @@ impl TargetDriver for HttpTargetDriver {
             .client
             .post(&manifest.endpoint)
             .header("traceparent", &session.traceparent)
+            .header("baggage", &session.baggage)
+            .header(
+                "x-featherlane-eval-run-id",
+                session.context.eval_run_id.to_string(),
+            )
+            .header(
+                "x-featherlane-invocation-id",
+                session.context.invocation_id.to_string(),
+            )
+            .header(
+                "x-featherlane-scenario-id",
+                session.context.scenario_id.to_string(),
+            )
             .header(
                 "x-governance-eval-run-id",
                 session.context.eval_run_id.to_string(),
+            )
+            .header(
+                "x-governance-invocation-id",
+                session.context.invocation_id.to_string(),
             )
             .header(
                 "x-governance-scenario-id",
@@ -203,9 +273,12 @@ impl TargetDriver for HttpTargetDriver {
         if !response.status().is_success() {
             return Err(DriverError::Rejected(response.status()));
         }
-        let body = response.json().await?;
+        let body: Value = response.json().await?;
         Ok(TargetOutput {
-            terminal: manifest.driver_type == DriverType::HttpText,
+            terminal: body
+                .get("terminal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             body,
         })
     }
@@ -221,6 +294,7 @@ mod tests {
         let session = driver
             .start_session(RunContext {
                 eval_run_id: EvalRunId::new(),
+                invocation_id: InvocationId::new(),
                 scenario_id: ScenarioId::new(),
             })
             .await
@@ -229,6 +303,8 @@ mod tests {
         assert_eq!(parts.len(), 4);
         assert_eq!(parts[1].len(), 32);
         assert_eq!(parts[2].len(), 16);
+        assert!(session.baggage.contains("featherlane.eval_run.id="));
+        assert!(session.baggage.contains("featherlane.invocation.id="));
     }
 
     #[tokio::test]
@@ -245,6 +321,7 @@ mod tests {
             timeout_seconds: 1,
             otlp_required: false,
             production_credentials_allowed: true,
+            telemetry_boundary: TelemetryBoundaryConfig::default(),
         };
         assert!(matches!(
             driver.validate(&manifest).await,

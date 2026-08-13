@@ -1,46 +1,124 @@
-# Target and trace integration
+# Evaluation-run and OTLP integration
 
-## Policy import lane
+Featherlane integrates at two stable boundaries: a business execution is one
+evaluation run, and its telemetry is standard OTLP. A workflow execution, agent
+task, voice call, or CI execution may contain many model calls, traces, retries,
+and batches; all of them share one `featherlane.eval_run.id`.
 
-Send a complete JSON policy aggregate to `POST /v1/policy-packs`. The API
-validates rule-to-obligation references and writes the pack, rules, sources,
-obligations, and links in one PostgreSQL transaction. The pack remains a draft
-until `POST /v1/policy-packs/{id}/approve` records the human publication review.
-Evaluation requests may then name that persisted `policy_pack_id`; background
-jobs carry only the ID and evidence, never a serialized policy definition.
+## Active CI
 
-## Active CI lane
+Start a run against an approved, immutable policy pack:
 
-Register a target manifest with an HTTP message endpoint, optional reset
-endpoint, target version, timeout, and a secret reference. Featherlane starts a
-session and sends typed events. Each request carries:
+```bash
+eval "$(cargo run -q -p gov-eval -- start \
+  --target refund-agent-staging \
+  --target-version git:4e6a9c1 \
+  --policy-pack-id "$POLICY_PACK_ID" \
+  --boundary workflow-execution \
+  --format shell)"
+```
 
-- W3C `traceparent`;
-- `x-governance-eval-run-id`;
-- `x-governance-scenario-id`.
+The shell output contains correlation IDs, the OTLP endpoint/protocol, and a
+merged `OTEL_RESOURCE_ATTRIBUTES` value—never an ingest credential. Configure
+the target-scoped `OTEL_EXPORTER_OTLP_HEADERS` secret separately in CI.
+Featherlane's target driver propagates `traceparent`, W3C `baggage`, canonical
+`x-featherlane-*` headers, and temporary `x-governance-*` compatibility headers.
+Copy baggage values into span attributes if the SDK does not do that itself:
 
-Text agents receive `{ "session_id", "message" }`. Webhook workflows receive the
-configured JSON event. Voice agents are integrated through their test/media
-gateway: the adapter can send an audio reference or transcript event while the
-same trace contract observes model, tool, handoff, and terminal events.
+```text
+featherlane.eval_run.id
+featherlane.invocation.id
+featherlane.scenario.id
+```
 
-The MVP never sends production credentials and should target staging, preview,
-or a resettable sandbox.
+After the full workflow/task has ended, close the boundary and wait for the one
+immutable result:
 
-## Passive observability lane
+```bash
+cargo run -q -p gov-eval -- complete \
+  --run-id "$FEATHERLANE_EVAL_RUN_ID" --terminal-state completed
+cargo run -q -p gov-eval -- wait \
+  --run-id "$FEATHERLANE_EVAL_RUN_ID" --format junit --fail-on-inconclusive
+```
 
-Production or staging services may send trace envelopes to `POST /v1/traces` on
-the telemetry gateway. The gateway allowlists governance/OpenInference
-attributes, removes secret-like keys before persistence, normalizes spans into
-the versioned event schema, and assigns a trace-quality result.
+A successful target HTTP response is not automatically a completed workflow.
+The target contract must say it is terminal or the caller must invoke complete.
 
-Passive observation can detect evidence about naturally occurring behavior, but
-cannot prove scenarios that did not happen. Active CI testing and passive
-monitoring share the event schema and evaluator; they are different evidence
-sources.
+## Generic OTLP export
 
-## Terminal workflows
+Keep the OpenTelemetry/OpenInference instrumentation already used by Google ADK,
+Mastra, OpenAI Agents SDK, LangGraph, or a custom framework. Add a small resource
+or span processor that attaches the correlation attributes above, then point the
+normal OTLP/HTTP exporter at Featherlane:
 
-Long-running workflows should expose a status endpoint or emit a final workflow
-span. A successful HTTP response is not automatically proof of completed side
-effects. If the terminal state is missing, affected rules become inconclusive.
+```text
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer flt_...
+```
+
+The endpoint accepts OTLP protobuf and OTLP JSON, optional gzip, and responds in
+the request format. The ingest key is target-scoped; tenant and target identity
+come from the key, never from customer-controlled span attributes. Exact span
+retries are idempotent. Conflicting retries receive an OTLP partial-success
+rejection.
+
+For passive workflows without a Featherlane-created ID, persist a target
+`telemetry_boundary` capability with its boundary kind, ordered external-ID
+attributes, approved default policy pack, and finite timeouts. For example:
+
+```json
+{
+  "boundary_kind": "workflow_execution",
+  "external_id_attributes": ["workflow.run.id"],
+  "terminal_attribute": "workflow.completed",
+  "default_policy_pack_id": "<approved-policy-pack-uuid>",
+  "settle_seconds": 10,
+  "idle_timeout_seconds": 300,
+  "max_duration_seconds": 3600,
+  "conversation_id_is_task_boundary": false
+}
+```
+
+The first span with that configured external ID atomically finds or creates the
+run. `gen_ai.conversation.id` is considered only when it appears in the target's
+attribute list and `conversation_id_is_task_boundary` is true. A long-lived chat
+session must not be treated as an evaluation run by default.
+
+## Human approval and terminal events
+
+Framework spans are useful evidence but cannot reliably reveal every domain
+event. Emit a structured span attribute when the customer system records an
+approval decision:
+
+```text
+featherlane.event.type=human_approval_decision
+decision=approved
+```
+
+Likewise, a terminal event may use:
+
+```text
+featherlane.event.type=final_output
+featherlane.run.terminal=true
+featherlane.run.terminal_state=completed
+```
+
+Featherlane does not ask a model judge to invent an approval or guess where an
+opaque workflow ended. A target-specific deterministic mapping is acceptable;
+fabricated semantic evidence is not. If required approval evidence is absent,
+the policy's missing-evidence behavior yields `not_observable`, `fail`, or
+`error`—never a vacuous pass.
+
+## Unassigned telemetry
+
+Valid, redacted spans without a verified run or configured external boundary are
+stored as unassigned diagnostics. They are not evaluated. Inspect the target's
+correlation configuration, then resend with a canonical run ID or create the
+matching external-boundary run. Late spans are retained as diagnostics but never
+mutate an already finalized bundle or verdict.
+
+The sample requests in `fixtures/otlp/correlated-run/` put approval in trace A
+and execution/terminal events in linked trace B. Send `02-execution.json` first,
+then `01-approval.json`, and retry either file to exercise out-of-order and
+idempotent ingestion.

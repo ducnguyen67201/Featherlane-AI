@@ -1,10 +1,12 @@
-import { CheckCircle2, Database, FileCheck2, GitBranch, ShieldCheck } from "lucide-react";
+import Link from "next/link";
+import { ArrowRight, CheckCircle2, Database, FileCheck2, GitBranch, ShieldCheck } from "lucide-react";
 import { ImportPolicyButton } from "@/components/import-policy-button";
-import { getPolicies, getPolicyPack } from "@/lib/api";
+import { getPolicies, getPolicyImports, getPolicyPack } from "@/lib/api";
 import { PageHeader, StateBadge } from "@/components/ui";
 
 export default async function PoliciesPage() {
   const packs = await getPolicies();
+  const imports = await getPolicyImports();
   const details = await Promise.all(packs.map((pack) => getPolicyPack(pack.id)));
   const sourceCount = packs.reduce((total, pack) => total + pack.source_count, 0);
   const ruleCount = packs.reduce((total, pack) => total + pack.rules, 0);
@@ -25,11 +27,30 @@ export default async function PoliciesPage() {
         <div><ShieldCheck size={18} /><span>Executable packs</span><strong>{ruleCount} database rules</strong></div>
       </section>
 
+      <section className="panel">
+        <div className="section-header"><div><h2>Recent source imports</h2><p>Live ingestion and human-review state from the governance database.</p></div></div>
+        {imports.error ? (
+          <div className="inline-api-error">{imports.error} Import state is never replaced with demonstration data.</div>
+        ) : imports.data?.length ? (
+          <div className="import-list">
+            {imports.data.map((policyImport) => (
+              <Link key={policyImport.id} href={`/policies/imports/${policyImport.id}`}>
+                <div><strong>{policyImport.title}</strong><span>{policyImport.source_type.replaceAll("_", " ")} · {policyImport.candidate_count} candidates</span></div>
+                <StateBadge state={policyImport.status} />
+                <ArrowRight size={14} />
+              </Link>
+            ))}
+          </div>
+        ) : (
+          <div className="inline-empty">No source imports yet. Upload a policy source to begin grounded extraction.</div>
+        )}
+      </section>
+
       {packs.length === 0 ? (
         <section className="panel policy-empty">
           <Database size={27} />
           <h2>No policy packs in PostgreSQL</h2>
-          <p>Import a JSON policy aggregate to create a draft. Featherlane never loads executable policies from repository files or frontend seed data.</p>
+          <p>Import a policy source, verify it, and approve grounded candidates to compile the first draft pack. Featherlane never loads executable policies from repository files or frontend seed data.</p>
         </section>
       ) : packs.map((pack, index) => {
         const detail = details[index];

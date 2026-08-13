@@ -1,0 +1,25 @@
+[package]
+name = "governance-ingestion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+docx-rs.workspace = true
+governance-application.workspace = true
+governance-config.workspace = true
+governance-domain.workspace = true
+opendal.workspace = true
+pdf-extract.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

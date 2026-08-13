@@ -11,6 +11,22 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: featherlane_test
+          POSTGRES_USER: featherlane
+          POSTGRES_PASSWORD: featherlane
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U featherlane -d featherlane_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgres://featherlane:featherlane@localhost:5432/featherlane_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,6 +37,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: cargo build --workspace --release --locked
 
   web:
     runs-on: ubuntu-latest

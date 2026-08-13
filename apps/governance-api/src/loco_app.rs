@@ -8,29 +8,35 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use governance_application::{
-    DashboardSnapshot, EvaluateEvidence, EvaluationRepository, PolicyPackRepository,
+    CancelEvaluationRun, CompleteEvaluationRun, CompletionRequest, CreateEvaluationRun,
+    CreateEvaluationRunRequest, DashboardSnapshot, EvaluationRepository, EvaluationRunRepository,
+    EvidenceBundleRepository, PolicyPackRepository, RotateTelemetryIngestKey,
+    TelemetryIngestKeyRepository,
 };
-use governance_domain::{EvalRunId, PolicyPackApproval, PolicyPackId, ReviewStatus, RunVerdict};
+use governance_domain::{EvalRunId, PolicyPackApproval, PolicyPackId};
 use governance_migration::Migrator;
-use governance_persistence::{SeaOrmEvaluationRepository, SeaOrmPolicyPackRepository};
-use governance_worker::EvaluationWorker;
+use governance_persistence::{
+    SeaOrmEvaluationRepository, SeaOrmEvaluationRunRepository, SeaOrmPolicyPackRepository,
+};
+use governance_worker::{EvaluationWorker, FinalizationWorker, ProcessPolicyImportWorker};
 use loco_rs::{
     Result,
     app::{AppContext, Hooks},
     bgworker::{BackgroundWorker, Queue},
     boot::{BootResult, StartMode, create_app},
-    config::Config,
+    config::{Config, WorkerMode},
     controller::{AppRoutes, Routes},
     environment::Environment,
-    prelude::{get, post},
+    prelude::{get, patch, post},
     task::Tasks,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    ApprovePolicyPackRequest, CreateEvaluationRequest, EvaluationView, HealthResponse,
-    PolicyImportRequest, PolicyPackView, TargetView,
+    ApprovePolicyPackRequest, CompleteEvaluationRequest, CreateEvaluationRequest,
+    CreatedEvaluationRun, EvaluationRunDetail, HealthResponse, PolicyImportRequest, PolicyPackView,
+    RotateTelemetryKeyRequest, TargetView,
 };
 
 #[derive(Debug)]
@@ -60,6 +66,10 @@ impl Hooks for App {
 
     async fn connect_workers(context: &AppContext, queue: &Queue) -> Result<()> {
         queue.register(EvaluationWorker::build(context)).await?;
+        queue.register(FinalizationWorker::build(context)).await?;
+        queue
+            .register(ProcessPolicyImportWorker::build(context))
+            .await?;
         Ok(())
     }
 
@@ -85,15 +95,79 @@ fn api_routes() -> Routes {
             "/v1/policy-packs/{id}/approve",
             post(loco_approve_policy_pack),
         )
+        .add(
+            "/v1/policy-imports",
+            get(crate::policy_imports::list_policy_imports),
+        )
+        .add(
+            "/v1/policy-imports",
+            post(crate::policy_imports::create_policy_import),
+        )
+        .add(
+            "/v1/policy-imports/{id}",
+            get(crate::policy_imports::get_policy_import),
+        )
+        .add(
+            "/v1/policy-imports/{id}/candidates",
+            get(crate::policy_imports::list_policy_candidates),
+        )
+        .add(
+            "/v1/policy-imports/{id}/candidates",
+            post(crate::policy_imports::add_manual_candidate),
+        )
+        .add(
+            "/v1/policy-imports/{id}/candidates/{candidate_id}",
+            patch(crate::policy_imports::review_candidate),
+        )
+        .add(
+            "/v1/policy-imports/{id}/source-context",
+            get(crate::policy_imports::source_context),
+        )
+        .add(
+            "/v1/policy-imports/{id}/verify-source",
+            post(crate::policy_imports::verify_source),
+        )
+        .add(
+            "/v1/policy-imports/{id}/retry",
+            post(crate::policy_imports::retry_policy_import),
+        )
+        .add(
+            "/v1/policy-imports/{id}/compile",
+            post(crate::policy_imports::compile_import),
+        )
         .add("/v1/targets", get(loco_targets))
         .add("/v1/evaluations", get(loco_evaluations))
         .add("/v1/evaluations", post(loco_create_evaluation))
         .add("/v1/evaluations/{id}", get(loco_evaluation))
+        .add(
+            "/v1/evaluations/{id}/complete",
+            post(loco_complete_evaluation),
+        )
+        .add("/v1/evaluations/{id}/cancel", post(loco_cancel_evaluation))
+        .add(
+            "/v1/targets/{id}/telemetry-key/rotate",
+            post(loco_rotate_telemetry_key),
+        )
+        .add(
+            "/v1/targets/{id}/telemetry-key/revoke",
+            post(loco_revoke_telemetry_key),
+        )
         .add("/v1/corpora/{set_name}", get(loco_corpus))
 }
 
-async fn loco_health() -> Json<HealthResponse> {
-    super::health().await
+async fn loco_health(State(context): State<AppContext>) -> Json<HealthResponse> {
+    let durable_worker = context.config.workers.mode == WorkerMode::BackgroundQueue
+        && context.config.queue.is_some();
+    Json(HealthResponse {
+        status: if durable_worker { "ok" } else { "degraded" },
+        service: "governance-api",
+        version: env!("CARGO_PKG_VERSION"),
+        policy_import_worker: if durable_worker {
+            "durable_queue"
+        } else {
+            "not_durable"
+        },
+    })
 }
 
 async fn loco_overview(State(context): State<AppContext>) -> Response {
@@ -195,8 +269,12 @@ async fn loco_targets() -> Json<Vec<TargetView>> {
     super::targets(axum::extract::State(super::demo_state())).await
 }
 
-async fn loco_evaluations() -> Json<Vec<EvaluationView>> {
-    super::evaluations(axum::extract::State(super::demo_state())).await
+async fn loco_evaluations(State(context): State<AppContext>) -> Response {
+    let repository = SeaOrmEvaluationRunRepository::new(context.db);
+    match repository.list_runs(super::default_organization_id()).await {
+        Ok(runs) => Json(runs).into_response(),
+        Err(error) => database_error(error),
+    }
 }
 
 async fn loco_evaluation(State(context): State<AppContext>, Path(id): Path<String>) -> Response {
@@ -204,39 +282,27 @@ async fn loco_evaluation(State(context): State<AppContext>, Path(id): Path<Strin
         return problem(StatusCode::BAD_REQUEST, "invalid evaluation identifier");
     };
     let organization_id = super::default_organization_id();
-    let evaluation_repository = SeaOrmEvaluationRepository::new(context.db.clone());
-    let summary = match evaluation_repository.get_summary(organization_id, id).await {
-        Ok(Some(summary)) => summary,
+    let runs = SeaOrmEvaluationRunRepository::new(context.db.clone());
+    let run = match runs.get_run(organization_id, id).await {
+        Ok(Some(run)) => run,
         Ok(None) => return problem(StatusCode::NOT_FOUND, "evaluation was not found"),
         Err(error) => return database_error(error),
     };
-    let policy_repository = SeaOrmPolicyPackRepository::new(context.db);
-    let pack = match policy_repository.list(organization_id).await {
-        Ok(packs) => packs
-            .into_iter()
-            .find(|pack| pack.status == ReviewStatus::Approved),
+    let summaries = SeaOrmEvaluationRepository::new(context.db);
+    let summary = match summaries.get_summary(organization_id, id).await {
+        Ok(summary) => summary,
         Err(error) => return database_error(error),
     };
-    let Some(pack) = pack else {
-        return problem(
-            StatusCode::NOT_FOUND,
-            "the approved policy pack for this evaluation was not found",
-        );
+    let evidence = match runs.get_bundle(organization_id, id).await {
+        Ok(evidence) => evidence,
+        Err(error) => return database_error(error),
     };
-    let simulate_missing_approval = summary.verdict == RunVerdict::Fail;
-    let simulate_missing_trace = summary.verdict == RunVerdict::Inconclusive;
-    let evidence = super::demo_evidence(
-        organization_id,
-        simulate_missing_approval,
-        simulate_missing_trace,
-    );
-    let request = CreateEvaluationRequest {
-        policy_pack_id: Some(pack.id),
-        target: super::default_target(),
-        simulate_missing_approval,
-        simulate_missing_trace,
-    };
-    Json(super::evaluation_view(request, &pack, &evidence, &summary)).into_response()
+    Json(EvaluationRunDetail {
+        run,
+        summary,
+        evidence,
+    })
+    .into_response()
 }
 
 async fn loco_create_evaluation(
@@ -245,40 +311,111 @@ async fn loco_create_evaluation(
 ) -> Response {
     let organization_id = super::default_organization_id();
     let policy_repository = SeaOrmPolicyPackRepository::new(context.db.clone());
-    let pack = if let Some(id) = request.policy_pack_id {
-        policy_repository.get(organization_id, id).await
-    } else {
-        policy_repository.list(organization_id).await.map(|packs| {
-            packs
-                .into_iter()
-                .find(|pack| pack.status == ReviewStatus::Approved)
-        })
-    };
-    let pack = match pack {
-        Ok(Some(pack)) => pack,
-        Ok(None) => {
-            return problem(
-                StatusCode::PRECONDITION_REQUIRED,
-                "no approved database policy pack is available",
-            );
-        }
-        Err(error) => return database_error(error),
-    };
-    let evidence = super::demo_evidence(
+    let runs = SeaOrmEvaluationRunRepository::new(context.db);
+    let command = CreateEvaluationRunRequest {
         organization_id,
-        request.simulate_missing_approval,
-        request.simulate_missing_trace,
-    );
-    let evaluation_repository = SeaOrmEvaluationRepository::new(context.db);
-    match EvaluateEvidence::new(policy_repository, evaluation_repository)
-        .execute(organization_id, pack.id, &evidence)
+        target_id: request.target_id,
+        target_version: request.target_version,
+        policy_pack_id: request.policy_pack_id,
+        scenario_id: request.scenario_id,
+        rule_ids: request.rule_ids,
+        boundary_kind: request.boundary_kind,
+        external_run_id: request.external_run_id,
+        invocation_id: request.invocation_id,
+        max_duration_seconds: request.max_duration_seconds,
+    };
+    match CreateEvaluationRun::new(policy_repository, runs.clone(), runs)
+        .execute(command)
         .await
     {
-        Ok(summary) => (
-            StatusCode::CREATED,
-            Json(super::evaluation_view(request, &pack, &evidence, &summary)),
+        Ok(run) => {
+            let endpoint = std::env::var("GOVERNANCE_OTLP_HTTP_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:4318/v1/traces".to_owned());
+            (
+                StatusCode::CREATED,
+                Json(CreatedEvaluationRun::new(run, endpoint)),
+            )
+                .into_response()
+        }
+        Err(error) => database_error(error),
+    }
+}
+
+async fn loco_complete_evaluation(
+    State(context): State<AppContext>,
+    Path(id): Path<String>,
+    Json(request): Json<CompleteEvaluationRequest>,
+) -> Response {
+    let Some(eval_run_id) = parse_eval_run_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid evaluation identifier");
+    };
+    let repository = SeaOrmEvaluationRunRepository::new(context.db);
+    let command = CompletionRequest {
+        organization_id: super::default_organization_id(),
+        eval_run_id,
+        reason: request.reason,
+        terminal_state: request.terminal_state,
+        settle_seconds: request.settle_seconds,
+    };
+    match CompleteEvaluationRun::new(repository.clone(), repository)
+        .execute(command)
+        .await
+    {
+        Ok(run) => (StatusCode::ACCEPTED, Json(run)).into_response(),
+        Err(error) => database_error(error),
+    }
+}
+
+async fn loco_cancel_evaluation(
+    State(context): State<AppContext>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(eval_run_id) = parse_eval_run_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid evaluation identifier");
+    };
+    let repository = SeaOrmEvaluationRunRepository::new(context.db);
+    match CancelEvaluationRun::new(repository)
+        .execute(super::default_organization_id(), eval_run_id)
+        .await
+    {
+        Ok(run) => Json(run).into_response(),
+        Err(error) => database_error(error),
+    }
+}
+
+async fn loco_rotate_telemetry_key(
+    State(context): State<AppContext>,
+    Path(target_id): Path<String>,
+    Json(request): Json<RotateTelemetryKeyRequest>,
+) -> Response {
+    let repository = SeaOrmEvaluationRunRepository::new(context.db);
+    match RotateTelemetryIngestKey::new(repository)
+        .execute(
+            super::default_organization_id(),
+            target_id,
+            request.expires_at,
         )
-            .into_response(),
+        .await
+    {
+        Ok(key) => (StatusCode::CREATED, Json(key)).into_response(),
+        Err(error) => database_error(error),
+    }
+}
+
+async fn loco_revoke_telemetry_key(
+    State(context): State<AppContext>,
+    Path(target_id): Path<String>,
+) -> Response {
+    let repository = SeaOrmEvaluationRunRepository::new(context.db);
+    match repository
+        .revoke_target_keys(
+            super::default_organization_id(),
+            &target_id,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => database_error(error),
     }
 }
@@ -299,12 +436,14 @@ fn parse_eval_run_id(value: &str) -> Option<EvalRunId> {
 }
 
 #[allow(clippy::needless_pass_by_value)] // Keeps match arms usable as direct error adapters.
-fn database_error(error: governance_application::ApplicationError) -> Response {
+pub(crate) fn database_error(error: governance_application::ApplicationError) -> Response {
     let detail = error.to_string();
     let status = match error {
         governance_application::ApplicationError::NotFound(_) => StatusCode::NOT_FOUND,
-        governance_application::ApplicationError::InvalidRequest(_) => StatusCode::CONFLICT,
+        governance_application::ApplicationError::InvalidRequest(_)
+        | governance_application::ApplicationError::Conflict(_) => StatusCode::CONFLICT,
         governance_application::ApplicationError::Forbidden(_) => StatusCode::FORBIDDEN,
+        governance_application::ApplicationError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         governance_application::ApplicationError::Repository(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -312,7 +451,7 @@ fn database_error(error: governance_application::ApplicationError) -> Response {
     problem(status, &detail)
 }
 
-fn problem(status: StatusCode, detail: &str) -> Response {
+pub(crate) fn problem(status: StatusCode, detail: &str) -> Response {
     (
         status,
         Json(crate::ProblemDetails {

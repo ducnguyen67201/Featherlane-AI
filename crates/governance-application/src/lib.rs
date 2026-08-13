@@ -9,6 +9,12 @@ use governance_evaluator::evaluate_pack;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod evaluation_runs;
+mod policy_import;
+
+pub use evaluation_runs::*;
+pub use policy_import::*;
+
 #[derive(Debug, Error)]
 pub enum ApplicationError {
     #[error("repository operation failed: {0}")]
@@ -19,6 +25,10 @@ pub enum ApplicationError {
     Forbidden(String),
     #[error("invalid application request: {0}")]
     InvalidRequest(String),
+    #[error("resource state conflicts with this operation: {0}")]
+    Conflict(String),
+    #[error("required service is unavailable: {0}")]
+    Unavailable(String),
 }
 
 #[async_trait]

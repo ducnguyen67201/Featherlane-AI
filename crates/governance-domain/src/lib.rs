@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -52,8 +53,17 @@ id_type!(EvalRunId);
 id_type!(InvocationId);
 id_type!(EventId);
 id_type!(RuleResultId);
+id_type!(PolicyImportId);
+id_type!(PolicyCandidateId);
+id_type!(PolicyCandidateReviewId);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+mod evaluation_run;
+mod policy_import;
+
+pub use evaluation_run::*;
+pub use policy_import::*;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
     PrimaryLaw,
@@ -80,10 +90,16 @@ pub enum SourceConfidence {
     Quarantined,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceLocator {
     pub page: Option<u32>,
+    #[serde(default)]
+    pub page_end: Option<u32>,
     pub section: Option<String>,
+    #[serde(default)]
+    pub paragraph_start: Option<u32>,
+    #[serde(default)]
+    pub paragraph_end: Option<u32>,
     pub source_url: Option<String>,
     pub excerpt_sha256: String,
 }
@@ -126,7 +142,7 @@ pub struct Obligation {
     pub review: Option<ReviewerApproval>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Critical,
@@ -135,7 +151,7 @@ pub enum Severity {
     Advisory,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingEvidencePolicy {
     NotObservable,
@@ -143,7 +159,8 @@ pub enum MissingEvidencePolicy {
     Error,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EventMatcher {
     pub event_type: EventType,
     pub name: Option<String>,
@@ -152,14 +169,15 @@ pub struct EventMatcher {
     pub numeric_argument: Option<NumericArgumentMatcher>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct NumericArgumentMatcher {
     pub path: String,
     pub greater_than: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuleAssertion {
     ExistsBefore { matcher: EventMatcher },
     Absent { matcher: EventMatcher },
@@ -167,7 +185,7 @@ pub enum RuleAssertion {
     TerminalState { state: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CompiledRule {
     pub id: String,
     pub version: u32,
@@ -214,7 +232,18 @@ pub struct PolicyPackApproval {
 }
 
 #[derive(
-    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
@@ -236,6 +265,7 @@ pub enum EventType {
     Error,
     Timeout,
     Cancellation,
+    Unclassified,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -265,6 +295,8 @@ pub struct NormalizedEvent {
     pub trace_id: String,
     pub id: EventId,
     pub parent_event_id: Option<EventId>,
+    #[serde(default)]
+    pub linked_event_ids: Vec<EventId>,
     pub sequence: u64,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
@@ -300,11 +332,21 @@ pub struct TraceDefect {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceBundle {
+    #[serde(default = "default_evidence_schema_version")]
+    pub schema_version: String,
     pub organization_id: OrganizationId,
     pub eval_run_id: EvalRunId,
     pub invocation_id: InvocationId,
+    #[serde(default)]
+    pub invocation_ids: Vec<InvocationId>,
     pub scenario_id: ScenarioId,
     pub target_version: String,
+    #[serde(default)]
+    pub policy_content_sha256: String,
+    #[serde(default)]
+    pub trace_ids: Vec<String>,
+    #[serde(default)]
+    pub completion_reason: Option<CompletionReason>,
     pub terminal_state: Option<String>,
     pub events: Vec<NormalizedEvent>,
     #[serde(default)]
@@ -312,7 +354,25 @@ pub struct EvidenceBundle {
     pub trace_quality: TraceQualityStatus,
     #[serde(default)]
     pub trace_defects: Vec<TraceDefect>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub finalized_at: Option<OffsetDateTime>,
     pub evidence_sha256: String,
+}
+
+fn default_evidence_schema_version() -> String {
+    "1.0".to_owned()
+}
+
+impl EventId {
+    #[must_use]
+    pub fn from_source_span(
+        organization_id: OrganizationId,
+        trace_id: &str,
+        span_id: &str,
+    ) -> Self {
+        let source = format!("{trace_id}:{span_id}");
+        Self(Uuid::new_v5(&organization_id.0, source.as_bytes()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
