@@ -48,10 +48,24 @@ Requirements: Rust 1.95, Node.js 22+, pnpm 10, and Docker.
 
 ```bash
 cp .env.example .env
+pnpm dlx auth@latest secret
 pnpm install
 docker compose up postgres -d
 cd apps/governance-api && cargo run -- start
 ```
+
+Copy the generated secret into `BETTER_AUTH_SECRET` in `.env`; never commit the
+populated file. In Google Cloud, create an OAuth 2.0 client with application type
+**Web application**, configure the consent screen and test users if Google
+requires them, and register this exact authorized redirect URI:
+
+```text
+http://localhost:3000/api/auth/callback/google
+```
+
+Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from that client. Keep
+`BETTER_AUTH_URL=http://localhost:3000`. Featherlane requests only the basic
+Google identity needed to sign in; there is no password or additional provider.
 
 In another terminal:
 
@@ -60,13 +74,26 @@ pnpm --dir apps/web dev
 ```
 
 Open `http://localhost:3000`. The console has a deterministic seed fallback, so
-its complete visual flow is still available while the Rust API is offline.
+its complete visual flow is still available after sign-in while the Rust API is
+offline.
 
 To start the complete container topology:
 
 ```bash
 docker compose up --build
 ```
+
+For production, set `BETTER_AUTH_URL` to the public HTTPS console origin and
+register the matching exact callback, for example
+`https://console.example.com/api/auth/callback/google`. Load the Better Auth and
+Google client secrets from the deployment secret manager, not image build args
+or source control. Complete Google's production consent-screen, homepage, and
+privacy-policy requirements before making the client public.
+
+Google login protects the web console and its same-origin mutation endpoints.
+The Rust/Loco `/v1/*` API intentionally remains directly callable for the CLI
+and service integrations in this MVP; add API authentication, service identity,
+organization authorization, and RBAC before exposing that API publicly.
 
 ## Import and approve a policy
 

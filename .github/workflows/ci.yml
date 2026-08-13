@@ -34,6 +34,12 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Configure ephemeral auth build values
+        run: |
+          echo "BETTER_AUTH_URL=http://localhost:3000" >> "$GITHUB_ENV"
+          echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "GOOGLE_CLIENT_ID=ci-build-only.apps.googleusercontent.com" >> "$GITHUB_ENV"
+          echo "GOOGLE_CLIENT_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
       - run: pnpm --dir apps/web lint
       - run: pnpm --dir apps/web test
       - run: pnpm --dir apps/web build
@@ -42,4 +48,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure ephemeral Compose auth values
+        run: |
+          echo "BETTER_AUTH_URL=http://localhost:3000" >> "$GITHUB_ENV"
+          echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "GOOGLE_CLIENT_ID=ci-build-only.apps.googleusercontent.com" >> "$GITHUB_ENV"
+          echo "GOOGLE_CLIENT_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
       - run: docker compose config --quiet
