@@ -114,6 +114,7 @@ export const agents: AgentTarget[] = [
 ];
 
 export const corpus: Corpus = {
+  set_name: "open-us-law",
   dataset: "Open US Law",
   snapshot: "v2026.07",
   snapshot_date: "2026-07-21",

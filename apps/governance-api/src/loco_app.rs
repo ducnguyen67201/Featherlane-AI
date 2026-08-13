@@ -29,7 +29,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    ApprovePolicyPackRequest, CorpusView, CreateEvaluationRequest, EvaluationView, HealthResponse,
+    ApprovePolicyPackRequest, CreateEvaluationRequest, EvaluationView, HealthResponse,
     PolicyImportRequest, PolicyPackView, TargetView,
 };
 
@@ -89,7 +89,7 @@ fn api_routes() -> Routes {
         .add("/v1/evaluations", get(loco_evaluations))
         .add("/v1/evaluations", post(loco_create_evaluation))
         .add("/v1/evaluations/{id}", get(loco_evaluation))
-        .add("/v1/corpus/open-us-law", get(loco_corpus))
+        .add("/v1/corpora/{set_name}", get(loco_corpus))
 }
 
 async fn loco_health() -> Json<HealthResponse> {
@@ -283,8 +283,11 @@ async fn loco_create_evaluation(
     }
 }
 
-async fn loco_corpus() -> (StatusCode, Json<CorpusView>) {
-    (StatusCode::OK, super::corpus().await)
+async fn loco_corpus(Path(set_name): Path<String>) -> Response {
+    match super::corpus(Path(set_name)).await {
+        Ok(value) => value.into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 fn parse_policy_pack_id(value: &str) -> Option<PolicyPackId> {

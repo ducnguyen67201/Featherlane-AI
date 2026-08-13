@@ -114,6 +114,7 @@ export interface Jurisdiction {
 }
 
 export interface Corpus {
+  set_name: string;
   dataset: string;
   snapshot: string;
   snapshot_date: string;

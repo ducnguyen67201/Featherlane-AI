@@ -101,6 +101,7 @@ pub struct PolicyPackView {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CorpusView {
+    pub set_name: String,
     pub dataset: String,
     pub snapshot: String,
     pub snapshot_date: String,
@@ -408,7 +409,7 @@ pub fn app() -> Result<Router, ApiError> {
         .route("/v1/targets", get(targets))
         .route("/v1/evaluations", get(evaluations))
         .route("/v1/evaluations/{id}", get(evaluation))
-        .route("/v1/corpus/open-us-law", get(corpus))
+        .route("/v1/corpora/{set_name}", get(corpus))
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -493,8 +494,12 @@ pub(crate) async fn evaluation(
         .ok_or_else(|| ApiError::not_found(&format!("evaluation {id}")))
 }
 
-pub(crate) async fn corpus() -> Json<CorpusView> {
-    Json(CorpusView {
+pub(crate) async fn corpus(Path(set_name): Path<String>) -> Result<Json<CorpusView>, ApiError> {
+    if set_name != "open-us-law" {
+        return Err(ApiError::not_found(&format!("corpus {set_name}")));
+    }
+    Ok(Json(CorpusView {
+        set_name,
         dataset: "Open US Law".to_owned(),
         snapshot: PINNED_SNAPSHOT.to_owned(),
         snapshot_date: "2026-07-21".to_owned(),
@@ -525,7 +530,7 @@ pub(crate) async fn corpus() -> Json<CorpusView> {
             },
         ],
         attribution: "Structured US primary-law data from the Open US Law corpus by Vaquill AI, used under CC BY 4.0.".to_owned(),
-    })
+    }))
 }
 
 pub(crate) fn demo_evidence(
@@ -793,6 +798,36 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/v1/evaluations/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn corpus_is_resolved_by_set_name() {
+        let response = app()
+            .expect("router should build")
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/corpora/open-us-law")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unknown_corpus_set_returns_not_found() {
+        let response = app()
+            .expect("router should build")
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/corpora/not-imported")
                     .body(Body::empty())
                     .unwrap(),
             )

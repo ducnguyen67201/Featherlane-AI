@@ -4,7 +4,7 @@ import { formatBytes } from "@/lib/format";
 import { MetricCard, PageHeader, StateBadge } from "@/components/ui";
 
 export default async function CorpusPage() {
-  const corpus = await getCorpus();
+  const corpus = await getCorpus("open-us-law");
   return (
     <div className="page">
       <PageHeader
