@@ -1,22 +1,25 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Bell,
   Bot,
   Braces,
-  ChevronDown,
   Command,
   FlaskConical,
   LayoutDashboard,
   Library,
+  LogOut,
   ScrollText,
   Search,
   Settings,
   ShieldCheck,
 } from "lucide-react";
+import { authClient } from "@/lib/auth-client";
+import { userInitials } from "@/lib/auth-routing";
 
 const primaryNav = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
@@ -26,13 +29,49 @@ const primaryNav = [
   { href: "/corpus", label: "Source corpus", icon: Library },
 ];
 
-export function AppShell({ children }: { children: ReactNode }) {
+type AppShellProps = {
+  children: ReactNode;
+  user: {
+    name: string;
+    email: string;
+  };
+};
+
+export function AppShell({ children, user }: AppShellProps) {
   const pathname = usePathname();
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+
+  async function signOut() {
+    setSigningOut(true);
+    setSignOutError(null);
+
+    try {
+      const result = await authClient.signOut();
+      if (result.error) {
+        setSignOutError("Sign out failed. Please try again.");
+        setSigningOut(false);
+        return;
+      }
+      window.location.assign(new URL("/login", window.location.origin).toString());
+    } catch {
+      setSignOutError("Sign out failed. Please try again.");
+      setSigningOut(false);
+    }
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <Link className="brand" href="/" aria-label="Featherlane home">
-          <span className="brand-mark"><span /></span>
+          <Image
+            className="brand-mark"
+            src="/brand/featherlane-mark.png"
+            alt=""
+            width={32}
+            height={30}
+            aria-hidden="true"
+          />
           <span>featherlane</span>
         </Link>
 
@@ -52,11 +91,24 @@ export function AppShell({ children }: { children: ReactNode }) {
 
         <div className="top-actions">
           <button className="icon-button" aria-label="Notifications"><Bell size={17} /></button>
-          <button className="workspace-switcher">
-            <span className="avatar">FL</span>
-            <span>Acme staging</span>
-            <ChevronDown size={14} />
-          </button>
+          <div className="user-control">
+            <span className="avatar" aria-hidden="true">{userInitials(user.name, user.email)}</span>
+            <span className="user-identity">
+              <strong>{user.name || user.email}</strong>
+              <small>{user.email}</small>
+            </span>
+            <button
+              className="logout-button"
+              type="button"
+              onClick={signOut}
+              disabled={signingOut}
+              aria-label={signingOut ? "Signing out" : "Sign out"}
+            >
+              <LogOut size={15} aria-hidden="true" />
+              <span>{signingOut ? "Signing out…" : "Sign out"}</span>
+            </button>
+          </div>
+          {signOutError && <span className="sign-out-error" role="alert">{signOutError}</span>}
         </div>
       </header>
 
