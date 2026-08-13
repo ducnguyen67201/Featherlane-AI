@@ -44,6 +44,9 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
     let other_organization_id = OrganizationId::new();
     let policy_pack_id = PolicyPackId::new();
     let now = OffsetDateTime::now_utc();
+    let now = now
+        .replace_nanosecond((now.nanosecond() / 1_000) * 1_000)
+        .expect("microsecond precision should be valid");
     database
         .execute_raw(Statement::from_string(
             database.get_database_backend(),
