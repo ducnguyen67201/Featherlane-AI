@@ -7,12 +7,10 @@ import type {
   PolicyPackDetail,
 } from "./types";
 import * as seed from "./seed";
-import { requireSession } from "./session";
 
 const API_URL = process.env.GOVERNANCE_API_URL ?? "http://127.0.0.1:8080";
 
 async function getJson<T>(path: string, fallback: T): Promise<T> {
-  await requireSession();
   try {
     const response = await fetch(`${API_URL}${path}`, {
       cache: "no-store",
