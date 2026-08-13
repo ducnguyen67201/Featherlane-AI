@@ -272,6 +272,25 @@ mod tests {
         }
     }
 
+    fn test_manifest(
+        address: std::net::SocketAddr,
+        path: &str,
+        driver_type: DriverType,
+    ) -> TargetManifest {
+        TargetManifest {
+            schema_version: "1.0".to_owned(),
+            target_id: "test-agent".to_owned(),
+            target_version: "git:test".to_owned(),
+            driver_type,
+            endpoint: format!("http://{address}{path}"),
+            reset_endpoint: None,
+            auth_secret_ref: None,
+            timeout_seconds: 5,
+            evidence_mode: crate::EvidenceMode::Inline,
+            production_credentials_allowed: false,
+        }
+    }
+
     #[tokio::test]
     async fn generated_traceparent_has_w3c_shape() {
         let session = start_session_common(RunContext {
@@ -335,18 +354,9 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("test server");
         });
-        let manifest = TargetManifest {
-            schema_version: "1.0".to_owned(),
-            target_id: "test-agent".to_owned(),
-            target_version: "git:test".to_owned(),
-            driver_type: DriverType::HttpText,
-            endpoint: format!("http://{address}/messages"),
-            reset_endpoint: Some(format!("http://{address}/reset")),
-            auth_secret_ref: Some("TEST_TARGET_TOKEN".to_owned()),
-            timeout_seconds: 5,
-            evidence_mode: crate::EvidenceMode::Inline,
-            production_credentials_allowed: false,
-        };
+        let mut manifest = test_manifest(address, "/messages", DriverType::HttpText);
+        manifest.reset_endpoint = Some(format!("http://{address}/reset"));
+        manifest.auth_secret_ref = Some("TEST_TARGET_TOKEN".to_owned());
         let driver = HttpTextDriver::new(Arc::new(FakeSecretResolver));
         assert!(
             driver
@@ -396,6 +406,143 @@ mod tests {
             assert_eq!(headers["authorization"], "Bearer test-bearer-value");
         }
         drop(requests);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_preserves_the_configured_json_payload() {
+        async fn webhook(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            capture
+                .0
+                .lock()
+                .expect("capture lock")
+                .push(("webhook".to_owned(), headers, body));
+            Json(json!({
+                "schema_version": "1.0",
+                "terminal": true,
+                "terminal_state": "completed",
+                "events": [{
+                    "event_type": "final_output",
+                    "name": "done",
+                    "actor": {"actor_type": "agent", "id": "workflow"}
+                }]
+            }))
+        }
+
+        let capture = Capture::default();
+        let app = Router::new()
+            .route("/webhook", post(webhook))
+            .with_state(capture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        let manifest = test_manifest(address, "/webhook", DriverType::Webhook);
+        let driver = WebhookDriver::new(Arc::new(FakeSecretResolver));
+        let session = driver
+            .start_session(RunContext {
+                eval_run_id: EvalRunId::new(),
+                scenario_id: ScenarioId::new(),
+            })
+            .await
+            .expect("session");
+        let payload = json!({"ticket": "T-1", "nested": {"ready": true}});
+
+        driver
+            .send(
+                &manifest,
+                &session,
+                &TestEvent::Webhook {
+                    payload: payload.clone(),
+                },
+            )
+            .await
+            .expect("webhook should complete");
+
+        assert_eq!(capture.0.lock().expect("capture lock")[0].2, payload);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_failures_are_bounded_and_do_not_leak_response_bodies() {
+        async fn rejected() -> (AxumStatusCode, &'static str) {
+            (AxumStatusCode::UNAUTHORIZED, "test-bearer-value")
+        }
+        async fn invalid() -> &'static str {
+            "not-json"
+        }
+        async fn oversized() -> String {
+            "x".repeat(MAX_RESPONSE_BYTES + 1)
+        }
+        async fn slow() -> Json<Value> {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            Json(json!({
+                "schema_version": "1.0",
+                "terminal": true,
+                "events": []
+            }))
+        }
+
+        let app = Router::new()
+            .route("/rejected", post(rejected))
+            .route("/invalid", post(invalid))
+            .route("/oversized", post(oversized))
+            .route("/slow", post(slow));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        let driver = HttpTextDriver::new(Arc::new(FakeSecretResolver));
+        let session = driver
+            .start_session(RunContext {
+                eval_run_id: EvalRunId::new(),
+                scenario_id: ScenarioId::new(),
+            })
+            .await
+            .expect("session");
+        let event = TestEvent::UserText {
+            text: "hello".to_owned(),
+        };
+
+        let mut manifest = test_manifest(address, "/rejected", DriverType::HttpText);
+        let error = driver
+            .send(&manifest, &session, &event)
+            .await
+            .expect_err("non-success must fail");
+        assert!(matches!(
+            error,
+            DriverError::Rejected(StatusCode::UNAUTHORIZED)
+        ));
+        assert!(!error.to_string().contains("test-bearer-value"));
+
+        manifest.endpoint = format!("http://{address}/invalid");
+        assert!(matches!(
+            driver.send(&manifest, &session, &event).await,
+            Err(DriverError::InvalidResponse)
+        ));
+
+        manifest.endpoint = format!("http://{address}/oversized");
+        assert!(matches!(
+            driver.send(&manifest, &session, &event).await,
+            Err(DriverError::ResponseTooLarge)
+        ));
+
+        manifest.endpoint = format!("http://{address}/slow");
+        manifest.timeout_seconds = 1;
+        assert!(matches!(
+            driver.send(&manifest, &session, &event).await,
+            Err(DriverError::Timeout)
+        ));
         server.abort();
     }
 }

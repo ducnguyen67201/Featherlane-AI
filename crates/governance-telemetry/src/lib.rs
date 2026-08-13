@@ -131,6 +131,11 @@ pub fn normalize_observations(
 }
 
 impl RedactionPolicy {
+    /// Removes secret-like keys recursively from an evidence value.
+    pub fn redact_value(&self, value: &mut Value) {
+        redact_nested(value, &self.sensitive_key_fragments);
+    }
+
     pub fn redact_attributes(&self, attributes: &mut BTreeMap<String, Value>) -> Vec<String> {
         let mut removed = Vec::new();
         attributes.retain(|key, value| {
@@ -489,6 +494,27 @@ mod tests {
         assert_eq!(
             events[0].attributes,
             BTreeMap::from([("terminal_state".to_owned(), serde_json::json!("completed"))])
+        );
+    }
+
+    #[test]
+    fn side_effect_values_are_recursively_redacted() {
+        let mut side_effect = serde_json::json!({
+            "destination": "sandbox-ledger",
+            "request": {
+                "authorization": "Bearer remove",
+                "payload": [{"api_key": "remove", "amount": 700}]
+            }
+        });
+
+        RedactionPolicy::default().redact_value(&mut side_effect);
+
+        assert_eq!(
+            side_effect,
+            serde_json::json!({
+                "destination": "sandbox-ledger",
+                "request": {"payload": [{"amount": 700}]}
+            })
         );
     }
 }

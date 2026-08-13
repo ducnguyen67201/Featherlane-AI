@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use governance_application::{ActivityPoint, DashboardSnapshot, RunListItem, StoredEvaluationRun};
+use governance_application::{DashboardSnapshot, RunListItem, StoredEvaluationRun};
 use governance_corpus::PINNED_SNAPSHOT;
 use governance_domain::{
     CompiledRule, EvalRunId, EventType, NormalizedEvent, Obligation, ObligationId, OrganizationId,
@@ -262,7 +262,7 @@ pub(crate) fn build_registered_target(
     let manifest = TargetManifest {
         schema_version: "1.0".to_owned(),
         target_id: request.key,
-        target_version: request.version,
+        target_version: request.version.trim().to_owned(),
         driver_type: request.driver_type,
         endpoint: request.endpoint,
         reset_endpoint: request.reset_endpoint,
@@ -537,6 +537,17 @@ pub(crate) async fn health() -> Json<HealthResponse> {
 
 pub(crate) async fn overview(State(state): State<AppState>) -> Json<DashboardSnapshot> {
     let store = state.store.read().await;
+    let count = store.runs.len();
+    let passed = store
+        .runs
+        .iter()
+        .filter(|run| run.verdict == RunVerdict::Pass)
+        .count();
+    let complete = store
+        .runs
+        .iter()
+        .filter(|run| run.trace_quality == TraceQualityStatus::Complete)
+        .count();
     let recent_runs = store
         .runs
         .iter()
@@ -556,12 +567,13 @@ pub(crate) async fn overview(State(state): State<AppState>) -> Json<DashboardSna
     Json(DashboardSnapshot {
         active_agents: u32::try_from(store.targets.len()).unwrap_or(u32::MAX),
         policy_packs: 0,
-        evaluations_30d: 184,
-        pass_rate: 96.8,
-        open_findings: 7,
-        trace_coverage: 94.2,
+        evaluations_30d: u32::try_from(count).unwrap_or(u32::MAX),
+        pass_rate: percentage(passed, count),
+        open_findings: u32::try_from(store.runs.iter().map(|run| run.failed).sum::<usize>())
+            .unwrap_or(u32::MAX),
+        trace_coverage: percentage(complete, count),
         recent_runs,
-        daily_activity: demo_activity(),
+        daily_activity: Vec::new(),
     })
 }
 
@@ -654,121 +666,15 @@ fn demo_runs() -> Vec<EvaluationView> {
     Vec::new()
 }
 
-fn demo_activity() -> Vec<ActivityPoint> {
-    [
-        ("Aug 7", 18, 1, 2),
-        ("Aug 8", 22, 0, 1),
-        ("Aug 9", 17, 2, 0),
-        ("Aug 10", 28, 1, 3),
-        ("Aug 11", 31, 0, 1),
-        ("Aug 12", 26, 2, 2),
-        ("Aug 13", 34, 1, 1),
-    ]
-    .into_iter()
-    .map(|(day, passed, failed, inconclusive)| ActivityPoint {
-        day: day.to_owned(),
-        passed,
-        failed,
-        inconclusive,
-    })
-    .collect()
+fn percentage(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        let numerator = u32::try_from(numerator).unwrap_or(u32::MAX);
+        let denominator = u32::try_from(denominator).unwrap_or(u32::MAX);
+        100.0 * f64::from(numerator) / f64::from(denominator)
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use axum::{body::Body, http::Request};
-    use tower::ServiceExt;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn health_route_is_available() {
-        let response = app()
-            .expect("router should build")
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("request should complete");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn unknown_evaluation_returns_problem_response() {
-        let response = app()
-            .expect("router should build")
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/evaluations/missing")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("request should complete");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn corpus_is_resolved_by_set_name() {
-        let response = app()
-            .expect("router should build")
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/corpora/open-us-law")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("request should complete");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn unknown_corpus_set_returns_not_found() {
-        let response = app()
-            .expect("router should build")
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/corpora/not-imported")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("request should complete");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn import_fixture_builds_one_draft_database_aggregate() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/policies/refund-governance.import.json");
-        let input = fs::read_to_string(path).expect("policy fixture should be readable");
-        let request: PolicyImportRequest =
-            serde_json::from_str(&input).expect("policy fixture should match the import contract");
-        let bundle = build_policy_bundle(default_organization_id(), &request)
-            .expect("policy aggregate should compile");
-
-        assert_eq!(bundle.pack.status, ReviewStatus::Draft);
-        assert_eq!(bundle.pack.rules.len(), 1);
-        assert_eq!(bundle.sources.len(), 1);
-        assert_eq!(bundle.obligations.len(), 1);
-        assert_eq!(bundle.pack.content_sha256.len(), 64);
-    }
-
-    #[test]
-    fn import_rejects_a_rule_without_a_persisted_obligation() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/policies/refund-governance.import.json");
-        let input = fs::read_to_string(path).expect("policy fixture should be readable");
-        let mut request: PolicyImportRequest =
-            serde_json::from_str(&input).expect("policy fixture should match the import contract");
-        request.rules[0].obligation_key = "MISSING".to_owned();
-
-        assert!(build_policy_bundle(default_organization_id(), &request).is_err());
-    }
-}
+mod tests;

@@ -18,13 +18,15 @@
   authenticated same-origin BFF routes for browser mutations;
 - target URLs restricted to absolute HTTP(S) URLs without userinfo, with
   redirects disabled and well-known metadata/link-local literal hosts blocked;
+- authenticated reset URLs restricted to the target origin so a configured
+  Bearer secret cannot be forwarded to another service;
 - target responses capped at 2 MiB and 1,000 observations, with scenario text,
   payload, event-count, and timeout limits enforced before network execution;
 - server-side Bearer resolution by uppercase `auth_secret_ref`; the referenced
   value is absent from manifests, capability reports, errors, and logs;
 - inline target observations receive server-owned organization, run, scenario,
-  invocation, event, trace, sequence, and timestamp context before redaction and
-  persistence.
+  invocation, event, trace, sequence, and timestamp context; observations and
+  side-effect values are redacted before their integrity metadata is persisted.
 
 ## Before production
 

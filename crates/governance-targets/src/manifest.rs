@@ -88,6 +88,8 @@ pub enum ManifestError {
     UnsupportedEvidenceMode,
     #[error("production credentials must be disabled")]
     ProductionCredentials,
+    #[error("an authenticated reset_endpoint must use the same origin as endpoint")]
+    CrossOriginAuthenticatedReset,
 }
 
 /// Validates the user-facing target name and its stored manifest.
@@ -125,9 +127,13 @@ pub fn validate_manifest(manifest: &TargetManifest) -> Result<(), ManifestError>
     if version.is_empty() || version.chars().count() > 120 {
         return Err(ManifestError::InvalidVersion);
     }
-    validate_url("endpoint", &manifest.endpoint)?;
-    if let Some(endpoint) = &manifest.reset_endpoint {
-        validate_url("reset_endpoint", endpoint)?;
+    let target_endpoint = validate_url("endpoint", &manifest.endpoint)?;
+    if let Some(reset_endpoint) = &manifest.reset_endpoint {
+        let reset_endpoint = validate_url("reset_endpoint", reset_endpoint)?;
+        if manifest.auth_secret_ref.is_some() && reset_endpoint.origin() != target_endpoint.origin()
+        {
+            return Err(ManifestError::CrossOriginAuthenticatedReset);
+        }
     }
     if !(1..=120).contains(&manifest.timeout_seconds) {
         return Err(ManifestError::InvalidTimeout);
@@ -176,7 +182,7 @@ fn valid_secret_reference(value: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
-fn validate_url(field: &'static str, value: &str) -> Result<(), ManifestError> {
+fn validate_url(field: &'static str, value: &str) -> Result<Url, ManifestError> {
     let parsed = Url::parse(value).map_err(|_| ManifestError::InvalidUrl { field })?;
     if !matches!(parsed.scheme(), "http" | "https")
         || !parsed.username().is_empty()
@@ -194,7 +200,7 @@ fn validate_url(field: &'static str, value: &str) -> Result<(), ManifestError> {
     if blocked {
         return Err(ManifestError::BlockedHost { field });
     }
-    Ok(())
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -246,5 +252,18 @@ mod tests {
             validate_manifest(&value),
             Err(ManifestError::BlockedHost { .. })
         ));
+    }
+
+    #[test]
+    fn bearer_secret_cannot_be_forwarded_to_another_reset_origin() {
+        let mut value = manifest();
+        value.endpoint = "https://agent.example.com/run".to_owned();
+        value.reset_endpoint = Some("https://sandbox.example.com/reset".to_owned());
+        value.auth_secret_ref = Some("TARGET_TOKEN".to_owned());
+
+        assert_eq!(
+            validate_manifest(&value),
+            Err(ManifestError::CrossOriginAuthenticatedReset)
+        );
     }
 }

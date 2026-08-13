@@ -8,8 +8,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use governance_application::{
-    ApplicationError, DashboardSnapshot, LiveEvaluationRepository, PolicyPackRepository,
-    RunListItem, RunTargetEvaluation, RunTargetEvaluationRequest, TargetRepository,
+    ActivityPoint, ApplicationError, DashboardSnapshot, LiveEvaluationRepository,
+    PolicyPackRepository, RunListItem, RunTargetEvaluation, RunTargetEvaluationRequest,
+    TargetRepository,
 };
 use governance_domain::{
     EvalRunId, PolicyPackApproval, PolicyPackId, RunVerdict, TargetId, TraceQualityStatus,
@@ -116,11 +117,17 @@ async fn loco_overview(State(context): State<AppContext>) -> Response {
         let targets = targets.list(organization_id).await?;
         let policies = policies.list(organization_id).await?;
         let runs = evaluations.list_runs(organization_id).await?;
-        let completed = runs
+        let now = OffsetDateTime::now_utc();
+        let cutoff = now - time::Duration::days(30);
+        let recent_30d = runs
+            .iter()
+            .filter(|run| run.created_at >= cutoff)
+            .collect::<Vec<_>>();
+        let completed = recent_30d
             .iter()
             .filter(|run| run.evidence.trace_quality == TraceQualityStatus::Complete)
             .count();
-        let passed = runs
+        let passed = recent_30d
             .iter()
             .filter(|run| run.summary.verdict == RunVerdict::Pass)
             .count();
@@ -139,17 +146,26 @@ async fn loco_overview(State(context): State<AppContext>) -> Response {
                 created_at: super::rfc3339(run.created_at),
             })
             .collect();
-        let count = runs.len();
+        let count = recent_30d.len();
+        let activity_inputs = recent_30d
+            .iter()
+            .map(|run| (run.created_at, run.summary.verdict))
+            .collect::<Vec<_>>();
         Ok::<_, ApplicationError>(DashboardSnapshot {
             active_agents: u32::try_from(targets.len()).unwrap_or(u32::MAX),
             policy_packs: u32::try_from(policies.len()).unwrap_or(u32::MAX),
             evaluations_30d: u32::try_from(count).unwrap_or(u32::MAX),
             pass_rate: percentage(passed, count),
-            open_findings: u32::try_from(runs.iter().map(|run| run.summary.failed).sum::<usize>())
-                .unwrap_or(u32::MAX),
+            open_findings: u32::try_from(
+                recent_30d
+                    .iter()
+                    .map(|run| run.summary.failed)
+                    .sum::<usize>(),
+            )
+            .unwrap_or(u32::MAX),
             trace_coverage: percentage(completed, count),
             recent_runs,
-            daily_activity: Vec::new(),
+            daily_activity: daily_activity(&activity_inputs, now),
         })
     }
     .await;
@@ -431,12 +447,45 @@ fn percentage(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
+fn daily_activity(
+    runs: &[(OffsetDateTime, RunVerdict)],
+    now: OffsetDateTime,
+) -> Vec<ActivityPoint> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    (0..7)
+        .rev()
+        .map(|days_ago| {
+            let date = (now - time::Duration::days(days_ago)).date();
+            let mut point = ActivityPoint {
+                day: date.to_string(),
+                passed: 0,
+                failed: 0,
+                inconclusive: 0,
+            };
+            for (_, verdict) in runs
+                .iter()
+                .filter(|(created_at, _)| created_at.date() == date)
+            {
+                match verdict {
+                    RunVerdict::Pass => point.passed += 1,
+                    RunVerdict::Fail => point.failed += 1,
+                    RunVerdict::Inconclusive => point.inconclusive += 1,
+                }
+            }
+            point
+        })
+        .collect()
+}
+
 #[allow(clippy::needless_pass_by_value)] // Keeps match arms usable as direct error adapters.
 fn application_error(error: ApplicationError) -> Response {
     let detail = error.to_string();
     let status = match error {
         ApplicationError::NotFound(_) => StatusCode::NOT_FOUND,
-        ApplicationError::InvalidRequest(_) => StatusCode::CONFLICT,
+        ApplicationError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        ApplicationError::Conflict(_) => StatusCode::CONFLICT,
         ApplicationError::Forbidden(_) => StatusCode::FORBIDDEN,
         ApplicationError::Repository(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ApplicationError::TargetTransport(_) => StatusCode::BAD_GATEWAY,
@@ -475,4 +524,41 @@ fn problem(status: StatusCode, detail: &str) -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use time::macros::datetime;
+
+    use super::*;
+
+    #[test]
+    fn activity_groups_real_runs_into_the_last_seven_days() {
+        let now = datetime!(2026-08-13 12:00 UTC);
+        let points = daily_activity(
+            &[
+                (datetime!(2026-08-13 10:00 UTC), RunVerdict::Pass),
+                (datetime!(2026-08-13 11:00 UTC), RunVerdict::Fail),
+                (datetime!(2026-08-12 10:00 UTC), RunVerdict::Inconclusive),
+            ],
+            now,
+        );
+
+        assert_eq!(points.len(), 7);
+        assert_eq!(points[5].inconclusive, 1);
+        assert_eq!(points[6].passed, 1);
+        assert_eq!(points[6].failed, 1);
+    }
+
+    #[test]
+    fn application_errors_preserve_bad_request_and_conflict_statuses() {
+        assert_eq!(
+            application_error(ApplicationError::InvalidRequest("bad scenario".to_owned())).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            application_error(ApplicationError::Conflict("unapproved policy".to_owned())).status(),
+            StatusCode::CONFLICT
+        );
+    }
 }

@@ -35,7 +35,9 @@ Every reset and invocation request carries:
 
 If `auth_secret_ref` is configured, it must be an uppercase environment-variable
 name available to the Rust API. Its resolved value is sent as a Bearer token and
-is never stored or returned. Redirects are disabled.
+is never stored or returned. An authenticated reset endpoint must share the
+target endpoint's origin so the Bearer value cannot be forwarded to another
+service. Redirects are disabled.
 
 The target must synchronously return HTTP 2xx with a terminal inline envelope:
 
@@ -65,6 +67,11 @@ text is limited to 32 KiB and JSON payloads to 256 KiB. Unknown schema versions,
 oversized content, malformed evidence, and non-2xx responses are operational
 errors and do not create a completed run. Missing final evidence or
 `terminal: false` becomes `INCONCLUSIVE`, never `PASS`.
+
+Before persistence, secret-like keys are recursively removed from observation
+inputs, outputs, attributes, and side-effect values. The stored run retains the
+original terminal state, trace quality/defects, redacted side effects, and
+evidence SHA-256 so reading a run does not silently recompute different evidence.
 
 Run `fixtures/scenarios/refund-approval.json` from CI:
 

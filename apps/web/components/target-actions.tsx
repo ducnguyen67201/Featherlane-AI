@@ -3,22 +3,49 @@
 import { useMemo, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { Check, Clipboard, FlaskConical, LoaderCircle, RotateCcw } from "lucide-react";
-import type { AgentTargetDetail, Evaluation, ScenarioDefinition } from "@/lib/types";
+import type { AgentTargetDetail, DriverType, Evaluation, ScenarioDefinition } from "@/lib/types";
 
 type PolicyOption = { id: string; title: string };
 
+export function buildQuickTestScenario(driverType: DriverType, input: string): ScenarioDefinition {
+  if (driverType === "webhook") {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(input) as unknown;
+    } catch {
+      throw new Error("Webhook input must be valid JSON.");
+    }
+    return {
+      schema_version: "1.0",
+      name: "console quick test",
+      events: [{ type: "webhook", payload }],
+    };
+  }
+  return {
+    schema_version: "1.0",
+    name: "console quick test",
+    events: [{ type: "user_text", text: input }],
+  };
+}
+
 export function TargetActions({ target, policies }: { target: AgentTargetDetail; policies: PolicyOption[] }) {
   const router = useRouter();
-  const [message, setMessage] = useState("Refund order test-456 for $700");
+  const isWebhook = target.manifest.driver_type === "webhook";
+  const [input, setInput] = useState(() => isWebhook
+    ? '{\n  "event": "test",\n  "message": "Run the connected workflow"\n}'
+    : "Refund order test-456 for $700");
   const [policyId, setPolicyId] = useState(policies[0]?.id ?? "");
   const [busy, setBusy] = useState<"validate" | "run" | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const scenario = useMemo<ScenarioDefinition>(() => ({
-    schema_version: "1.0",
-    name: "console quick test",
-    events: [{ type: "user_text", text: message }],
-  }), [message]);
-  const command = `gov-eval run --target-id ${target.id} --policy-pack-id ${policyId || "<approved-policy-id>"} --scenario fixtures/scenarios/refund-approval.json --format junit`;
+  const scenario = useMemo(() => {
+    try {
+      return buildQuickTestScenario(target.manifest.driver_type, input);
+    } catch {
+      return null;
+    }
+  }, [input, target.manifest.driver_type]);
+  const scenarioPath = `.featherlane/${target.manifest.target_id}.scenario.json`;
+  const command = `gov-eval run --target-id ${target.id} --policy-pack-id ${policyId || "<approved-policy-id>"} --scenario ${scenarioPath} --format junit --fail-on-inconclusive`;
 
   async function recheck() {
     setBusy("validate");
@@ -51,6 +78,10 @@ export function TargetActions({ target, policies }: { target: AgentTargetDetail;
       setStatus("Approve a policy pack before running a test.");
       return;
     }
+    if (!scenario) {
+      setStatus("Webhook input must be valid JSON.");
+      return;
+    }
     setBusy("run");
     setStatus(null);
     try {
@@ -79,17 +110,17 @@ export function TargetActions({ target, policies }: { target: AgentTargetDetail;
       </section>
 
       <form className="panel action-panel" onSubmit={run}>
-        <div className="section-header"><div><h2>Quick test</h2><p>Run one text event against an approved policy.</p></div></div>
+        <div className="section-header"><div><h2>Quick test</h2><p>Run one {isWebhook ? "JSON webhook" : "text"} event against an approved policy.</p></div></div>
         <div className="action-fields">
           <label><span>Approved policy pack</span><select value={policyId} onChange={(event) => setPolicyId(event.target.value)} disabled={busy !== null}><option value="">Select a policy</option>{policies.map((policy) => <option key={policy.id} value={policy.id}>{policy.title}</option>)}</select></label>
-          <label><span>Message</span><textarea value={message} onChange={(event) => setMessage(event.target.value)} maxLength={32768} required disabled={busy !== null} /></label>
+          <label><span>{isWebhook ? "Webhook JSON" : "Message"}</span><textarea value={input} onChange={(event) => setInput(event.target.value)} maxLength={isWebhook ? 262144 : 32768} required disabled={busy !== null} /></label>
           <button className="primary-button" type="submit" disabled={busy !== null || !policyId}>{busy === "run" ? <LoaderCircle className="spin" size={15} /> : <FlaskConical size={15} />}{busy === "run" ? "Running…" : "Run test"}</button>
         </div>
       </form>
 
       <section className="panel action-panel ci-panel">
-        <div className="section-header"><div><h2>CI setup</h2><p>Commit the scenario in your repository and run this command.</p></div></div>
-        <pre tabIndex={0}>{JSON.stringify(scenario, null, 2)}</pre>
+        <div className="section-header"><div><h2>CI setup</h2><p>Save this scenario as {scenarioPath}, commit it, and run the strict command.</p></div></div>
+        <pre tabIndex={0}>{scenario ? JSON.stringify(scenario, null, 2) : "Enter valid webhook JSON to generate the scenario."}</pre>
         <pre tabIndex={0}>{command}</pre>
         <button className="secondary-button" onClick={() => copy(command, "CI command")}><Clipboard size={15} />Copy command</button>
       </section>

@@ -28,6 +28,8 @@ pub enum ApplicationError {
     Forbidden(String),
     #[error("invalid application request: {0}")]
     InvalidRequest(String),
+    #[error("application state conflict: {0}")]
+    Conflict(String),
     #[error("target transport failed: {0}")]
     TargetTransport(String),
     #[error("target request timed out: {0}")]
@@ -186,7 +188,7 @@ where
             .await?
             .ok_or_else(|| ApplicationError::NotFound(request.policy_pack_id.to_string()))?;
         pack.ensure_publishable()
-            .map_err(|error| ApplicationError::InvalidRequest(error.to_string()))?;
+            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
 
         let created_at = OffsetDateTime::now_utc();
         let context = RunContext {
@@ -257,12 +259,16 @@ where
             invocation_id,
             scenario_id: context.scenario_id,
         };
+        let redaction_policy = RedactionPolicy::default();
+        for side_effect in &mut side_effects {
+            redaction_policy.redact_value(side_effect);
+        }
         let events = normalize_observations(
             normalization_context,
             trace_id,
             &target.manifest.target_id,
             observations,
-            &RedactionPolicy::default(),
+            &redaction_policy,
         )
         .map_err(|error| ApplicationError::TargetContract(error.to_string()))?;
         let mut evidence = finalize_evidence(
@@ -364,7 +370,7 @@ where
             .await?
             .ok_or_else(|| ApplicationError::NotFound(policy_pack_id.to_string()))?;
         pack.ensure_publishable()
-            .map_err(|error| ApplicationError::InvalidRequest(error.to_string()))?;
+            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
         let summary = evaluate_pack(evidence.eval_run_id, &pack.rules, evidence);
         self.evaluations
             .save_summary(organization_id, &summary)
