@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use governance_domain::{
     EvalRunId, EvaluationSummary, EvidenceBundle, OrganizationId, PolicyBundle, PolicyPack,
-    PolicyPackApproval, PolicyPackId, RuleResult, RunVerdict,
+    PolicyPackApproval, PolicyPackId, PolicyPackStatusChange, RuleResult, RunVerdict,
 };
 use governance_evaluator::evaluate_pack;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,18 @@ pub trait PolicyPackRepository: Send + Sync {
         organization_id: OrganizationId,
         id: PolicyPackId,
         approval: &PolicyPackApproval,
+    ) -> Result<PolicyPack, ApplicationError>;
+    async fn disable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
+    ) -> Result<PolicyPack, ApplicationError>;
+    async fn enable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
     ) -> Result<PolicyPack, ApplicationError>;
 }
 

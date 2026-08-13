@@ -102,7 +102,7 @@ export function PolicyImportProgress({ initialImport }: { initialImport: PolicyI
       </section>
 
       <section className="import-metadata-grid">
-        <article><span>Source</span><strong>{policyImport.source_type.replaceAll("_", " ")}</strong><small>{policyImport.jurisdiction}</small></article>
+        <article><span>Source</span><strong>{policyImport.source_type.replaceAll("_", " ")} · revision {policyImport.revision}</strong><small>{policyImport.jurisdiction} · {policyImport.policy_source_id.slice(0, 12)}…</small></article>
         <article><span>Artifact</span><strong>{formatBytes(policyImport.byte_length)}</strong><small className="mono">{policyImport.content_sha256.slice(0, 14)}…</small></article>
         <article><span>Coverage</span><strong>{policyImport.coverage.processed_chunks}/{policyImport.coverage.total_chunks} chunks</strong><small>{policyImport.coverage.failed_chunks.length} failed</small></article>
         <article><span>Candidates</span><strong>{policyImport.candidate_count}</strong><small>{policyImport.model_name ?? "Waiting for extraction"}</small></article>

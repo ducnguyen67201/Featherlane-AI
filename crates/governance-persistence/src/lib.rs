@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use governance_application::{ApplicationError, EvaluationRepository, PolicyPackRepository};
 use governance_domain::{
     CompiledRule, EvalRunId, EvaluationSummary, OrganizationId, PolicyBundle, PolicyPack,
-    PolicyPackApproval, PolicyPackId, ReviewStatus,
+    PolicyPackApproval, PolicyPackId, PolicyPackStatusChange, ReviewStatus,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
@@ -247,6 +247,98 @@ impl PolicyPackRepository for SeaOrmPolicyPackRepository {
             .await?
             .ok_or_else(|| ApplicationError::NotFound(id.to_string()))
     }
+
+    async fn disable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
+    ) -> Result<PolicyPack, ApplicationError> {
+        transition_pack_status(
+            &self.database,
+            organization_id,
+            id,
+            "approved",
+            "disabled",
+            None,
+            change,
+        )
+        .await?;
+        self.get(organization_id, id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))
+    }
+
+    async fn enable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
+    ) -> Result<PolicyPack, ApplicationError> {
+        transition_pack_status(
+            &self.database,
+            organization_id,
+            id,
+            "disabled",
+            "approved",
+            Some(change.changed_at),
+            change,
+        )
+        .await?;
+        self.get(organization_id, id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))
+    }
+}
+
+async fn transition_pack_status(
+    database: &DatabaseConnection,
+    organization_id: OrganizationId,
+    id: PolicyPackId,
+    expected: &str,
+    next: &str,
+    published_at: Option<OffsetDateTime>,
+    change: &PolicyPackStatusChange,
+) -> Result<(), ApplicationError> {
+    if change.actor_id.trim().is_empty() {
+        return Err(ApplicationError::InvalidRequest(
+            "policy status changes require an actor identifier".to_owned(),
+        ));
+    }
+    let transaction = database.begin().await.map_err(repository_error)?;
+    let model = policy_packs::Entity::find()
+        .filter(policy_packs::Column::OrganizationId.eq(organization_id.0))
+        .filter(policy_packs::Column::Id.eq(id.0))
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .map_err(repository_error)?
+        .ok_or_else(|| ApplicationError::NotFound(id.to_string()))?;
+    if model.status != expected {
+        return Err(ApplicationError::Conflict(format!(
+            "only a {expected} policy pack can transition to {next}"
+        )));
+    }
+    let mut active: policy_packs::ActiveModel = model.into();
+    active.status = Set(next.to_owned());
+    active.published_at = Set(published_at);
+    active
+        .update(&transaction)
+        .await
+        .map_err(repository_error)?;
+    policy_reviews::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        organization_id: Set(organization_id.0),
+        policy_pack_id: Set(id.0),
+        status: Set(next.to_owned()),
+        reviewer_id: Set(change.actor_id.clone()),
+        notes: Set(change.notes.clone()),
+        reviewed_at: Set(change.changed_at),
+    }
+    .insert(&transaction)
+    .await
+    .map_err(repository_error)?;
+    transaction.commit().await.map_err(repository_error)
 }
 
 pub(crate) async fn persist_bundle<C: ConnectionTrait>(

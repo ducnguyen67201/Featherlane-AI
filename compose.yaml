@@ -6,13 +6,13 @@ services:
     environment:
       POSTGRES_DB: featherlane
       POSTGRES_USER: featherlane
-      POSTGRES_PASSWORD: featherlane
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U featherlane -d featherlane"]
       interval: 5s
       timeout: 3s
       retries: 12
-    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
     volumes: ["postgres-data:/var/lib/postgresql/data"]
 
   governance-api:
@@ -24,13 +24,13 @@ services:
         RUST_BINARY: governance-api
     command: ["start", "--server-and-worker"]
     environment:
-      DATABASE_URL: postgres://featherlane:featherlane@postgres:5432/featherlane
-      LOCO_QUEUE_URL: postgres://featherlane:featherlane@postgres:5432/featherlane
+      DATABASE_URL: postgres://featherlane:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/featherlane
+      LOCO_QUEUE_URL: postgres://featherlane:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/featherlane
       OBJECT_STORE_URL: http://minio:9000
       OBJECT_STORE_BUCKET: featherlane
       OBJECT_STORE_REGION: us-east-1
-      OBJECT_STORE_ACCESS_KEY_ID: featherlane-dev
-      OBJECT_STORE_SECRET_ACCESS_KEY: featherlane-dev-only
+      OBJECT_STORE_ACCESS_KEY_ID: ${OBJECT_STORE_ACCESS_KEY_ID:?Set OBJECT_STORE_ACCESS_KEY_ID in .env}
+      OBJECT_STORE_SECRET_ACCESS_KEY: ${OBJECT_STORE_SECRET_ACCESS_KEY:?Set OBJECT_STORE_SECRET_ACCESS_KEY in .env}
       POLICY_LLM_ENABLED: "true"
       POLICY_LLM_PROVIDER: heuristic
       POLICY_LLM_PROMPT_VERSION: policy-extract-v1
@@ -52,7 +52,7 @@ services:
         RUST_BINARY: governance-telemetry-gateway
     environment:
       GOVERNANCE_GATEWAY_ADDR: 0.0.0.0:4318
-      DATABASE_URL: postgres://featherlane:featherlane@postgres:5432/featherlane
+      DATABASE_URL: postgres://featherlane:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/featherlane
       RUST_LOG: info
     depends_on:
       postgres:
@@ -67,7 +67,7 @@ services:
         RUST_PACKAGE: governance-worker
         RUST_BINARY: governance-worker
     environment:
-      DATABASE_URL: postgres://featherlane:featherlane@postgres:5432/featherlane
+      DATABASE_URL: postgres://featherlane:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/featherlane
       RUST_LOG: info
     depends_on:
       postgres:
@@ -116,19 +116,27 @@ services:
     image: minio/minio:RELEASE.2025-07-23T15-54-02Z
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: featherlane-dev
-      MINIO_ROOT_PASSWORD: featherlane-dev-only
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
     ports: ["9000:9000", "9001:9001"]
     volumes: ["minio-data:/data"]
 
   minio-init:
-    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z@sha256:fb8f773eac8ef9d6da0486d5dec2f42f219358bcb8de579d1623d518c9ebd4cc
     entrypoint: ["/bin/sh", "-c"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+      OBJECT_STORE_ACCESS_KEY_ID: ${OBJECT_STORE_ACCESS_KEY_ID:?Set OBJECT_STORE_ACCESS_KEY_ID in .env}
+      OBJECT_STORE_SECRET_ACCESS_KEY: ${OBJECT_STORE_SECRET_ACCESS_KEY:?Set OBJECT_STORE_SECRET_ACCESS_KEY in .env}
     command:
       - >-
-        until mc alias set local http://minio:9000 featherlane-dev featherlane-dev-only; do sleep 1; done;
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do sleep 1; done;
         mc mb --ignore-existing local/featherlane;
-        mc anonymous set none local/featherlane
+        mc anonymous set none local/featherlane;
+        printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetBucketLocation","s3:ListBucket"],"Resource":["arn:aws:s3:::featherlane"]},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::featherlane/*"]}]}' > /tmp/featherlane-policy.json;
+        mc admin user svcacct rm local "$${OBJECT_STORE_ACCESS_KEY_ID}" >/dev/null 2>&1 || true;
+        mc admin user svcacct add local "$${MINIO_ROOT_USER}" --access-key "$${OBJECT_STORE_ACCESS_KEY_ID}" --secret-key "$${OBJECT_STORE_SECRET_ACCESS_KEY}" --policy /tmp/featherlane-policy.json
     depends_on: [minio]
 
 volumes:

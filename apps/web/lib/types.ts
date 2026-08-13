@@ -1,4 +1,14 @@
+export type WireVerdict = "pass" | "fail" | "inconclusive";
 export type Verdict = "PASS" | "FAIL" | "INCONCLUSIVE";
+
+export function displayVerdict(verdict: WireVerdict): Verdict {
+  const display: Record<WireVerdict, Verdict> = {
+    pass: "PASS",
+    fail: "FAIL",
+    inconclusive: "INCONCLUSIVE",
+  };
+  return display[verdict];
+}
 export type TraceQuality = "complete" | "degraded" | "insufficient";
 
 export interface ActivityPoint {
@@ -50,7 +60,7 @@ export interface EvaluationRun {
   state: EvaluationRunState;
   completion_reason: string | null;
   terminal_state: string | null;
-  verdict: "pass" | "fail" | "inconclusive" | null;
+  verdict: WireVerdict | null;
   trace_quality: TraceQuality | null;
   evidence_sha256: string | null;
   span_count: number;
@@ -71,7 +81,7 @@ export interface RuleResult {
 }
 
 export interface EvaluationSummary {
-  verdict: "pass" | "fail" | "inconclusive";
+  verdict: WireVerdict;
   results: RuleResult[];
   passed: number;
   failed: number;
@@ -225,6 +235,9 @@ export interface PolicyImportCoverage {
 
 export interface PolicyImport {
   id: string;
+  policy_source_id: string;
+  revision: number;
+  supersedes_import_id: string | null;
   status: PolicyImportStatus;
   input_kind: "file" | "pasted_text";
   source_type: "primary_law" | "official_guidance" | "standard" | "company_policy" | "expert_interpretation";

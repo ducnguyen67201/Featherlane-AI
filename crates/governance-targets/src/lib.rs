@@ -23,6 +23,8 @@ pub struct TargetManifest {
     pub endpoint: String,
     pub reset_endpoint: Option<String>,
     pub status_endpoint: Option<String>,
+    #[serde(default)]
+    pub terminal_response_key: Option<String>,
     pub auth_secret_ref: Option<String>,
     pub timeout_seconds: u64,
     pub otlp_required: bool,
@@ -156,6 +158,22 @@ impl HttpTargetDriver {
     }
 }
 
+fn with_correlation_headers(
+    builder: reqwest::RequestBuilder,
+    context: &RunContext,
+) -> reqwest::RequestBuilder {
+    let eval_run_id = context.eval_run_id.to_string();
+    let invocation_id = context.invocation_id.to_string();
+    let scenario_id = context.scenario_id.to_string();
+    builder
+        .header("x-featherlane-eval-run-id", &eval_run_id)
+        .header("x-featherlane-invocation-id", &invocation_id)
+        .header("x-featherlane-scenario-id", &scenario_id)
+        .header("x-governance-eval-run-id", &eval_run_id)
+        .header("x-governance-invocation-id", &invocation_id)
+        .header("x-governance-scenario-id", &scenario_id)
+}
+
 #[async_trait]
 impl TargetDriver for HttpTargetDriver {
     async fn validate(&self, manifest: &TargetManifest) -> Result<CapabilityReport, DriverError> {
@@ -192,21 +210,7 @@ impl TargetDriver for HttpTargetDriver {
         let Some(endpoint) = &manifest.reset_endpoint else {
             return Ok(());
         };
-        let response = self
-            .client
-            .post(endpoint)
-            .header("x-featherlane-eval-run-id", context.eval_run_id.to_string())
-            .header(
-                "x-featherlane-invocation-id",
-                context.invocation_id.to_string(),
-            )
-            .header("x-featherlane-scenario-id", context.scenario_id.to_string())
-            .header("x-governance-eval-run-id", context.eval_run_id.to_string())
-            .header(
-                "x-governance-invocation-id",
-                context.invocation_id.to_string(),
-            )
-            .header("x-governance-scenario-id", context.scenario_id.to_string())
+        let response = with_correlation_headers(self.client.post(endpoint), context)
             .send()
             .await?;
         if !response.status().is_success() {
@@ -242,45 +246,28 @@ impl TargetDriver for HttpTargetDriver {
             TestEvent::HumanDecision { decision } => json!({"decision": decision}),
             TestEvent::Timer { milliseconds } => json!({"timer_ms": milliseconds}),
         };
-        let response = self
-            .client
-            .post(&manifest.endpoint)
-            .header("traceparent", &session.traceparent)
-            .header("baggage", &session.baggage)
-            .header(
-                "x-featherlane-eval-run-id",
-                session.context.eval_run_id.to_string(),
-            )
-            .header(
-                "x-featherlane-invocation-id",
-                session.context.invocation_id.to_string(),
-            )
-            .header(
-                "x-featherlane-scenario-id",
-                session.context.scenario_id.to_string(),
-            )
-            .header(
-                "x-governance-eval-run-id",
-                session.context.eval_run_id.to_string(),
-            )
-            .header(
-                "x-governance-invocation-id",
-                session.context.invocation_id.to_string(),
-            )
-            .header(
-                "x-governance-scenario-id",
-                session.context.scenario_id.to_string(),
-            )
-            .json(&payload)
-            .send()
-            .await?;
+        let response = with_correlation_headers(
+            self.client
+                .post(&manifest.endpoint)
+                .header("traceparent", &session.traceparent)
+                .header("baggage", &session.baggage)
+                .json(&payload),
+            &session.context,
+        )
+        .send()
+        .await?;
         if !response.status().is_success() {
             return Err(DriverError::Rejected(response.status()));
         }
         let body: Value = response.json().await?;
         Ok(TargetOutput {
             terminal: body
-                .get("terminal")
+                .get(
+                    manifest
+                        .terminal_response_key
+                        .as_deref()
+                        .unwrap_or("terminal"),
+                )
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             body,
@@ -321,6 +308,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".to_owned(),
             reset_endpoint: None,
             status_endpoint: None,
+            terminal_response_key: None,
             auth_secret_ref: None,
             timeout_seconds: 1,
             otlp_required: false,

@@ -165,6 +165,7 @@ impl EvaluationRun {
                 self.updated_at = now;
                 return Ok(());
             }
+            return Ok(());
         }
         self.transition_to(EvaluationRunState::Settling, now)?;
         self.completion_reason = Some(reason);
@@ -244,6 +245,31 @@ mod tests {
         )
         .expect("same completion should be idempotent");
         assert_eq!(run.state, EvaluationRunState::Settling);
+    }
+
+    #[test]
+    fn repeated_completion_is_idempotent_after_settling() {
+        let mut run = run();
+        let now = OffsetDateTime::now_utc();
+        run.begin_settling(
+            CompletionReason::Explicit,
+            Some("completed".to_owned()),
+            now,
+            now,
+        )
+        .expect("first completion should settle");
+        run.transition_to(EvaluationRunState::Finalizing, now)
+            .expect("settling run should begin finalizing");
+
+        run.begin_settling(
+            CompletionReason::Explicit,
+            Some("completed".to_owned()),
+            now + Duration::seconds(5),
+            now + Duration::seconds(1),
+        )
+        .expect("matching completion remains idempotent after the settle window");
+
+        assert_eq!(run.state, EvaluationRunState::Finalizing);
     }
 
     #[test]

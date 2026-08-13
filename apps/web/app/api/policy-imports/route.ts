@@ -1,4 +1,4 @@
-import { proxyGovernanceMultipart, proxyGovernanceRequest } from "@/lib/governance-proxy";
+import { proxyGovernanceRequest } from "@/lib/governance-proxy";
 
 export function GET(request: Request) {
   const query = new URL(request.url).search;
@@ -6,5 +6,5 @@ export function GET(request: Request) {
 }
 
 export function POST(request: Request) {
-  return proxyGovernanceMultipart(request, "/v1/policy-imports");
+  return proxyGovernanceRequest(request, "/v1/policy-imports");
 }

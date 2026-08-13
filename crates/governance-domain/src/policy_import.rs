@@ -5,7 +5,7 @@ use time::OffsetDateTime;
 
 use crate::{
     EventMatcher, OrganizationId, PolicyCandidateId, PolicyCandidateReviewId, PolicyImportId,
-    PolicyPackId, RuleAssertion, Severity, SourceId, SourceLocator, SourceType,
+    PolicyPackId, PolicySourceId, RuleAssertion, Severity, SourceId, SourceLocator, SourceType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -147,6 +147,9 @@ impl PolicyImportCoverage {
 pub struct PolicyImport {
     pub id: PolicyImportId,
     pub organization_id: OrganizationId,
+    pub policy_source_id: PolicySourceId,
+    pub revision: u32,
+    pub supersedes_import_id: Option<PolicyImportId>,
     pub status: PolicyImportStatus,
     pub input_kind: PolicyInputKind,
     pub source_type: SourceType,
@@ -359,6 +362,9 @@ mod tests {
         PolicyImport {
             id: PolicyImportId::new(),
             organization_id: OrganizationId::new(),
+            policy_source_id: PolicySourceId::new(),
+            revision: 1,
+            supersedes_import_id: None,
             status: PolicyImportStatus::ReviewRequired,
             input_kind: PolicyInputKind::PastedText,
             source_type: SourceType::CompanyPolicy,

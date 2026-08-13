@@ -13,13 +13,12 @@ const DEFAULT_RULE: RuleSuggestion = {
   evidence_required: [],
 };
 
-const EVENT_TYPES = ["scenario_input", "agent_start", "model_call", "model_result", "tool_call", "tool_result", "retrieval", "handoff", "guardrail_decision", "human_approval_request", "human_approval_decision", "final_output", "side_effect", "retry", "error", "timeout", "cancellation", "unclassified"];
-
-export function PolicyReviewWorkspace({ initialImport, initialCandidates, reviewerIdentity, compiledPackStatus }: {
+export function PolicyReviewWorkspace({ initialImport, initialCandidates, reviewerIdentity, compiledPackStatus, eventTypes }: {
   initialImport: PolicyImport;
   initialCandidates: PolicyCandidate[];
   reviewerIdentity: string;
   compiledPackStatus: string | null;
+  eventTypes: string[];
 }) {
   const router = useRouter();
   const [policyImport, setPolicyImport] = useState(initialImport);
@@ -133,11 +132,13 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates, review
 
       {compiled && policyImport.compiled_policy_pack_id && (
         <section className="panel compiled-policy-action">
-          <div><ShieldCheck size={20} /><div><strong>Candidate review is complete and immutable</strong><p>The resulting policy pack is {compiledPackStatus ?? "loading"}. Publish a draft pack to make its rules selectable for evaluations.</p></div></div>
+          <div><ShieldCheck size={20} /><div><strong>Candidate review is complete and immutable</strong><p>The resulting policy pack is {compiledPackStatus ?? "loading"}. Upload a new source version to propose policy changes without overwriting this evidence.</p></div></div>
           {compiledPackStatus ? (
             <PolicyPackActions
               packId={policyImport.compiled_policy_pack_id}
               status={compiledPackStatus}
+              sourceImportId={policyImport.id}
+              showSourceReview={false}
             />
           ) : (
             <span className="policy-action-message" role="status">Policy pack status is unavailable.</span>
@@ -154,6 +155,7 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates, review
           <CandidateCard
             key={candidate.id}
             candidate={candidate}
+            eventTypes={eventTypes}
             disabled={busy}
             readOnly={compiled}
             onBusy={setBusy}
@@ -189,7 +191,7 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates, review
       {!compiled && <form className="panel compile-panel" onSubmit={(event) => { event.preventDefault(); void compile(event.currentTarget); }}>
         <div><ShieldCheck size={21} /><div><h2>Compile approved candidates</h2><p>Creates a database-backed draft pack. Publishing remains a separate policy-owner action.</p></div></div>
         <label className="field"><span>Pack key</span><input name="key" required defaultValue={slug(policyImport.title)} /></label>
-        <label className="field"><span>Version</span><input name="version" type="number" min="1" required defaultValue="1" /></label>
+        <label className="field"><span>Version</span><input name="version" type="number" min="1" required defaultValue={policyImport.revision} /></label>
         <label className="field"><span>Pack title</span><input name="title" required defaultValue={policyImport.title} /></label>
         <button className="primary-button" type="submit" disabled={!ready || busy || policyImport.status === "compiled"}>
           {busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
@@ -204,8 +206,9 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates, review
   );
 }
 
-function CandidateCard({ candidate, disabled, readOnly, onBusy, onDirty, onMessage, onSaved }: {
+function CandidateCard({ candidate, eventTypes, disabled, readOnly, onBusy, onDirty, onMessage, onSaved }: {
   candidate: PolicyCandidate;
+  eventTypes: string[];
   disabled: boolean;
   readOnly: boolean;
   onBusy: (busy: boolean) => void;
@@ -301,9 +304,9 @@ function CandidateCard({ candidate, disabled, readOnly, onBusy, onDirty, onMessa
         <label className="field"><span>Severity</span><select value={severity} disabled={readOnly} onChange={(event) => { setSeverity(event.target.value as typeof severity); onDirty(); }}><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="advisory">Advisory</option></select></label>
         <label className="field"><span>Rule mapping</span><select value={mappingStatus} disabled={readOnly} onChange={(event) => { setMappingStatus(event.target.value as typeof mappingStatus); onDirty(); }}><option value="ready">Ready</option><option value="manual_required">Manual required</option><option value="unsupported">Unsupported</option></select></label>
         <label className="field field-wide"><span>Required evidence</span><input value={evidence} readOnly={readOnly} onChange={(event) => { setEvidence(event.target.value); onDirty(); }} /></label>
-        <label className="field"><span>Trigger event</span><select value={triggerEvent} disabled={readOnly} onChange={(event) => applyTypedRule(event.target.value, assertionKind, assertionEvent)}>{EVENT_TYPES.map((eventType) => <option key={eventType} value={eventType}>{eventType.replaceAll("_", " ")}</option>)}</select></label>
+        <label className="field"><span>Trigger event</span><select value={triggerEvent} disabled={readOnly} onChange={(event) => applyTypedRule(event.target.value, assertionKind, assertionEvent)}>{eventTypes.map((eventType) => <option key={eventType} value={eventType}>{eventType.replaceAll("_", " ")}</option>)}</select></label>
         <label className="field"><span>Assertion</span><select value={assertionKind} disabled={readOnly} onChange={(event) => applyTypedRule(triggerEvent, event.target.value, assertionEvent)}><option value="exists_before">Exists before</option><option value="absent">Absent</option><option value="max_count">Maximum count: 1</option><option value="terminal_state">Terminal state: completed</option></select></label>
-        {assertionKind !== "terminal_state" && <label className="field field-wide"><span>Assertion event</span><select value={assertionEvent} disabled={readOnly} onChange={(event) => applyTypedRule(triggerEvent, assertionKind, event.target.value)}>{EVENT_TYPES.map((eventType) => <option key={eventType} value={eventType}>{eventType.replaceAll("_", " ")}</option>)}</select></label>}
+        {assertionKind !== "terminal_state" && <label className="field field-wide"><span>Assertion event</span><select value={assertionEvent} disabled={readOnly} onChange={(event) => applyTypedRule(triggerEvent, assertionKind, event.target.value)}>{eventTypes.map((eventType) => <option key={eventType} value={eventType}>{eventType.replaceAll("_", " ")}</option>)}</select></label>}
         <details className="field field-wide rule-json"><summary>Advanced deterministic rule JSON</summary><textarea className="mono" rows={8} value={rule} readOnly={readOnly} onChange={(event) => { setRule(event.target.value); onDirty(); }} /></details>
         <label className="field field-wide"><span>Review notes</span><input value={notes} readOnly={readOnly} onChange={(event) => { setNotes(event.target.value); onDirty(); }} placeholder="Why this decision is supportable" /></label>
       </div>

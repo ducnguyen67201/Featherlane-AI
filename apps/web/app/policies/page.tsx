@@ -36,7 +36,7 @@ export default async function PoliciesPage() {
           <div className="import-list">
             {imports.data.map((policyImport) => (
               <Link key={policyImport.id} href={`/policies/imports/${policyImport.id}`}>
-                <div><strong>{policyImport.title}</strong><span>{policyImport.source_type.replaceAll("_", " ")} · {policyImport.candidate_count} candidates</span></div>
+                <div><strong>{policyImport.title}</strong><span>{policyImport.source_type.replaceAll("_", " ")} · revision {policyImport.revision} · {policyImport.candidate_count} candidates</span></div>
                 <StateBadge state={policyImport.status} />
                 <ArrowRight size={14} />
               </Link>

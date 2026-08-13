@@ -1,15 +1,38 @@
 use governance_application::PolicyImportRepository;
 use governance_domain::{
     OrganizationId, PolicyImport, PolicyImportCoverage, PolicyImportId, PolicyImportStatus,
-    PolicyInputKind, SourceType, SourceVerificationStatus,
+    PolicyInputKind, PolicySourceId, SourceType, SourceVerificationStatus,
 };
 use governance_migration::Migrator;
 use governance_persistence::SeaOrmPolicyImportRepository;
-use sea_orm::{ConnectionTrait, Database, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use time::{Duration, OffsetDateTime};
 
-#[tokio::test]
+struct PolicyImportCleanup {
+    database: DatabaseConnection,
+    organization_id: OrganizationId,
+    active: bool,
+}
+
+impl Drop for PolicyImportCleanup {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let database = self.database.clone();
+        let organization_id = self.organization_id;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                if let Err(error) = cleanup_policy_imports(&database, organization_id).await {
+                    eprintln!("policy import test cleanup failed: {error}");
+                }
+            });
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn creating_multiple_imports_reuses_the_existing_organization() {
     let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
         return;
@@ -23,11 +46,19 @@ async fn creating_multiple_imports_reuses_the_existing_organization() {
 
     let repository = SeaOrmPolicyImportRepository::new(database.clone());
     let organization_id = OrganizationId::new();
+    let mut cleanup = PolicyImportCleanup {
+        database: database.clone(),
+        organization_id,
+        active: true,
+    };
     let mut first = policy_import(organization_id, "first");
     first.status = PolicyImportStatus::FailedTerminal;
     first.created_at -= Duration::days(1);
     first.updated_at = first.created_at;
-    let second = policy_import(organization_id, "second");
+    let mut second = policy_import(organization_id, "second");
+    second.policy_source_id = first.policy_source_id;
+    second.revision = 2;
+    second.supersedes_import_id = Some(first.id);
 
     repository
         .create(&first)
@@ -44,18 +75,26 @@ async fn creating_multiple_imports_reuses_the_existing_organization() {
             .expect("additional import should create");
     }
 
-    assert!(
-        repository
-            .get(organization_id, first.id)
-            .await
-            .expect("first import lookup should succeed")
-            .is_some()
+    let first_exists = repository
+        .get(organization_id, first.id)
+        .await
+        .expect("first import lookup should succeed")
+        .is_some();
+    let loaded_second = repository
+        .get(organization_id, second.id)
+        .await
+        .expect("second import lookup should succeed")
+        .expect("second import should exist");
+    let second_lineage = (
+        loaded_second.policy_source_id,
+        loaded_second.revision,
+        loaded_second.supersedes_import_id,
     );
     let first_page = repository
         .list(organization_id, 100, None, None)
         .await
         .expect("first import page should load");
-    assert_eq!(first_page.len(), 100);
+    let first_page_len = first_page.len();
     let second_page = repository
         .list(
             organization_id,
@@ -65,12 +104,10 @@ async fn creating_multiple_imports_reuses_the_existing_organization() {
         )
         .await
         .expect("second import page should load");
-    assert_eq!(second_page.len(), 5);
-    assert!(
-        first_page
-            .iter()
-            .all(|first| second_page.iter().all(|second| first.id != second.id))
-    );
+    let second_page_len = second_page.len();
+    let pages_do_not_overlap = first_page
+        .iter()
+        .all(|first| second_page.iter().all(|second| first.id != second.id));
     let terminal_imports = repository
         .list(
             organization_id,
@@ -80,30 +117,46 @@ async fn creating_multiple_imports_reuses_the_existing_organization() {
         )
         .await
         .expect("status-filtered import page should load");
-    assert_eq!(terminal_imports.len(), 1);
-    assert_eq!(terminal_imports[0].id, first.id);
-    assert!(
-        repository
-            .get(organization_id, second.id)
-            .await
-            .expect("second import lookup should succeed")
-            .is_some()
-    );
+    let terminal_ids = terminal_imports
+        .iter()
+        .map(|import| import.id)
+        .collect::<Vec<_>>();
+    let second_exists = repository
+        .get(organization_id, second.id)
+        .await
+        .expect("second import lookup should succeed")
+        .is_some();
 
-    database
-        .execute_raw(Statement::from_string(
-            database.get_database_backend(),
-            format!("DELETE FROM policy_imports WHERE organization_id='{organization_id}'"),
-        ))
+    cleanup_policy_imports(&database, organization_id)
         .await
-        .expect("test imports should clean up");
-    database
-        .execute_raw(Statement::from_string(
-            database.get_database_backend(),
-            format!("DELETE FROM organizations WHERE id='{organization_id}'"),
-        ))
-        .await
-        .expect("test organization should clean up");
+        .expect("test records should clean up");
+    cleanup.active = false;
+
+    assert!(first_exists);
+    assert_eq!(second_lineage, (first.policy_source_id, 2, Some(first.id)));
+    assert_eq!(first_page_len, 100);
+    assert_eq!(second_page_len, 5);
+    assert!(pages_do_not_overlap);
+    assert_eq!(terminal_ids, vec![first.id]);
+    assert!(second_exists);
+}
+
+async fn cleanup_policy_imports(
+    database: &DatabaseConnection,
+    organization_id: OrganizationId,
+) -> Result<(), sea_orm::DbErr> {
+    for statement in [
+        format!("DELETE FROM policy_imports WHERE organization_id='{organization_id}'"),
+        format!("DELETE FROM organizations WHERE id='{organization_id}'"),
+    ] {
+        database
+            .execute_raw(Statement::from_string(
+                database.get_database_backend(),
+                statement,
+            ))
+            .await?;
+    }
+    Ok(())
 }
 
 fn policy_import(organization_id: OrganizationId, title: &str) -> PolicyImport {
@@ -112,6 +165,9 @@ fn policy_import(organization_id: OrganizationId, title: &str) -> PolicyImport {
     PolicyImport {
         id,
         organization_id,
+        policy_source_id: PolicySourceId::new(),
+        revision: 1,
+        supersedes_import_id: None,
         status: PolicyImportStatus::Uploading,
         input_kind: PolicyInputKind::PastedText,
         source_type: SourceType::CompanyPolicy,

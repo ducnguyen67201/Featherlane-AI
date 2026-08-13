@@ -3,6 +3,8 @@ use std::fmt::Write as _;
 use governance_domain::ParsedDocument;
 use serde::{Deserialize, Serialize};
 
+pub(crate) const EXTRACTION_CHUNK_CHARACTER_BUDGET: usize = 12_000;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PolicyChunk {
     pub id: String,

@@ -39,7 +39,7 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
         let config = match &self.config {
             Ok(config) => config,
             Err(error) => {
-                let _ = self
+                if let Err(persistence_error) = self
                     .repository
                     .mark_failure(
                         args.organization_id,
@@ -48,14 +48,17 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
                         "configuration_missing",
                         "policy import configuration is invalid",
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(policy_import_id = %args.policy_import_id, error = %persistence_error, "failed to persist policy import configuration failure");
+                }
                 return Err(loco_rs::Error::Worker(error.clone()));
             }
         };
         let artifacts = match OpenDalArtifactStore::from_config(config) {
             Ok(artifacts) => artifacts,
             Err(error) => {
-                let _ = self
+                if let Err(persistence_error) = self
                     .repository
                     .mark_failure(
                         args.organization_id,
@@ -64,7 +67,10 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
                         "artifact_store_misconfigured",
                         "policy source storage is unavailable",
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(policy_import_id = %args.policy_import_id, error = %persistence_error, "failed to persist artifact-store configuration failure");
+                }
                 return Err(loco_rs::Error::Worker(error.to_string()));
             }
         };
@@ -72,7 +78,7 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
         let model = match ConfiguredPolicyExtractionModel::from_config(config) {
             Ok(model) => model,
             Err(error) => {
-                let _ = self
+                if let Err(persistence_error) = self
                     .repository
                     .mark_failure(
                         args.organization_id,
@@ -81,7 +87,10 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
                         "extraction_provider_misconfigured",
                         "policy extraction provider is unavailable",
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(policy_import_id = %args.policy_import_id, error = %persistence_error, "failed to persist extraction-provider configuration failure");
+                }
                 return Err(loco_rs::Error::Worker(error.to_string()));
             }
         };

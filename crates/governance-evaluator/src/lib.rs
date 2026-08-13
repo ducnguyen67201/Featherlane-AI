@@ -517,4 +517,29 @@ mod tests {
 
         assert_eq!(result.status, RuleStatus::Pass);
     }
+
+    #[test]
+    fn attribute_requirements_support_presence_and_typed_values() {
+        let mut observed = event(1, EventType::HumanApprovalDecision, "approval");
+        observed
+            .attributes
+            .insert("decision".to_owned(), json!("approved"));
+        observed
+            .attributes
+            .insert("retry_attempt".to_owned(), json!(2));
+
+        for requirement in [
+            "attribute:decision",
+            "attribute:decision=approved",
+            "attribute:retry_attempt=2",
+        ] {
+            let mut required_rule = rule();
+            required_rule.evidence_required = vec![requirement.to_owned()];
+            assert_eq!(
+                evaluate_rule(&required_rule, &evidence(vec![observed.clone()])).status,
+                RuleStatus::Pass,
+                "{requirement} should match"
+            );
+        }
+    }
 }

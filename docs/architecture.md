@@ -14,8 +14,8 @@ flowchart LR
     D --> P["Versioned executable policy pack"]
   end
   subgraph Execution["Execution lane — what actually happened"]
-    E["Synthetic event"] --> A["Customer agent or workflow"]
-    A --> T["OpenTelemetry / OpenInference trace"]
+    E["Synthetic event"] --> C["Customer agent or workflow"]
+    C --> T["OpenTelemetry / OpenInference trace"]
     T --> I[("Sanitized ingested spans")]
     I --> F["Explicit boundary + settle window"]
     F --> N["Run-global causal normalization"]

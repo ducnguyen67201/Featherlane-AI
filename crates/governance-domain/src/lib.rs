@@ -54,6 +54,7 @@ id_type!(InvocationId);
 id_type!(EventId);
 id_type!(RuleResultId);
 id_type!(PolicyImportId);
+id_type!(PolicySourceId);
 id_type!(PolicyCandidateId);
 id_type!(PolicyCandidateReviewId);
 
@@ -78,6 +79,7 @@ pub enum SourceType {
 pub enum ReviewStatus {
     Draft,
     Approved,
+    Disabled,
     Rejected,
 }
 
@@ -229,6 +231,15 @@ pub struct PolicyPackApproval {
     pub notes: String,
     #[serde(with = "time::serde::rfc3339")]
     pub approved_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PolicyPackStatusChange {
+    pub actor_id: String,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub changed_at: OffsetDateTime,
 }
 
 #[derive(
@@ -459,6 +470,26 @@ mod tests {
             version: 1,
             title: "Test".to_owned(),
             status: ReviewStatus::Draft,
+            content_sha256: "abc".to_owned(),
+            published_at: None,
+            rules: vec![],
+        };
+
+        assert_eq!(
+            pack.ensure_publishable(),
+            Err(DomainError::UnapprovedPolicyPack)
+        );
+    }
+
+    #[test]
+    fn disabled_pack_cannot_be_selected_for_evaluation() {
+        let pack = PolicyPack {
+            id: PolicyPackId::new(),
+            organization_id: OrganizationId::new(),
+            key: "test".to_owned(),
+            version: 1,
+            title: "Test".to_owned(),
+            status: ReviewStatus::Disabled,
             content_sha256: "abc".to_owned(),
             published_at: None,
             rules: vec![],

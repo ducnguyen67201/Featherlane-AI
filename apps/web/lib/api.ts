@@ -1,14 +1,15 @@
-import type {
-  AgentTarget,
-  Corpus,
-  DashboardSnapshot,
-  EvaluationRun,
-  EvaluationRunDetail,
-  RunListItem,
-  PolicyPack,
-  PolicyPackDetail,
-  PolicyCandidate,
-  PolicyImport,
+import {
+  displayVerdict,
+  type AgentTarget,
+  type Corpus,
+  type DashboardSnapshot,
+  type EvaluationRun,
+  type EvaluationRunDetail,
+  type RunListItem,
+  type PolicyPack,
+  type PolicyPackDetail,
+  type PolicyCandidate,
+  type PolicyImport,
 } from "./types";
 import * as seed from "./seed";
 import { requireSession } from "./session";
@@ -16,17 +17,8 @@ import { requireSession } from "./session";
 const API_URL = process.env.GOVERNANCE_API_URL ?? "http://127.0.0.1:8080";
 
 async function getJson<T>(path: string, fallback: T): Promise<T> {
-  await requireSession();
-  try {
-    const response = await fetch(`${API_URL}${path}`, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(1_500),
-    });
-    if (!response.ok) return fallback;
-    return (await response.json()) as T;
-  } catch {
-    return fallback;
-  }
+  const result = await getLiveJson<T>(path);
+  return result.data ?? fallback;
 }
 
 export function getOverview(): Promise<DashboardSnapshot> {
@@ -39,7 +31,7 @@ export async function getEvaluations(): Promise<RunListItem[]> {
     id: run.id,
     target: run.target_id,
     policy_pack: `${run.policy_pack_key} v${run.policy_pack_version}`,
-    verdict: run.verdict?.toUpperCase() as RunListItem["verdict"] ?? null,
+    verdict: run.verdict ? displayVerdict(run.verdict) : null,
     state: run.state,
     passed: 0,
     failed: 0,
@@ -53,6 +45,10 @@ export async function getEvaluations(): Promise<RunListItem[]> {
 
 export function getEvaluation(id: string): Promise<EvaluationRunDetail | null> {
   return getJson(`/v1/evaluations/${encodeURIComponent(id)}`, null);
+}
+
+export function getEventTypes(): Promise<string[]> {
+  return getJson("/v1/contracts/event-types", []);
 }
 
 export function getPolicies(): Promise<{ data: PolicyPack[] | null; error: string | null }> {

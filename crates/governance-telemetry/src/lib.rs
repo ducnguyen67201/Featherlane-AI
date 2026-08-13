@@ -7,7 +7,7 @@ use governance_domain::{
     InvocationId, NormalizedEvent, OrganizationId, ScenarioId, TraceDefect, TraceQualityStatus,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -372,14 +372,6 @@ pub struct FinalizationMetadata {
     pub finalized_at: OffsetDateTime,
 }
 
-pub fn normalize_spans(
-    context: NormalizationContext,
-    spans: Vec<TraceSpan>,
-    policy: &RedactionPolicy,
-) -> Vec<NormalizedEvent> {
-    normalize_spans_with_defects(context, spans, policy).0
-}
-
 fn normalize_spans_with_defects(
     context: NormalizationContext,
     mut spans: Vec<TraceSpan>,
@@ -736,47 +728,6 @@ pub fn finalize_observed_spans(
     }
 }
 
-pub fn finalize_evidence(
-    context: NormalizationContext,
-    target_version: String,
-    terminal_state: Option<String>,
-    events: Vec<NormalizedEvent>,
-    side_effects: Vec<Value>,
-) -> EvidenceBundle {
-    let (trace_quality, trace_defects) = assess_trace_quality(&events);
-    let mut trace_ids: Vec<String> = events.iter().map(|event| event.trace_id.clone()).collect();
-    trace_ids.sort();
-    trace_ids.dedup();
-    let canonical = serde_json::to_vec(&(target_version.as_str(), &events, &side_effects))
-        .unwrap_or_else(|error| {
-            format!(
-                "canonicalization-error:{}:{}:{}",
-                context.organization_id, context.eval_run_id, error
-            )
-            .into_bytes()
-        });
-    let evidence_sha256 = format!("{:x}", Sha256::digest(canonical));
-    EvidenceBundle {
-        schema_version: "1.1".to_owned(),
-        organization_id: context.organization_id,
-        eval_run_id: context.eval_run_id,
-        invocation_id: context.invocation_id,
-        invocation_ids: vec![context.invocation_id],
-        scenario_id: context.scenario_id,
-        target_version,
-        policy_content_sha256: String::new(),
-        trace_ids,
-        completion_reason: None,
-        terminal_state,
-        events,
-        side_effects,
-        trace_quality,
-        trace_defects,
-        finalized_at: Some(OffsetDateTime::now_utc()),
-        evidence_sha256,
-    }
-}
-
 fn defect(code: &str, message: &str, blocking: bool) -> TraceDefect {
     TraceDefect {
         code: code.to_owned(),
@@ -843,21 +794,6 @@ fn infer_actor_type(event_type: EventType) -> ActorType {
     }
 }
 
-#[allow(dead_code)]
-fn redact_object(object: &mut Map<String, Value>, fragments: &[String]) {
-    object.retain(|key, value| {
-        let normalized = key.to_ascii_lowercase();
-        if fragments
-            .iter()
-            .any(|fragment| normalized.contains(fragment))
-        {
-            return false;
-        }
-        redact_nested(value, fragments);
-        true
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use governance_domain::{CompletionReason, EventType};
@@ -890,6 +826,71 @@ mod tests {
             instrumentation_scope: None,
             status: None,
         }
+    }
+
+    #[test]
+    fn span_validation_rejects_malformed_ids_and_limits() {
+        let limits = TelemetryLimits {
+            max_attributes_per_span: 1,
+            max_string_bytes: 8,
+            ..TelemetryLimits::default()
+        };
+
+        let mut short_trace = span("short", "0000000000000001", 0, "tool_call");
+        assert_eq!(
+            limits.validate_span(&short_trace),
+            Err(TelemetryError::InvalidTraceId)
+        );
+
+        short_trace.trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        short_trace.span_id = "0000000000000000".to_owned();
+        assert_eq!(
+            limits.validate_span(&short_trace),
+            Err(TelemetryError::InvalidSpanId)
+        );
+
+        let mut malformed_link = span(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0000000000000001",
+            0,
+            "tool_call",
+        );
+        malformed_link.links.push(SpanLink {
+            trace_id: "bad".to_owned(),
+            span_id: "0000000000000002".to_owned(),
+        });
+        assert_eq!(
+            limits.validate_span(&malformed_link),
+            Err(TelemetryError::InvalidSpanId)
+        );
+
+        let mut too_many_attributes = span(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0000000000000001",
+            0,
+            "tool_call",
+        );
+        too_many_attributes
+            .attributes
+            .insert("decision".to_owned(), json!("ok"));
+        assert!(matches!(
+            limits.validate_span(&too_many_attributes),
+            Err(TelemetryError::LimitExceeded(_))
+        ));
+
+        let mut long_string = span(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0000000000000001",
+            0,
+            "tool",
+        );
+        long_string
+            .attributes
+            .insert(ATTR_EVENT_TYPE.to_owned(), json!("too-long-value"));
+        assert!(matches!(
+            limits.validate_span(&long_string),
+            Err(TelemetryError::LimitExceeded(_))
+        ));
     }
 
     #[test]
@@ -1088,7 +1089,8 @@ mod tests {
             "unclassified",
         );
         unknown.attributes.clear();
-        let events = normalize_spans(context(), vec![unknown], &RedactionPolicy::default());
+        let (events, _) =
+            normalize_spans_with_defects(context(), vec![unknown], &RedactionPolicy::default());
         assert_eq!(events[0].event_type, EventType::Unclassified);
     }
 

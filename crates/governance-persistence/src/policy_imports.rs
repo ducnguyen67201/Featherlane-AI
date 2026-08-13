@@ -10,7 +10,7 @@ use governance_domain::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    QuerySelect, Set, SqlErr, TransactionTrait,
     sea_query::{Condition, Expr},
 };
 use time::OffsetDateTime;
@@ -51,13 +51,39 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
     async fn create(&self, import: &PolicyImport) -> Result<PolicyImport, ApplicationError> {
         super::ensure_organization(&self.database, import.organization_id).await?;
         let active = import_active_model(import)?;
-        active.insert(&self.database).await.map_err(|error| {
-            if error.to_string().contains("uq_policy_imports_idempotency") {
-                ApplicationError::Conflict("Idempotency-Key was already used".to_owned())
-            } else {
-                repository_error(error)
+        if let Err(error) = active.insert(&self.database).await {
+            if matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
+                if let Some(idempotency_key) = import.idempotency_key.as_deref()
+                    && policy_imports::Entity::find()
+                        .filter(policy_imports::Column::OrganizationId.eq(import.organization_id.0))
+                        .filter(policy_imports::Column::IdempotencyKey.eq(idempotency_key))
+                        .one(&self.database)
+                        .await
+                        .map_err(repository_error)?
+                        .is_some()
+                {
+                    return Err(ApplicationError::Conflict(
+                        "Idempotency-Key was already used".to_owned(),
+                    ));
+                }
+                if policy_imports::Entity::find()
+                    .filter(policy_imports::Column::PolicySourceId.eq(import.policy_source_id.0))
+                    .filter(
+                        policy_imports::Column::Revision
+                            .eq(i32::try_from(import.revision).unwrap_or(i32::MAX)),
+                    )
+                    .one(&self.database)
+                    .await
+                    .map_err(repository_error)?
+                    .is_some()
+                {
+                    return Err(ApplicationError::Conflict(
+                        "a newer revision of this policy source already exists".to_owned(),
+                    ));
+                }
             }
-        })?;
+            return Err(repository_error(error));
+        }
         Ok(import.clone())
     }
 
@@ -620,6 +646,9 @@ fn import_active_model(
     Ok(policy_imports::ActiveModel {
         id: Set(import.id.0),
         organization_id: Set(import.organization_id.0),
+        policy_source_id: Set(import.policy_source_id.0),
+        revision: Set(i32::try_from(import.revision).unwrap_or(i32::MAX)),
+        supersedes_import_id: Set(import.supersedes_import_id.map(|id| id.0)),
         status: Set(enum_string(import.status)?),
         input_kind: Set(enum_string(import.input_kind)?),
         source_type: Set(enum_string(import.source_type)?),
@@ -663,6 +692,9 @@ fn import_from_model(model: policy_imports::Model) -> Result<PolicyImport, Appli
     Ok(PolicyImport {
         id: PolicyImportId(model.id),
         organization_id: governance_domain::OrganizationId(model.organization_id),
+        policy_source_id: governance_domain::PolicySourceId(model.policy_source_id),
+        revision: u32::try_from(model.revision).unwrap_or_default(),
+        supersedes_import_id: model.supersedes_import_id.map(PolicyImportId),
         status: enum_from_string(&model.status)?,
         input_kind: enum_from_string(&model.input_kind)?,
         source_type: enum_from_string(&model.source_type)?,

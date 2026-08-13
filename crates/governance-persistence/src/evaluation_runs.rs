@@ -835,23 +835,33 @@ fn run_active_model(run: &EvaluationRun) -> Result<eval_runs::ActiveModel, Appli
 }
 
 fn run_from_model(model: eval_runs::Model) -> Result<EvaluationRun, ApplicationError> {
+    let run_id = model.id;
+    let policy_pack_id = model
+        .policy_pack_id
+        .ok_or_else(|| legacy_run_mapping_error(run_id, "policy_pack_id"))?;
+    let scenario_id = model
+        .scenario_id
+        .ok_or_else(|| legacy_run_mapping_error(run_id, "scenario_id"))?;
+    let primary_invocation_id = model
+        .primary_invocation_id
+        .ok_or_else(|| legacy_run_mapping_error(run_id, "primary_invocation_id"))?;
     Ok(EvaluationRun {
-        id: EvalRunId(model.id),
+        id: EvalRunId(run_id),
         organization_id: OrganizationId(model.organization_id),
         target_id: model.target_id,
         target_version: model.target_version.unwrap_or_else(|| "legacy".to_owned()),
-        policy_pack_id: PolicyPackId(model.policy_pack_id.unwrap_or(model.id)),
+        policy_pack_id: PolicyPackId(policy_pack_id),
         policy_pack_key: model.policy_pack_key,
         policy_pack_version: u32::try_from(model.policy_pack_version.unwrap_or_default())
             .unwrap_or_default(),
         policy_content_sha256: model
             .policy_content_sha256
             .unwrap_or_else(|| "legacy".to_owned()),
-        scenario_id: ScenarioId(model.scenario_id.unwrap_or(model.id)),
+        scenario_id: ScenarioId(scenario_id),
         rule_ids: serde_json::from_value(model.rule_ids).map_err(serialization_error)?,
         boundary_kind: enum_from_string(&model.boundary_kind)?,
         external_run_id: model.external_run_id,
-        primary_invocation_id: InvocationId(model.primary_invocation_id.unwrap_or(model.id)),
+        primary_invocation_id: InvocationId(primary_invocation_id),
         state: enum_from_string(&model.state)?,
         completion_reason: model
             .completion_reason
@@ -878,6 +888,12 @@ fn run_from_model(model: eval_runs::Model) -> Result<EvaluationRun, ApplicationE
         finalized_at: model.finalized_at,
         completed_at: model.completed_at,
     })
+}
+
+fn legacy_run_mapping_error(run_id: Uuid, column: &str) -> ApplicationError {
+    ApplicationError::InvalidRequest(format!(
+        "legacy evaluation run {run_id} is missing required column {column}"
+    ))
 }
 
 fn span_from_model(model: ingested_spans::Model) -> Result<ObservedSpan, ApplicationError> {

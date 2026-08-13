@@ -10,7 +10,7 @@ use governance_domain::{
 };
 use serde_json::Value;
 
-use crate::chunk_document;
+use crate::{chunk_document, chunking::EXTRACTION_CHUNK_CHARACTER_BUDGET};
 
 #[derive(Clone, Debug)]
 pub struct HeuristicPolicyExtractionModel {
@@ -36,7 +36,7 @@ impl PolicyExtractionModel for HeuristicPolicyExtractionModel {
         &self,
         document: &ParsedDocument,
     ) -> Result<ExtractionBatch, ApplicationError> {
-        let chunks = chunk_document(document, 12_000, self.max_chunks);
+        let chunks = chunk_document(document, EXTRACTION_CHUNK_CHARACTER_BUDGET, self.max_chunks);
         if !chunks.last().is_some_and(|chunk| chunk.completes_document) {
             return Err(ApplicationError::InvalidRequest(
                 "source exceeds the configured extraction chunk limit".to_owned(),
@@ -87,18 +87,20 @@ impl PolicyExtractionModel for HeuristicPolicyExtractionModel {
                 break;
             }
         }
+        let before_validation = candidates.len();
         let response = validate_extraction_response(
             document,
             ExtractionResponse { candidates },
             self.max_candidates,
         )?;
+        let dropped_candidates = before_validation.saturating_sub(response.candidates.len());
         Ok(ExtractionBatch {
             candidates: response.candidates,
             coverage: PolicyImportCoverage {
                 total_chunks: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
                 processed_chunks: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
                 failed_chunks: Vec::new(),
-                duplicate_candidates: 0,
+                duplicate_candidates: u32::try_from(dropped_candidates).unwrap_or(u32::MAX),
                 warnings: vec![
                     "Development heuristic extraction was used; configure an approved model before production."
                         .to_owned(),

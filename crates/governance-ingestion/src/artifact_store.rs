@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use governance_application::{ApplicationError, SourceArtifactStore};
 use governance_config::PolicyImportConfig;
-use opendal::{Operator, services};
+use opendal::{ErrorKind, Operator, services};
 use std::fmt;
 
 #[derive(Clone)]
@@ -47,10 +47,9 @@ impl OpenDalArtifactStore {
 #[async_trait]
 impl SourceArtifactStore for OpenDalArtifactStore {
     async fn put(&self, key: &str, content: Vec<u8>) -> Result<(), ApplicationError> {
-        self.operator
-            .write(key, content)
-            .await
-            .map_err(|_| ApplicationError::Unavailable("object-store write failed".to_owned()))?;
+        self.operator.write(key, content).await.map_err(|error| {
+            ApplicationError::Unavailable(format!("object-store write failed ({:?})", error.kind()))
+        })?;
         Ok(())
     }
 
@@ -59,7 +58,16 @@ impl SourceArtifactStore for OpenDalArtifactStore {
             .read(key)
             .await
             .map(|buffer| buffer.to_vec())
-            .map_err(|_| ApplicationError::Unavailable("object-store read failed".to_owned()))
+            .map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    ApplicationError::NotFound(key.to_owned())
+                } else {
+                    ApplicationError::Unavailable(format!(
+                        "object-store read failed ({:?})",
+                        error.kind()
+                    ))
+                }
+            })
     }
 }
 

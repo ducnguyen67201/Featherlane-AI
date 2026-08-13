@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 
 use docx_rs::{DocumentChild, Paragraph, Table, TableCellContent, TableChild, TableRowChild};
 use governance_application::{ApplicationError, sha256_hex};
@@ -51,7 +51,7 @@ pub fn parse(content: &[u8], max_characters: usize) -> Result<ParsedDocument, Ap
         .collect();
     Ok(ParsedDocument {
         format: DocumentFormat::Docx,
-        parser_version: "docx-rs-0.4".to_owned(),
+        parser_version: concat!("docx-rs-", env!("DOCX_RS_VERSION")).to_owned(),
         title: None,
         segments,
     })
@@ -107,16 +107,37 @@ fn validate_package_limits(content: &[u8], max_characters: usize) -> Result<(), 
             "zip_limit_exceeded: too many DOCX entries".to_owned(),
         ));
     }
-    let mut expanded = 0_u64;
+    let mut declared_expanded = 0_u64;
+    let mut actual_expanded = 0_u64;
     let max_expanded =
         u64::try_from(max_characters.min(50_000_000).saturating_mul(2)).unwrap_or(100_000_000);
     for index in 0..archive.len() {
-        let file = archive.by_index(index).map_err(|_| {
+        let mut file = archive.by_index(index).map_err(|_| {
             ApplicationError::InvalidRequest("invalid_docx: invalid ZIP entry".to_owned())
         })?;
-        expanded = expanded.saturating_add(file.size());
+        // ZIP metadata is uploader-controlled, so this is only a cheap pre-filter.
+        declared_expanded = declared_expanded.saturating_add(file.size());
         let compression_ratio = file.size() / file.compressed_size().max(1);
-        if expanded > max_expanded || compression_ratio > 100 {
+        if declared_expanded > max_expanded || compression_ratio >= 100 {
+            return Err(ApplicationError::InvalidRequest(
+                "zip_limit_exceeded: expanded DOCX is too large".to_owned(),
+            ));
+        }
+        // Decompress each entry through a bounded reader before docx-rs sees the
+        // package. This enforces the real expansion limit rather than trusting
+        // the declared uncompressed sizes above.
+        let remaining = max_expanded.saturating_sub(actual_expanded);
+        let expanded = io::copy(
+            &mut file.by_ref().take(remaining.saturating_add(1)),
+            &mut io::sink(),
+        )
+        .map_err(|_| {
+            ApplicationError::InvalidRequest(
+                "invalid_docx: DOCX entry could not be decompressed".to_owned(),
+            )
+        })?;
+        actual_expanded = actual_expanded.saturating_add(expanded);
+        if actual_expanded > max_expanded {
             return Err(ApplicationError::InvalidRequest(
                 "zip_limit_exceeded: expanded DOCX is too large".to_owned(),
             ));

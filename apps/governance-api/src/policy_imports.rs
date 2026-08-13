@@ -12,9 +12,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use governance_application::{
-    CandidateEdit, CompilePolicyImportCommand, CreatePolicyImport, ManualCandidateCommand,
-    NewPolicyImport, PolicyImportRepository, ReviewCandidateCommand, SourceArtifactStore,
-    VerifySourceCommand, add_manual_policy_candidate, compile_policy_import,
+    ApplicationError, CandidateEdit, CompilePolicyImportCommand, CreatePolicyImport,
+    ManualCandidateCommand, NewPolicyImport, PolicyImportRepository, ReviewCandidateCommand,
+    SourceArtifactStore, VerifySourceCommand, add_manual_policy_candidate, compile_policy_import,
     detect_document_format, refresh_import_readiness, review_policy_candidate,
 };
 use governance_config::PolicyImportConfig;
@@ -31,6 +31,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PolicyImportServices {
+    config: PolicyImportConfig,
+    artifacts: OpenDalArtifactStore,
+    model: ConfiguredPolicyExtractionModel,
+}
+
+impl PolicyImportServices {
+    pub(crate) fn from_env() -> Result<Self, ApplicationError> {
+        let config = PolicyImportConfig::from_env()
+            .map_err(|error| ApplicationError::Unavailable(error.to_string()))?;
+        let artifacts = OpenDalArtifactStore::from_config(&config)?;
+        let model = ConfiguredPolicyExtractionModel::from_config(&config)?;
+        Ok(Self {
+            config,
+            artifacts,
+            model,
+        })
+    }
+}
+
+fn services(context: &AppContext) -> Result<PolicyImportServices, ApplicationError> {
+    context
+        .shared_store
+        .get::<PolicyImportServices>()
+        .ok_or_else(|| {
+            ApplicationError::Unavailable("policy import services were not initialized".to_owned())
+        })
+}
 
 use crate::loco_app::problem;
 
@@ -98,6 +128,9 @@ pub struct CompileImportRequest {
 #[derive(Clone, Debug, Serialize)]
 pub struct PolicyImportView {
     pub id: PolicyImportId,
+    pub policy_source_id: governance_domain::PolicySourceId,
+    pub revision: u32,
+    pub supersedes_import_id: Option<PolicyImportId>,
     pub status: PolicyImportStatus,
     pub input_kind: PolicyInputKind,
     pub source_type: SourceType,
@@ -140,6 +173,9 @@ impl From<PolicyImport> for PolicyImportView {
     fn from(import: PolicyImport) -> Self {
         Self {
             id: import.id,
+            policy_source_id: import.policy_source_id,
+            revision: import.revision,
+            supersedes_import_id: import.supersedes_import_id,
             status: import.status,
             input_kind: import.input_kind,
             source_type: import.source_type,
@@ -180,24 +216,24 @@ pub async fn create_policy_import(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    let config = match PolicyImportConfig::from_env() {
-        Ok(config) => config,
-        Err(error) => return problem(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    let services = match services(&context) {
+        Ok(services) => services,
+        Err(error) => return application_error(error),
     };
-    if !config.llm_enabled {
+    if !services.config.llm_enabled
+        || matches!(&services.model, ConfiguredPolicyExtractionModel::Disabled)
+    {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "policy extraction is disabled; configure POLICY_LLM_ENABLED and an approved provider",
         );
-    }
-    if let Err(error) = ConfiguredPolicyExtractionModel::from_config(&config) {
-        return application_error(error);
     }
     let mut title = None;
     let mut source_type = None;
     let mut jurisdiction = None;
     let mut effective_from = None;
     let mut source_url = None;
+    let mut supersedes_import_id = None;
     let mut file = None;
     let mut pasted_text = None;
 
@@ -217,7 +253,7 @@ pub async fn create_policy_import(
                 loop {
                     match field.chunk().await {
                         Ok(Some(chunk)) => {
-                            if bytes.len().saturating_add(chunk.len()) > config.max_bytes {
+                            if bytes.len().saturating_add(chunk.len()) > services.config.max_bytes {
                                 return problem(
                                     StatusCode::PAYLOAD_TOO_LARGE,
                                     "policy source exceeds the 25 MiB limit",
@@ -242,6 +278,7 @@ pub async fn create_policy_import(
             "jurisdiction" => jurisdiction = field.text().await.ok(),
             "effective_from" => effective_from = field.text().await.ok(),
             "source_url" => source_url = field.text().await.ok(),
+            "supersedes_import_id" => supersedes_import_id = field.text().await.ok(),
             _ => {}
         }
     }
@@ -284,6 +321,18 @@ pub async fn create_policy_import(
         },
         None => None,
     };
+    let supersedes_import_id = match supersedes_import_id.filter(|value| !value.trim().is_empty()) {
+        Some(value) => match parse_import_id(&value) {
+            Some(value) => Some(value),
+            None => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "supersedes_import_id must be a policy import identifier",
+                );
+            }
+        },
+        None => None,
+    };
     let (content, original_filename, declared_mime_type, input_kind) = match file {
         Some((content, filename, mime)) => (content, filename, mime, PolicyInputKind::File),
         None => (
@@ -293,7 +342,7 @@ pub async fn create_policy_import(
             PolicyInputKind::PastedText,
         ),
     };
-    if content.len() > config.max_bytes {
+    if content.len() > services.config.max_bytes {
         return problem(
             StatusCode::PAYLOAD_TOO_LARGE,
             "policy source exceeds the 25 MiB limit",
@@ -315,12 +364,8 @@ pub async fn create_policy_import(
         },
         None => None,
     };
-    let artifacts = match OpenDalArtifactStore::from_config(&config) {
-        Ok(artifacts) => artifacts,
-        Err(error) => return application_error(error),
-    };
     let repository = SeaOrmPolicyImportRepository::new(context.db.clone());
-    let import = match CreatePolicyImport::new(repository.clone(), artifacts)
+    let import = match CreatePolicyImport::new(repository.clone(), services.artifacts)
         .execute(NewPolicyImport {
             organization_id: crate::default_organization_id(),
             input_kind,
@@ -334,6 +379,7 @@ pub async fn create_policy_import(
             detected_mime_type: detected_mime_type.to_owned(),
             content,
             idempotency_key,
+            supersedes_import_id,
         })
         .await
     {
@@ -380,7 +426,7 @@ pub async fn list_policy_imports(
     State(context): State<AppContext>,
     Query(query): Query<ImportListQuery>,
 ) -> Response {
-    let repository = SeaOrmPolicyImportRepository::new(context.db);
+    let repository = SeaOrmPolicyImportRepository::new(context.db.clone());
     let status: Option<PolicyImportStatus> =
         match query.status.as_deref().map(enum_from_form).transpose() {
             Ok(status) => status,
@@ -422,7 +468,7 @@ pub async fn get_policy_import(
     let Some(id) = parse_import_id(&id) else {
         return problem(StatusCode::BAD_REQUEST, "invalid policy import identifier");
     };
-    let repository = SeaOrmPolicyImportRepository::new(context.db);
+    let repository = SeaOrmPolicyImportRepository::new(context.db.clone());
     match repository.get(crate::default_organization_id(), id).await {
         Ok(Some(import)) => Json(PolicyImportView::from(import)).into_response(),
         Ok(None) => problem(StatusCode::NOT_FOUND, "policy import was not found"),
@@ -515,7 +561,7 @@ pub async fn add_manual_candidate(
         );
     }
     let repository = SeaOrmPolicyImportRepository::new(context.db.clone());
-    let document = match normalized_document(&repository, id).await {
+    let document = match normalized_document(&repository, &context, id).await {
         Ok((_, document)) => document,
         Err(response) => return response,
     };
@@ -713,7 +759,7 @@ pub async fn source_context(
             "invalid policy candidate identifier",
         );
     };
-    let repository = SeaOrmPolicyImportRepository::new(context.db);
+    let repository = SeaOrmPolicyImportRepository::new(context.db.clone());
     let candidate = match repository
         .get_candidate(crate::default_organization_id(), id, candidate_id)
         .await
@@ -722,7 +768,7 @@ pub async fn source_context(
         Ok(None) => return problem(StatusCode::NOT_FOUND, "policy candidate was not found"),
         Err(error) => return application_error(error),
     };
-    let document = match normalized_document(&repository, id).await {
+    let document = match normalized_document(&repository, &context, id).await {
         Ok((_, document)) => document,
         Err(response) => return response,
     };
@@ -751,6 +797,7 @@ pub async fn source_context(
 
 async fn normalized_document(
     repository: &SeaOrmPolicyImportRepository,
+    context: &AppContext,
     id: PolicyImportId,
 ) -> Result<(PolicyImport, ParsedDocument), Response> {
     let import = repository
@@ -764,9 +811,7 @@ async fn normalized_document(
             "normalized source is not available yet",
         )
     })?;
-    let config = PolicyImportConfig::from_env()
-        .map_err(|error| problem(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()))?;
-    let artifacts = OpenDalArtifactStore::from_config(&config).map_err(application_error)?;
+    let artifacts = services(context).map_err(application_error)?.artifacts;
     let normalized = artifacts
         .get(&normalized_key)
         .await

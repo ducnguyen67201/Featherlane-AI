@@ -1888,7 +1888,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "time",
  "tokio",
 ]
 
@@ -2000,7 +1999,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tokio",
  "zip",
 ]
@@ -2106,7 +2104,6 @@ dependencies = [
  "flate2",
  "governance-application",
  "governance-config",
- "governance-domain",
  "governance-persistence",
  "governance-telemetry",
  "hex",
@@ -2128,7 +2125,6 @@ name = "governance-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "governance-application",
  "governance-config",
  "governance-domain",

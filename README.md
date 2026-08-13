@@ -89,7 +89,7 @@ where a human must:
 For a direct multipart example:
 
 ```bash
-curl --fail-with-body \
+curl --fail-with-body -D - \
   -H "Idempotency-Key: demo-refund-policy-1" \
   -F "file=@fixtures/policy-sources/refund-approval-policy.txt;type=text/plain" \
   -F "title=Customer refund approval policy" \

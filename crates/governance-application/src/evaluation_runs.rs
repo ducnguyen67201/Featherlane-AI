@@ -106,6 +106,14 @@ pub struct IngestBatchResult {
     pub late: usize,
 }
 
+#[derive(Debug)]
+struct CorrelatedRunBatch {
+    latest_received_at: OffsetDateTime,
+    inserted_any: bool,
+    terminal: bool,
+    terminal_state: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TelemetryIngestIdentity {
     pub organization_id: OrganizationId,
@@ -450,6 +458,8 @@ where
             self.settle_seconds,
         ));
         let mut result = IngestBatchResult::default();
+        let mut authorized_runs = BTreeMap::new();
+        let mut correlated_runs = BTreeMap::<EvalRunId, CorrelatedRunBatch>::new();
         for mut span in spans {
             if self.limits.validate_span(&span).is_err() {
                 result.rejected += 1;
@@ -527,12 +537,18 @@ where
                 }
             }
             if let Some(run_id) = correlation.eval_run_id {
-                let run = self.runs.get_run(identity.organization_id, run_id).await?;
-                let authorized = run.as_ref().is_some_and(|run| {
-                    run.target_id == identity.target_id
-                        && run.span_count
-                            < u64::try_from(self.limits.max_spans_per_run).unwrap_or(u64::MAX)
-                });
+                let authorized = if let Some(authorized) = authorized_runs.get(&run_id) {
+                    *authorized
+                } else {
+                    let run = self.runs.get_run(identity.organization_id, run_id).await?;
+                    let authorized = run.as_ref().is_some_and(|run| {
+                        run.target_id == identity.target_id
+                            && run.span_count
+                                < u64::try_from(self.limits.max_spans_per_run).unwrap_or(u64::MAX)
+                    });
+                    authorized_runs.insert(run_id, authorized);
+                    authorized
+                };
                 if !authorized {
                     result.rejected += 1;
                     continue;
@@ -543,6 +559,7 @@ where
             let correlated_run_id = correlation.eval_run_id;
             let terminal = correlation.terminal;
             let terminal_state = correlation.terminal_state.clone();
+            let received_at = OffsetDateTime::now_utc();
             let outcome = self
                 .spans
                 .insert_span(&SpanInsert {
@@ -551,7 +568,7 @@ where
                     correlation,
                     span,
                     sanitized_payload_sha256: format!("{:x}", Sha256::digest(sanitized)),
-                    received_at: OffsetDateTime::now_utc(),
+                    received_at,
                     max_spans_per_run: self.limits.max_spans_per_run,
                 })
                 .await?;
@@ -560,101 +577,22 @@ where
                 SpanInsertOutcome::Inserted | SpanInsertOutcome::Duplicate
             ) && let Some(eval_run_id) = correlated_run_id
             {
-                let is_new_span = outcome == SpanInsertOutcome::Inserted;
-                let mut run = None;
-                for attempt in 0..8 {
-                    let mut candidate = self
-                        .runs
-                        .get_run(identity.organization_id, eval_run_id)
-                        .await?
-                        .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
-                    let expected_state = candidate.state;
-                    let expected_updated_at = candidate.updated_at;
-                    let now = OffsetDateTime::now_utc();
-                    let changed = if terminal
-                        && matches!(
-                            candidate.state,
-                            EvaluationRunState::Created | EvaluationRunState::Collecting
-                        ) {
-                        candidate
-                            .begin_settling(
-                                CompletionReason::TerminalEvent,
-                                terminal_state.clone(),
-                                now + settle_duration,
-                                now,
-                            )
-                            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-                        true
-                    } else if candidate.state == EvaluationRunState::Created {
-                        candidate
-                            .transition_to(EvaluationRunState::Collecting, now)
-                            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-                        true
-                    } else if candidate.state == EvaluationRunState::Settling && is_new_span {
-                        let proposed = (now + settle_duration).min(candidate.hard_deadline_at);
-                        let extended = candidate
-                            .settle_until
-                            .map_or(proposed, |current| current.max(proposed));
-                        if candidate.settle_until == Some(extended) {
-                            false
-                        } else {
-                            candidate.settle_until = Some(extended);
-                            candidate.updated_at = now;
-                            true
+                correlated_runs
+                    .entry(eval_run_id)
+                    .and_modify(|batch| {
+                        batch.latest_received_at = batch.latest_received_at.max(received_at);
+                        batch.inserted_any |= outcome == SpanInsertOutcome::Inserted;
+                        if terminal && !batch.terminal {
+                            batch.terminal = true;
+                            batch.terminal_state.clone_from(&terminal_state);
                         }
-                    } else {
-                        false
-                    };
-                    if !changed
-                        || self
-                            .runs
-                            .update_run(&candidate, expected_state, expected_updated_at)
-                            .await?
-                    {
-                        run = Some(candidate);
-                        break;
-                    }
-                    if attempt == 7 {
-                        return Err(ApplicationError::Conflict(format!(
-                            "evaluation run {eval_run_id} changed during telemetry ingestion"
-                        )));
-                    }
-                }
-                let run = run.ok_or_else(|| {
-                    ApplicationError::Conflict(format!(
-                        "evaluation run {eval_run_id} could not be reconciled"
-                    ))
-                })?;
-                let now = OffsetDateTime::now_utc();
-                if run.state == EvaluationRunState::Settling {
-                    self.jobs
-                        .enqueue(&DurableJob {
-                            organization_id: run.organization_id,
-                            eval_run_id: run.id,
-                            kind: "finalize_evaluation_run".to_owned(),
-                            dedupe_key: format!("finalize:{}", run.id),
-                            available_at: run.settle_until.unwrap_or(now),
-                        })
-                        .await?;
-                } else if run.state == EvaluationRunState::Collecting {
-                    let idle_timeout = boundary
-                        .as_ref()
-                        .and_then(|target| target.config.idle_timeout_seconds)
-                        .unwrap_or(self.idle_timeout_seconds)
-                        .clamp(1, self.max_run_duration_seconds);
-                    self.jobs
-                        .enqueue(&DurableJob {
-                            organization_id: run.organization_id,
-                            eval_run_id: run.id,
-                            kind: "evaluation_run_idle_timeout".to_owned(),
-                            dedupe_key: format!("idle:{}", run.id),
-                            available_at: now
-                                + Duration::seconds(
-                                    i64::try_from(idle_timeout).unwrap_or(i64::MAX),
-                                ),
-                        })
-                        .await?;
-                }
+                    })
+                    .or_insert(CorrelatedRunBatch {
+                        latest_received_at: received_at,
+                        inserted_any: outcome == SpanInsertOutcome::Inserted,
+                        terminal,
+                        terminal_state,
+                    });
             }
             match outcome {
                 SpanInsertOutcome::Inserted => result.accepted += 1,
@@ -676,7 +614,118 @@ where
                 }
             }
         }
+        for (eval_run_id, batch) in correlated_runs {
+            self.reconcile_correlated_run(
+                identity.organization_id,
+                eval_run_id,
+                &batch,
+                settle_duration,
+                boundary.as_ref(),
+            )
+            .await?;
+        }
         Ok(result)
+    }
+
+    async fn reconcile_correlated_run(
+        &self,
+        organization_id: OrganizationId,
+        eval_run_id: EvalRunId,
+        batch: &CorrelatedRunBatch,
+        settle_duration: Duration,
+        boundary: Option<&TelemetryTargetBoundary>,
+    ) -> Result<(), ApplicationError> {
+        let mut reconciled = None;
+        for attempt in 0..8 {
+            let mut run = self
+                .runs
+                .get_run(organization_id, eval_run_id)
+                .await?
+                .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
+            let expected_state = run.state;
+            let expected_updated_at = run.updated_at;
+            let now = batch.latest_received_at;
+            let changed = if batch.terminal
+                && matches!(
+                    run.state,
+                    EvaluationRunState::Created | EvaluationRunState::Collecting
+                ) {
+                run.begin_settling(
+                    CompletionReason::TerminalEvent,
+                    batch.terminal_state.clone(),
+                    now + settle_duration,
+                    now,
+                )
+                .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
+                true
+            } else if run.state == EvaluationRunState::Created {
+                run.transition_to(EvaluationRunState::Collecting, now)
+                    .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
+                true
+            } else if run.state == EvaluationRunState::Settling && batch.inserted_any {
+                let proposed = (now + settle_duration).min(run.hard_deadline_at);
+                let extended = run
+                    .settle_until
+                    .map_or(proposed, |current| current.max(proposed));
+                if run.settle_until == Some(extended) {
+                    false
+                } else {
+                    run.settle_until = Some(extended);
+                    run.updated_at = now;
+                    true
+                }
+            } else {
+                false
+            };
+            if !changed
+                || self
+                    .runs
+                    .update_run(&run, expected_state, expected_updated_at)
+                    .await?
+            {
+                reconciled = Some(run);
+                break;
+            }
+            if attempt == 7 {
+                return Err(ApplicationError::Conflict(format!(
+                    "evaluation run {eval_run_id} changed during telemetry ingestion"
+                )));
+            }
+        }
+        let run = reconciled.ok_or_else(|| {
+            ApplicationError::Conflict(format!(
+                "evaluation run {eval_run_id} could not be reconciled"
+            ))
+        })?;
+        let now = batch.latest_received_at;
+        let job = if run.state == EvaluationRunState::Settling {
+            Some(DurableJob {
+                organization_id: run.organization_id,
+                eval_run_id: run.id,
+                kind: "finalize_evaluation_run".to_owned(),
+                dedupe_key: format!("finalize:{}", run.id),
+                available_at: run.settle_until.unwrap_or(now),
+            })
+        } else if run.state == EvaluationRunState::Collecting {
+            let idle_timeout = boundary
+                .and_then(|target| target.config.idle_timeout_seconds)
+                .unwrap_or(self.idle_timeout_seconds)
+                .clamp(1, self.max_run_duration_seconds);
+            Some(DurableJob {
+                organization_id: run.organization_id,
+                eval_run_id: run.id,
+                kind: "evaluation_run_idle_timeout".to_owned(),
+                dedupe_key: format!("idle:{}", run.id),
+                available_at: now
+                    + Duration::seconds(i64::try_from(idle_timeout).unwrap_or(i64::MAX)),
+            })
+        } else {
+            None
+        };
+        if let Some(job) = job {
+            self.jobs.enqueue(&job).await?;
+        }
+        Ok(())
     }
 }
 

@@ -7,6 +7,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub organization_id: Uuid,
+    pub policy_source_id: Uuid,
+    pub revision: i32,
+    pub supersedes_import_id: Option<Uuid>,
     pub status: String,
     pub input_kind: String,
     pub source_type: String,

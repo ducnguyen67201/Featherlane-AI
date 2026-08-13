@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_DB: featherlane_test
           POSTGRES_USER: featherlane
@@ -71,4 +71,9 @@ jobs:
           echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
           echo "GOOGLE_CLIENT_ID=ci-build-only.apps.googleusercontent.com" >> "$GITHUB_ENV"
           echo "GOOGLE_CLIENT_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "MINIO_ROOT_USER=ci-minio-admin" >> "$GITHUB_ENV"
+          echo "MINIO_ROOT_PASSWORD=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "OBJECT_STORE_ACCESS_KEY_ID=ci-featherlane-service" >> "$GITHUB_ENV"
+          echo "OBJECT_STORE_SECRET_ACCESS_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
       - run: docker compose config --quiet

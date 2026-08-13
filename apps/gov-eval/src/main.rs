@@ -326,19 +326,54 @@ async fn wait_for_run(
     format: OutputFormat,
     fail_on_inconclusive: bool,
 ) -> Result<ExitCode> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .build()
+        .context("failed to build the HTTP client")?;
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds.max(1));
+    let poll_interval = std::time::Duration::from_secs(poll_interval_seconds.max(1));
     let mut last_state = None;
+    let mut last_transient_error = None;
     loop {
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            if let Some(error) = last_transient_error {
+                anyhow::bail!(
+                    "timed out waiting for evaluation run {run_id}; last transient error: {error}"
+                );
+            }
             anyhow::bail!("timed out waiting for evaluation run {run_id}");
         }
-        let detail: RunDetail = client
+        let request_timeout = deadline
+            .saturating_duration_since(now)
+            .min(std::time::Duration::from_secs(30));
+        let response = client
             .get(format!("{api_url}/v1/evaluations/{run_id}"))
+            .timeout(request_timeout)
             .send()
-            .await?
-            .error_for_status()?
+            .await;
+        let response = match response {
+            Ok(response)
+                if response.status().is_server_error()
+                    || matches!(
+                        response.status(),
+                        reqwest::StatusCode::REQUEST_TIMEOUT
+                            | reqwest::StatusCode::TOO_MANY_REQUESTS
+                    ) =>
+            {
+                last_transient_error = Some(format!("API returned {}", response.status()));
+                sleep_before_retry(deadline, poll_interval).await;
+                continue;
+            }
+            Ok(response) => response.error_for_status()?,
+            Err(error) => {
+                last_transient_error = Some(error.to_string());
+                sleep_before_retry(deadline, poll_interval).await;
+                continue;
+            }
+        };
+        last_transient_error = None;
+        let detail: RunDetail = response
             .json()
             .await
             .context("API response was not an evaluation run detail")?;
@@ -375,6 +410,13 @@ async fn wait_for_run(
             | EvaluationRunState::Finalizing
             | EvaluationRunState::Evaluating => {}
         }
-        tokio::time::sleep(std::time::Duration::from_secs(poll_interval_seconds.max(1))).await;
+        sleep_before_retry(deadline, poll_interval).await;
+    }
+}
+
+async fn sleep_before_retry(deadline: tokio::time::Instant, requested: std::time::Duration) {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !remaining.is_zero() {
+        tokio::time::sleep(requested.min(remaining)).await;
     }
 }

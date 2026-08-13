@@ -8,7 +8,8 @@ pub fn parse(
     max_pages: usize,
     max_characters: usize,
 ) -> Result<ParsedDocument, ApplicationError> {
-    let document = pdf_extract::Document::load_mem(content).map_err(map_pdf_error)?;
+    let document =
+        pdf_extract::Document::load_mem(content).map_err(|error| map_document_error(&error))?;
     if document.is_encrypted() {
         return Err(ApplicationError::InvalidRequest(
             "encrypted_pdf: password-protected PDF".to_owned(),
@@ -34,7 +35,7 @@ pub fn parse(
                 "normalized source exceeds the character limit".to_owned(),
             ));
         }
-        extraction.map_err(map_pdf_error)?;
+        extraction.map_err(|error| map_output_error(&error))?;
         remaining_characters = remaining_characters.saturating_sub(writer.characters);
         pages.push(writer.text);
     }
@@ -69,15 +70,30 @@ pub fn parse(
         .collect();
     Ok(ParsedDocument {
         format: DocumentFormat::Pdf,
-        parser_version: "pdf-extract-0.12-bounded".to_owned(),
+        parser_version: concat!("pdf-extract-", env!("PDF_EXTRACT_VERSION"), "-bounded").to_owned(),
         title: None,
         segments,
     })
 }
 
-fn map_pdf_error(error: impl std::fmt::Display) -> ApplicationError {
-    let detail = error.to_string().to_ascii_lowercase();
-    if detail.contains("encrypt") || detail.contains("password") {
+fn map_document_error(error: &pdf_extract::Error) -> ApplicationError {
+    if matches!(
+        error,
+        pdf_extract::Error::Decryption(_) | pdf_extract::Error::InvalidPassword
+    ) {
+        ApplicationError::InvalidRequest("encrypted_pdf: password-protected PDF".to_owned())
+    } else {
+        ApplicationError::InvalidRequest("invalid_pdf: PDF could not be parsed".to_owned())
+    }
+}
+
+fn map_output_error(error: &pdf_extract::OutputError) -> ApplicationError {
+    if matches!(
+        error,
+        pdf_extract::OutputError::PdfError(
+            pdf_extract::Error::Decryption(_) | pdf_extract::Error::InvalidPassword
+        )
+    ) {
         ApplicationError::InvalidRequest("encrypted_pdf: password-protected PDF".to_owned())
     } else {
         ApplicationError::InvalidRequest("invalid_pdf: PDF could not be parsed".to_owned())

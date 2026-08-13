@@ -4,12 +4,15 @@ use governance_config::PolicyImportConfig;
 use governance_domain::{
     ExtractionBatch, ExtractionResponse, ParsedDocument, PolicyImportCoverage,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use schemars::schema_for;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{HeuristicPolicyExtractionModel, chunk_document, validate_extraction_response};
+use crate::{
+    HeuristicPolicyExtractionModel, chunk_document, chunking::EXTRACTION_CHUNK_CHARACTER_BUDGET,
+    validate_extraction_response,
+};
 
 use std::fmt;
 
@@ -130,7 +133,9 @@ impl OpenRouterPolicyExtractionModel {
     }
 
     fn request_body(&self, chunk_content: &str) -> Value {
-        let schema = schema_for!(ExtractionResponse);
+        let mut schema = serde_json::to_value(schema_for!(ExtractionResponse))
+            .expect("generated extraction schema should serialize");
+        require_all_object_properties(&mut schema);
         json!({
             "model": self.model,
             "temperature": 0,
@@ -181,7 +186,7 @@ impl OpenRouterPolicyExtractionModel {
                     "provider transport failed".to_owned(),
                 ));
                 if attempt == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    tokio::time::sleep(retry_delay(None, attempt)).await;
                 }
                 continue;
             };
@@ -192,10 +197,20 @@ impl OpenRouterPolicyExtractionModel {
                 } else {
                     "provider request failed"
                 };
-                last_error = Some(ApplicationError::Unavailable(format!("{code} ({status})")));
-                if attempt == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let error = ApplicationError::Unavailable(format!("{code} ({status})"));
+                let retryable = status == StatusCode::REQUEST_TIMEOUT
+                    || status == StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error();
+                if !retryable || attempt > 0 {
+                    return Err(error);
                 }
+                let retry_after = response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_retry_after);
+                last_error = Some(error);
+                tokio::time::sleep(retry_delay(retry_after, attempt)).await;
                 continue;
             }
             let body: ChatCompletionResponse = response.json().await.map_err(|_| {
@@ -224,13 +239,35 @@ impl OpenRouterPolicyExtractionModel {
     }
 }
 
+fn require_all_object_properties(schema: &mut Value) {
+    match schema {
+        Value::Object(object) => {
+            if let Some(Value::Object(properties)) = object.get("properties") {
+                object.insert(
+                    "required".to_owned(),
+                    Value::Array(properties.keys().cloned().map(Value::String).collect()),
+                );
+            }
+            for child in object.values_mut() {
+                require_all_object_properties(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                require_all_object_properties(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
 #[async_trait]
 impl PolicyExtractionModel for OpenRouterPolicyExtractionModel {
     async fn extract(
         &self,
         document: &ParsedDocument,
     ) -> Result<ExtractionBatch, ApplicationError> {
-        let chunks = chunk_document(document, 12_000, self.max_chunks);
+        let chunks = chunk_document(document, EXTRACTION_CHUNK_CHARACTER_BUDGET, self.max_chunks);
         if chunks.is_empty() || !chunks.last().is_some_and(|chunk| chunk.completes_document) {
             return Err(ApplicationError::InvalidRequest(
                 "source exceeds the configured extraction chunk limit".to_owned(),
@@ -286,6 +323,27 @@ impl PolicyExtractionModel for OpenRouterPolicyExtractionModel {
             prompt_version: self.prompt_version.clone(),
         })
     }
+}
+
+fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds.min(60)));
+    }
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(std::time::SystemTime::now())
+        .ok()
+        .map(|duration| duration.min(std::time::Duration::from_mins(1)))
+}
+
+fn retry_delay(retry_after: Option<std::time::Duration>, attempt: usize) -> std::time::Duration {
+    if let Some(delay) = retry_after {
+        return delay;
+    }
+    let jitter = u64::from(std::process::id())
+        .wrapping_add(u64::try_from(attempt).unwrap_or_default() * 37)
+        % 100;
+    std::time::Duration::from_millis(250 + jitter)
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +403,26 @@ mod tests {
         assert_eq!(request["provider"]["allow_fallbacks"], false);
         assert!(request["tools"].is_null());
         assert!(!format!("{model:?}").contains("super-secret-token"));
+    }
+
+    #[test]
+    fn strict_schema_requires_every_declared_property() {
+        let model = OpenRouterPolicyExtractionModel::from_config(&config())
+            .expect("configuration should be valid");
+        let request = model.request_body("source");
+        let schema = &request["response_format"]["json_schema"]["schema"];
+        for definition in ["EventMatcher", "RuleSuggestion", "ExtractedCandidate"] {
+            let object = &schema["$defs"][definition];
+            let properties = object["properties"]
+                .as_object()
+                .expect("definition should declare properties");
+            let required = object["required"]
+                .as_array()
+                .expect("definition should declare required properties");
+            assert_eq!(required.len(), properties.len(), "{definition}");
+            assert!(properties.keys().all(|key| required.contains(&json!(key))));
+            assert_eq!(object["additionalProperties"], false, "{definition}");
+        }
     }
 
     #[test]

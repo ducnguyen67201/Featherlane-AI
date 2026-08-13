@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 governance-application.workspace = true
 governance-config.workspace = true
 governance-domain.workspace = true

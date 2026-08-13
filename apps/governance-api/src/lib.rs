@@ -208,6 +208,13 @@ pub struct ApprovePolicyPackRequest {
     pub notes: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct PolicyPackLifecycleRequest {
+    pub actor_id: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
 fn default_target() -> String {
     "refund-agent-staging".to_owned()
 }

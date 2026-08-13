@@ -4,10 +4,11 @@ import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { FileText, LoaderCircle, Upload } from "lucide-react";
 import { validatePolicySourceFile } from "@/lib/policy-import";
+import type { PolicyImport } from "@/lib/types";
 
 type InputMode = "file" | "text";
 
-export function PolicyImportForm() {
+export function PolicyImportForm({ replacement }: { replacement?: PolicyImport }) {
   const router = useRouter();
   const fileInput = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<InputMode>("file");
@@ -49,7 +50,13 @@ export function PolicyImportForm() {
     try {
       const effectiveFrom = data.get("effective_from");
       if (typeof effectiveFrom === "string" && effectiveFrom) {
-        data.set("effective_from", new Date(effectiveFrom).toISOString());
+        const parsed = new Date(effectiveFrom);
+        if (Number.isNaN(parsed.getTime())) {
+          setError("Enter a valid effective date.");
+          setBusy(false);
+          return;
+        }
+        data.set("effective_from", parsed.toISOString());
       }
       const response = await fetch("/api/policy-imports", {
         method: "POST",
@@ -75,16 +82,31 @@ export function PolicyImportForm() {
         void submit(event.currentTarget);
       }}
     >
+      {replacement && (
+        <div className="source-revision-notice">
+          <FileText size={18} />
+          <div>
+            <strong>Uploading revision {replacement.revision + 1}</strong>
+            <span>This remains linked to source {replacement.policy_source_id.slice(0, 12)}…. Revision {replacement.revision} stays available as immutable evidence.</span>
+          </div>
+        </div>
+      )}
+      {replacement && <input type="hidden" name="supersedes_import_id" value={replacement.id} />}
       <div className="import-tabs" role="tablist" aria-label="Policy source input">
-        <button type="button" role="tab" aria-selected={mode === "file"} onClick={() => setMode("file")}>
+        <button id="policy-source-file-tab" type="button" role="tab" aria-controls="policy-source-file-panel" aria-selected={mode === "file"} onClick={() => setMode("file")}>
           <Upload size={16} /> Upload a file
         </button>
-        <button type="button" role="tab" aria-selected={mode === "text"} onClick={() => setMode("text")}>
+        <button id="policy-source-text-tab" type="button" role="tab" aria-controls="policy-source-text-panel" aria-selected={mode === "text"} onClick={() => setMode("text")}>
           <FileText size={16} /> Paste policy text
         </button>
       </div>
 
-      <div className="import-fields">
+      <div
+        id={mode === "file" ? "policy-source-file-panel" : "policy-source-text-panel"}
+        className="import-fields"
+        role="tabpanel"
+        aria-labelledby={mode === "file" ? "policy-source-file-tab" : "policy-source-text-tab"}
+      >
         {mode === "file" ? (
           <label
             className="file-drop"
@@ -123,11 +145,11 @@ export function PolicyImportForm() {
 
         <label className="field">
           <span>Source title</span>
-          <input name="title" required maxLength={240} placeholder="Customer refund approval policy" />
+          <input name="title" required maxLength={240} defaultValue={replacement?.title} placeholder="Customer refund approval policy" />
         </label>
         <label className="field">
           <span>Source type</span>
-          <select name="source_type" defaultValue="company_policy" required>
+          <select name="source_type" defaultValue={replacement?.source_type ?? "company_policy"} required>
             <option value="company_policy">Company policy</option>
             <option value="primary_law">Primary law</option>
             <option value="official_guidance">Official guidance</option>
@@ -137,7 +159,7 @@ export function PolicyImportForm() {
         </label>
         <label className="field">
           <span>Jurisdiction</span>
-          <input name="jurisdiction" required maxLength={120} placeholder="Internal, US, EU…" />
+          <input name="jurisdiction" required maxLength={120} defaultValue={replacement?.jurisdiction} placeholder="Internal, US, EU…" />
         </label>
         <label className="field">
           <span>Effective from <small>optional</small></span>
@@ -145,7 +167,7 @@ export function PolicyImportForm() {
         </label>
         <label className="field field-wide">
           <span>Canonical source URL <small>optional</small></span>
-          <input name="source_url" type="url" placeholder="https://intranet.example/policies/refunds" />
+          <input name="source_url" type="url" defaultValue={replacement?.source_url ?? undefined} placeholder="https://intranet.example/policies/refunds" />
         </label>
       </div>
 
@@ -153,7 +175,7 @@ export function PolicyImportForm() {
         <p>Extraction creates review candidates only. Nothing becomes executable until a human verifies the source and approves every candidate.</p>
         <button className="primary-button" type="submit" disabled={busy}>
           {busy ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}
-          Import and extract
+          {replacement ? "Upload and extract new version" : "Import and extract"}
         </button>
       </div>
       {error && <div className="form-error" role="alert">{error}</div>}

@@ -3,7 +3,7 @@ import { ArrowLeft, Braces, GitCommitHorizontal, RadioTower } from "lucide-react
 import { RunRefresh } from "@/components/run-refresh";
 import { MetricCard, StateBadge, VerdictBadge } from "@/components/ui";
 import { getEvaluation } from "@/lib/api";
-import type { Verdict } from "@/lib/types";
+import { displayVerdict } from "@/lib/types";
 
 export default async function EvaluationDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -12,7 +12,7 @@ export default async function EvaluationDetailPage({ params }: { params: Promise
     return <div className="page"><Link className="back-link" href="/evaluations"><ArrowLeft size={14} />All evaluations</Link><section className="panel"><h1>Evaluation unavailable</h1><p>The run was not found or the governance API is unavailable. No synthetic result was substituted.</p></section></div>;
   }
   const { run, summary, evidence } = detail;
-  const verdict = run.verdict?.toUpperCase() as Verdict | undefined;
+  const verdict = run.verdict ? displayVerdict(run.verdict) : undefined;
   return (
     <div className="page run-detail">
       <RunRefresh state={run.state} />
@@ -23,7 +23,15 @@ export default async function EvaluationDetailPage({ params }: { params: Promise
           <div className="run-title"><h1>{run.target_id}</h1>{verdict ? <VerdictBadge verdict={verdict} /> : <StateBadge state={run.state} />}</div>
           <p>Evaluating <strong>{run.policy_pack_key} v{run.policy_pack_version}</strong>. This is evidence relevant to policy conformance, not a certification.</p>
         </div>
-        {evidence && <button className="secondary-button"><Braces size={15} />Download JSON</button>}
+        {evidence && (
+          <a
+            className="secondary-button"
+            download={`featherlane-evidence-${run.id}.json`}
+            href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(evidence, null, 2))}`}
+          >
+            <Braces size={15} />Download JSON
+          </a>
+        )}
       </div>
 
       <section className="metric-grid run-metrics">

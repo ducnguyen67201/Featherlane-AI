@@ -6,9 +6,9 @@ use governance_domain::{
     MissingEvidencePolicy, Obligation, ObligationId, OrganizationId, ParsedDocument, PolicyBundle,
     PolicyCandidate, PolicyCandidateId, PolicyCandidateOrigin, PolicyCandidateReviewId,
     PolicyCandidateReviewRecord, PolicyCandidateStatus, PolicyImport, PolicyImportCoverage,
-    PolicyImportId, PolicyImportReadiness, PolicyImportStatus, PolicyPack, ReviewStatus,
-    ReviewerApproval, RuleMappingStatus, RuleSuggestion, Severity, Source, SourceConfidence,
-    SourceId, SourceLocator, SourceType, SourceVerificationStatus,
+    PolicyImportId, PolicyImportReadiness, PolicyImportStatus, PolicyPack, PolicySourceId,
+    ReviewStatus, ReviewerApproval, RuleMappingStatus, RuleSuggestion, Severity, Source,
+    SourceConfidence, SourceId, SourceLocator, SourceType, SourceVerificationStatus,
 };
 use governance_policy::{PolicyDocument, compile_policy_document};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,7 @@ pub struct NewPolicyImport {
     pub detected_mime_type: String,
     pub content: Vec<u8>,
     pub idempotency_key: Option<String>,
+    pub supersedes_import_id: Option<PolicyImportId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,6 +227,26 @@ where
         validate_new_import(&input)?;
         let id = PolicyImportId::new();
         let content_sha256 = sha256_hex(&input.content);
+        let parent = match input.supersedes_import_id {
+            Some(parent_id) => Some(
+                self.repository
+                    .get(input.organization_id, parent_id)
+                    .await?
+                    .ok_or_else(|| ApplicationError::NotFound(parent_id.to_string()))?,
+            ),
+            None => None,
+        };
+        let parent_lineage = parent.as_ref().map(|parent| {
+            (
+                parent.policy_source_id,
+                parent.revision,
+                parent.id,
+                parent.status,
+                parent.content_sha256.as_str(),
+            )
+        });
+        let (policy_source_id, revision, supersedes_import_id) =
+            resolve_import_lineage(parent_lineage, &content_sha256)?;
         let raw_object_key = format!(
             "organizations/{}/policy-imports/{}/raw/{}",
             input.organization_id, id, content_sha256
@@ -234,6 +255,9 @@ where
         let import = PolicyImport {
             id,
             organization_id: input.organization_id,
+            policy_source_id,
+            revision,
+            supersedes_import_id,
             status: PolicyImportStatus::Uploading,
             input_kind: input.input_kind,
             source_type: input.source_type,
@@ -294,6 +318,36 @@ where
     }
 }
 
+fn resolve_import_lineage(
+    parent: Option<(
+        PolicySourceId,
+        u32,
+        PolicyImportId,
+        PolicyImportStatus,
+        &str,
+    )>,
+    content_sha256: &str,
+) -> Result<(PolicySourceId, u32, Option<PolicyImportId>), ApplicationError> {
+    let Some((policy_source_id, parent_revision, parent_id, parent_status, parent_hash)) = parent
+    else {
+        return Ok((PolicySourceId::new(), 1, None));
+    };
+    if parent_status != PolicyImportStatus::Compiled {
+        return Err(ApplicationError::Conflict(
+            "only a compiled import can be updated with a new source version".to_owned(),
+        ));
+    }
+    if parent_hash == content_sha256 {
+        return Err(ApplicationError::Conflict(
+            "the uploaded source is unchanged".to_owned(),
+        ));
+    }
+    let revision = parent_revision.checked_add(1).ok_or_else(|| {
+        ApplicationError::Conflict("the policy source revision limit was reached".to_owned())
+    })?;
+    Ok((policy_source_id, revision, Some(parent_id)))
+}
+
 #[derive(Debug)]
 pub struct ProcessPolicyImport<R, S, P, M> {
     repository: R,
@@ -335,15 +389,22 @@ where
         let raw = match self.artifacts.get(&import.raw_object_key).await {
             Ok(raw) => raw,
             Err(error) => {
-                let _ = self
-                    .repository
-                    .mark_failure(
-                        organization_id,
-                        id,
+                let (status, code, detail) = if matches!(error, ApplicationError::NotFound(_)) {
+                    (
+                        PolicyImportStatus::FailedTerminal,
+                        "artifact_missing",
+                        "the stored source artifact no longer exists",
+                    )
+                } else {
+                    (
                         PolicyImportStatus::FailedRetryable,
                         "artifact_read_failed",
                         "source storage is temporarily unavailable",
                     )
+                };
+                let _ = self
+                    .repository
+                    .mark_failure(organization_id, id, status, code, detail)
                     .await;
                 return Err(error);
             }
@@ -1043,6 +1104,7 @@ mod tests {
             detected_mime_type: "text/plain".to_owned(),
             content: b"policy".to_vec(),
             idempotency_key: Some("contains space".to_owned()),
+            supersedes_import_id: None,
         };
         assert!(validate_new_import(&input).is_err());
     }
@@ -1050,5 +1112,49 @@ mod tests {
     #[test]
     fn stable_sha_has_expected_length() {
         assert_eq!(sha256_hex(b"policy").len(), 64);
+    }
+
+    #[test]
+    fn changed_content_advances_the_existing_source_lineage() {
+        let expected_source_id = PolicySourceId::new();
+        let parent_id = PolicyImportId::new();
+        let old_hash = sha256_hex(b"old policy");
+
+        let (source_id, revision, supersedes) = resolve_import_lineage(
+            Some((
+                expected_source_id,
+                4,
+                parent_id,
+                PolicyImportStatus::Compiled,
+                &old_hash,
+            )),
+            &sha256_hex(b"new policy"),
+        )
+        .expect("changed content should create a revision");
+
+        assert_eq!(source_id, expected_source_id);
+        assert_eq!(revision, 5);
+        assert_eq!(supersedes, Some(parent_id));
+    }
+
+    #[test]
+    fn unchanged_content_does_not_create_a_revision() {
+        let source_id = PolicySourceId::new();
+        let parent_id = PolicyImportId::new();
+        let same_hash = sha256_hex(b"same policy");
+
+        assert!(
+            resolve_import_lineage(
+                Some((
+                    source_id,
+                    1,
+                    parent_id,
+                    PolicyImportStatus::Compiled,
+                    &same_hash
+                )),
+                &same_hash,
+            )
+            .is_err()
+        );
     }
 }

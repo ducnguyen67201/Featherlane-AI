@@ -20,14 +20,48 @@ use governance_telemetry::{
     ObservedSpan, RedactionPolicy, SpanLink, TelemetryLimits,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, EntityTrait, PaginatorTrait,
-    QueryFilter, Set, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, Set, Statement,
 };
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
 
-#[tokio::test]
+struct EvaluationCleanup {
+    database: DatabaseConnection,
+    organization_ids: Vec<OrganizationId>,
+    active: bool,
+}
+
+impl Drop for EvaluationCleanup {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let database = self.database.clone();
+        let ids = self
+            .organization_ids
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                if let Err(error) = database
+                    .execute_raw(Statement::from_string(
+                        database.get_database_backend(),
+                        format!("DELETE FROM organizations WHERE id IN ({ids})"),
+                    ))
+                    .await
+                {
+                    eprintln!("evaluation test cleanup failed: {error}");
+                }
+            });
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
     let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
@@ -43,6 +77,11 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
     let organization_id = OrganizationId::new();
     let other_organization_id = OrganizationId::new();
     let policy_pack_id = PolicyPackId::new();
+    let mut cleanup = EvaluationCleanup {
+        database: database.clone(),
+        organization_ids: vec![organization_id, other_organization_id],
+        active: true,
+    };
     let now = OffsetDateTime::now_utc();
     let now = now
         .replace_nanosecond((now.nanosecond() / 1_000) * 1_000)
@@ -540,6 +579,8 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
         .await
         .expect("due job should claim")
         .expect("a due job should exist");
+    assert_eq!(claimed_job.eval_run_id, run.id);
+    assert_eq!(claimed_job.kind, "finalize_evaluation_run");
     assert!(
         repository
             .reschedule_job(
@@ -555,6 +596,8 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
         .await
         .expect("rescheduled job should claim")
         .expect("rescheduled job should be due");
+    assert_eq!(claimed_job.eval_run_id, run.id);
+    assert_eq!(claimed_job.kind, "finalize_evaluation_run");
     assert_eq!(claimed_job.attempts, 1);
     assert!(
         !repository
@@ -584,6 +627,7 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
         ))
         .await
         .expect("test records should clean up");
+    cleanup.active = false;
 }
 
 fn observed_span(

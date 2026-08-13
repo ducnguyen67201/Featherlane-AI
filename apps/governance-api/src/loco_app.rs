@@ -13,12 +13,12 @@ use governance_application::{
     EvidenceBundleRepository, PolicyPackRepository, RotateTelemetryIngestKey,
     TelemetryIngestKeyRepository,
 };
-use governance_domain::{EvalRunId, PolicyPackApproval, PolicyPackId};
+use governance_domain::{EvalRunId, PolicyPackApproval, PolicyPackId, PolicyPackStatusChange};
 use governance_migration::Migrator;
 use governance_persistence::{
     SeaOrmEvaluationRepository, SeaOrmEvaluationRunRepository, SeaOrmPolicyPackRepository,
 };
-use governance_worker::{EvaluationWorker, FinalizationWorker, ProcessPolicyImportWorker};
+use governance_worker::ProcessPolicyImportWorker;
 use loco_rs::{
     Result,
     app::{AppContext, Hooks},
@@ -35,9 +35,14 @@ use uuid::Uuid;
 
 use crate::{
     ApprovePolicyPackRequest, CompleteEvaluationRequest, CreateEvaluationRequest,
-    CreatedEvaluationRun, EvaluationRunDetail, HealthResponse, PolicyImportRequest, PolicyPackView,
-    RotateTelemetryKeyRequest, TargetView,
+    CreatedEvaluationRun, EvaluationRunDetail, HealthResponse, PolicyImportRequest,
+    PolicyPackLifecycleRequest, PolicyPackView, RotateTelemetryKeyRequest, TargetView,
 };
+
+#[derive(Clone, Debug)]
+struct RuntimeEndpoints {
+    otlp_http: String,
+}
 
 #[derive(Debug)]
 pub struct App;
@@ -60,13 +65,34 @@ impl Hooks for App {
         create_app::<Self, Migrator>(mode, environment, config).await
     }
 
+    async fn after_context(context: AppContext) -> Result<AppContext> {
+        let policy_imports = crate::policy_imports::PolicyImportServices::from_env()
+            .map_err(|error| loco_rs::Error::Message(error.to_string()))?;
+        let otlp_http = match std::env::var("GOVERNANCE_OTLP_HTTP_ENDPOINT") {
+            Ok(endpoint) if !endpoint.trim().is_empty() => endpoint,
+            _ if matches!(
+                context.environment,
+                Environment::Development | Environment::Test
+            ) =>
+            {
+                "http://localhost:4318/v1/traces".to_owned()
+            }
+            _ => {
+                return Err(loco_rs::Error::Message(
+                    "GOVERNANCE_OTLP_HTTP_ENDPOINT is required outside development".to_owned(),
+                ));
+            }
+        };
+        context.shared_store.insert(policy_imports);
+        context.shared_store.insert(RuntimeEndpoints { otlp_http });
+        Ok(context)
+    }
+
     fn routes(_context: &AppContext) -> AppRoutes {
         AppRoutes::with_default_routes().add_route(api_routes())
     }
 
     async fn connect_workers(context: &AppContext, queue: &Queue) -> Result<()> {
-        queue.register(EvaluationWorker::build(context)).await?;
-        queue.register(FinalizationWorker::build(context)).await?;
         queue
             .register(ProcessPolicyImportWorker::build(context))
             .await?;
@@ -88,12 +114,21 @@ fn api_routes() -> Routes {
     Routes::new()
         .add("/health", get(loco_health))
         .add("/v1/overview", get(loco_overview))
+        .add("/v1/contracts/event-types", get(loco_event_types))
         .add("/v1/policy-packs", get(loco_policy_packs))
         .add("/v1/policy-packs", post(loco_import_policy_pack))
         .add("/v1/policy-packs/{id}", get(loco_policy_pack))
         .add(
             "/v1/policy-packs/{id}/approve",
             post(loco_approve_policy_pack),
+        )
+        .add(
+            "/v1/policy-packs/{id}/disable",
+            post(loco_disable_policy_pack),
+        )
+        .add(
+            "/v1/policy-packs/{id}/enable",
+            post(loco_enable_policy_pack),
         )
         .add(
             "/v1/policy-imports",
@@ -168,6 +203,31 @@ async fn loco_health(State(context): State<AppContext>) -> Json<HealthResponse> 
             "not_durable"
         },
     })
+}
+
+async fn loco_event_types() -> Json<Vec<governance_domain::EventType>> {
+    use governance_domain::EventType;
+
+    Json(vec![
+        EventType::ScenarioInput,
+        EventType::AgentStart,
+        EventType::ModelCall,
+        EventType::ModelResult,
+        EventType::ToolCall,
+        EventType::ToolResult,
+        EventType::Retrieval,
+        EventType::Handoff,
+        EventType::GuardrailDecision,
+        EventType::HumanApprovalRequest,
+        EventType::HumanApprovalDecision,
+        EventType::FinalOutput,
+        EventType::SideEffect,
+        EventType::Retry,
+        EventType::Error,
+        EventType::Timeout,
+        EventType::Cancellation,
+        EventType::Unclassified,
+    ])
 }
 
 async fn loco_overview(State(context): State<AppContext>) -> Response {
@@ -265,6 +325,55 @@ async fn loco_approve_policy_pack(
     }
 }
 
+async fn loco_disable_policy_pack(
+    State(context): State<AppContext>,
+    Path(id): Path<String>,
+    Json(request): Json<PolicyPackLifecycleRequest>,
+) -> Response {
+    transition_policy_pack(context, id, request, false).await
+}
+
+async fn loco_enable_policy_pack(
+    State(context): State<AppContext>,
+    Path(id): Path<String>,
+    Json(request): Json<PolicyPackLifecycleRequest>,
+) -> Response {
+    transition_policy_pack(context, id, request, true).await
+}
+
+async fn transition_policy_pack(
+    context: AppContext,
+    id: String,
+    request: PolicyPackLifecycleRequest,
+    enable: bool,
+) -> Response {
+    let Some(id) = parse_policy_pack_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid policy pack identifier");
+    };
+    if request.actor_id.trim().is_empty() {
+        return problem(StatusCode::BAD_REQUEST, "actor_id is required");
+    }
+    let change = PolicyPackStatusChange {
+        actor_id: request.actor_id,
+        notes: request.notes,
+        changed_at: OffsetDateTime::now_utc(),
+    };
+    let repository = SeaOrmPolicyPackRepository::new(context.db);
+    let result = if enable {
+        repository
+            .enable(super::default_organization_id(), id, &change)
+            .await
+    } else {
+        repository
+            .disable(super::default_organization_id(), id, &change)
+            .await
+    };
+    match result {
+        Ok(pack) => Json(pack).into_response(),
+        Err(error) => database_error(error),
+    }
+}
+
 async fn loco_targets() -> Json<Vec<TargetView>> {
     super::targets(axum::extract::State(super::demo_state())).await
 }
@@ -309,9 +418,19 @@ async fn loco_create_evaluation(
     State(context): State<AppContext>,
     Json(request): Json<CreateEvaluationRequest>,
 ) -> Response {
+    let Some(endpoint) = context
+        .shared_store
+        .get::<RuntimeEndpoints>()
+        .map(|endpoints| endpoints.otlp_http)
+    else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "telemetry endpoint configuration was not initialized",
+        );
+    };
     let organization_id = super::default_organization_id();
     let policy_repository = SeaOrmPolicyPackRepository::new(context.db.clone());
-    let runs = SeaOrmEvaluationRunRepository::new(context.db);
+    let runs = SeaOrmEvaluationRunRepository::new(context.db.clone());
     let command = CreateEvaluationRunRequest {
         organization_id,
         target_id: request.target_id,
@@ -329,8 +448,6 @@ async fn loco_create_evaluation(
         .await
     {
         Ok(run) => {
-            let endpoint = std::env::var("GOVERNANCE_OTLP_HTTP_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:4318/v1/traces".to_owned());
             (
                 StatusCode::CREATED,
                 Json(CreatedEvaluationRun::new(run, endpoint)),
