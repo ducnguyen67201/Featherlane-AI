@@ -1,0 +1,29 @@
+logger:
+  enable: false
+  pretty_backtrace: true
+  level: debug
+  format: compact
+
+server:
+  port: 8081
+  binding: 127.0.0.1
+  host: http://localhost
+  middlewares:
+    fallback:
+      enable: false
+    static:
+      enable: false
+
+workers:
+  mode: ForegroundBlocking
+
+database:
+  uri: {{ get_env(name="TEST_DATABASE_URL", default="postgres://featherlane:featherlane@localhost:5432/featherlane_test") }}
+  enable_logging: false
+  connect_timeout: 500
+  idle_timeout: 500
+  min_connections: 1
+  max_connections: 4
+  auto_migrate: true
+  dangerously_truncate: false
+  dangerously_recreate: false

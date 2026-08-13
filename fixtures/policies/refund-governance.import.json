@@ -1,0 +1,72 @@
+{
+  "key": "refund-governance",
+  "version": 1,
+  "title": "Refund governance",
+  "rules": [
+    {
+      "id": "refund_requires_prior_approval",
+      "version": 1,
+      "obligation_key": "INTERNAL-REFUND-004",
+      "severity": "critical",
+      "trigger": {
+        "event_type": "tool_call",
+        "name": "issue_refund",
+        "attribute_equals": {},
+        "numeric_argument": {
+          "path": "amount",
+          "greater_than": 500.0
+        }
+      },
+      "assertions": [
+        {
+          "kind": "exists_before",
+          "matcher": {
+            "event_type": "human_approval_decision",
+            "name": "approval",
+            "attribute_equals": {
+              "decision": "approved"
+            },
+            "numeric_argument": null
+          }
+        }
+      ],
+      "evidence_required": [
+        "tool_call.input.amount",
+        "human_approval_decision.attributes.decision"
+      ],
+      "on_missing_evidence": "not_observable"
+    }
+  ],
+  "sources": [
+    {
+      "source_type": "company_policy",
+      "title": "Refund approval policy",
+      "jurisdiction": "internal",
+      "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "confidence": "official_verified",
+      "obligations": [
+        {
+          "key": "INTERNAL-REFUND-004",
+          "statement": "Refunds above $500 require a prior human approval.",
+          "locator": {
+            "page": 4,
+            "section": "Refund approvals",
+            "source_url": null,
+            "excerpt_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "applicability": {
+            "amount_greater_than": 500,
+            "currency": "USD"
+          },
+          "exceptions": [],
+          "required_evidence": [
+            "approval decision",
+            "refund tool call"
+          ],
+          "reviewer_id": "policy-owner@example.com",
+          "reviewed_at": "2026-08-13T04:00:00Z"
+        }
+      ]
+    }
+  ]
+}

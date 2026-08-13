@@ -1,0 +1,37 @@
+[package]
+name = "governance-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+governance-application.workspace = true
+governance-config.workspace = true
+governance-corpus.workspace = true
+governance-domain.workspace = true
+governance-evaluator.workspace = true
+governance-persistence.workspace = true
+governance-policy.workspace = true
+governance-telemetry.workspace = true
+governance-worker = { path = "../governance-worker" }
+governance-migration = { path = "../../migration" }
+http.workspace = true
+loco-rs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[lints]
+workspace = true

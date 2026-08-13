@@ -1,0 +1,20 @@
+[package]
+name = "governance-telemetry-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+governance-config.workspace = true
+governance-domain.workspace = true
+governance-telemetry.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

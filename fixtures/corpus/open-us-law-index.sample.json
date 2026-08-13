@@ -1,0 +1,17 @@
+{
+  "dataset": "open-us-law",
+  "version": "v2026.07",
+  "snapshot_date": "2026-07-21",
+  "total_bytes": 1169714039,
+  "parquet_files": 105,
+  "license_data": "CC-BY-4.0",
+  "files": [
+    {
+      "file": "us_ca_statutes.parquet",
+      "key": "v2026.07/us_ca_statutes.parquet",
+      "bytes": 1,
+      "sha256": "fixture-requires-live-manifest-before-download",
+      "url": "https://oss-data-us.vaquill.ai/v2026.07/us_ca_statutes.parquet"
+    }
+  ]
+}
