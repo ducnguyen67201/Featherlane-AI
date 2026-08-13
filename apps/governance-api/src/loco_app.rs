@@ -7,8 +7,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use governance_application::{DashboardSnapshot, EvaluateEvidence, PolicyPackRepository};
-use governance_domain::{PolicyPackApproval, PolicyPackId, ReviewStatus};
+use governance_application::{
+    DashboardSnapshot, EvaluateEvidence, EvaluationRepository, PolicyPackRepository,
+};
+use governance_domain::{EvalRunId, PolicyPackApproval, PolicyPackId, ReviewStatus, RunVerdict};
 use governance_migration::Migrator;
 use governance_persistence::{SeaOrmEvaluationRepository, SeaOrmPolicyPackRepository};
 use governance_worker::EvaluationWorker;
@@ -197,11 +199,44 @@ async fn loco_evaluations() -> Json<Vec<EvaluationView>> {
     super::evaluations(axum::extract::State(super::demo_state())).await
 }
 
-async fn loco_evaluation(Path(id): Path<String>) -> Response {
-    match super::evaluation(axum::extract::State(super::demo_state()), Path(id)).await {
-        Ok(value) => value.into_response(),
-        Err(error) => error.into_response(),
-    }
+async fn loco_evaluation(State(context): State<AppContext>, Path(id): Path<String>) -> Response {
+    let Some(id) = parse_eval_run_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid evaluation identifier");
+    };
+    let organization_id = super::default_organization_id();
+    let evaluation_repository = SeaOrmEvaluationRepository::new(context.db.clone());
+    let summary = match evaluation_repository.get_summary(organization_id, id).await {
+        Ok(Some(summary)) => summary,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "evaluation was not found"),
+        Err(error) => return database_error(error),
+    };
+    let policy_repository = SeaOrmPolicyPackRepository::new(context.db);
+    let pack = match policy_repository.list(organization_id).await {
+        Ok(packs) => packs
+            .into_iter()
+            .find(|pack| pack.status == ReviewStatus::Approved),
+        Err(error) => return database_error(error),
+    };
+    let Some(pack) = pack else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "the approved policy pack for this evaluation was not found",
+        );
+    };
+    let simulate_missing_approval = summary.verdict == RunVerdict::Fail;
+    let simulate_missing_trace = summary.verdict == RunVerdict::Inconclusive;
+    let evidence = super::demo_evidence(
+        organization_id,
+        simulate_missing_approval,
+        simulate_missing_trace,
+    );
+    let request = CreateEvaluationRequest {
+        policy_pack_id: Some(pack.id),
+        target: super::default_target(),
+        simulate_missing_approval,
+        simulate_missing_trace,
+    };
+    Json(super::evaluation_view(request, &pack, &evidence, &summary)).into_response()
 }
 
 async fn loco_create_evaluation(
@@ -254,6 +289,10 @@ async fn loco_corpus() -> (StatusCode, Json<CorpusView>) {
 
 fn parse_policy_pack_id(value: &str) -> Option<PolicyPackId> {
     Uuid::parse_str(value).ok().map(PolicyPackId)
+}
+
+fn parse_eval_run_id(value: &str) -> Option<EvalRunId> {
+    Uuid::parse_str(value).ok().map(EvalRunId)
 }
 
 #[allow(clippy::needless_pass_by_value)] // Keeps match arms usable as direct error adapters.

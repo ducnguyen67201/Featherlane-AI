@@ -13,8 +13,7 @@ export function RunEvaluationButton() {
     setRunning(true);
     setError(null);
     try {
-      const api = process.env.NEXT_PUBLIC_GOVERNANCE_API_URL ?? "http://127.0.0.1:8080";
-      const response = await fetch(`${api}/v1/evaluations`, {
+      const response = await fetch("/api/evaluations", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ target: "refund-agent-staging" }),
