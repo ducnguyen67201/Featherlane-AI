@@ -19,3 +19,8 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+governance-migration = { path = "../../migration" }
+sea-orm-migration.workspace = true
+tokio.workspace = true

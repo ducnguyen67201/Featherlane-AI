@@ -26,8 +26,12 @@ describe("target create BFF", () => {
     getCurrentSessionMock.mockResolvedValue({ user: { id: "user-1" } });
     fetchMock.mockResolvedValue(new Response('{"id":"target-1"}', { status: 201 }));
     const body = '{"name":"Refund Agent"}';
-    const response = await POST(new Request("http://localhost/api/targets", { method: "POST", body }));
-    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8080/v1/targets", expect.objectContaining({ body }));
+    const request = new Request("http://localhost/api/targets", { method: "POST", body });
+    const response = await POST(request);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080/v1/targets",
+      expect.objectContaining({ body: request.body }),
+    );
     expect(response.status).toBe(201);
   });
 

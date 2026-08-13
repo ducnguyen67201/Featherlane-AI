@@ -9,13 +9,18 @@ rust-version.workspace = true
 async-trait.workspace = true
 governance-domain.workspace = true
 governance-evaluator.workspace = true
+governance-policy.workspace = true
 governance-targets.workspace = true
 governance-telemetry.workspace = true
+base64.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

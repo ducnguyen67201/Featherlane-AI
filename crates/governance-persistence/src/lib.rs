@@ -1,9 +1,13 @@
 //! `SeaORM` persistence adapters. ORM models never cross this crate boundary.
 
 pub mod entities;
+mod evaluation_runs;
 mod live_evaluations;
+mod policy_imports;
 
+pub use evaluation_runs::SeaOrmEvaluationRunRepository;
 pub use live_evaluations::SeaOrmEvaluationRepository;
+pub use policy_imports::SeaOrmPolicyImportRepository;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,14 +15,14 @@ use async_trait::async_trait;
 use governance_application::{ApplicationError, PolicyPackRepository, TargetRepository};
 use governance_domain::{
     CompiledRule, OrganizationId, PolicyBundle, PolicyPack, PolicyPackApproval, PolicyPackId,
-    ReviewStatus, TargetId,
+    PolicyPackStatusChange, ReviewStatus, TargetId,
 };
 use governance_targets::{
     CapabilityReport, EvidenceMode, RegisteredTarget, TargetEnvironment, TargetManifest,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait, sea_query::OnConflict,
+    QueryOrder, QuerySelect, Set, TransactionTrait, sea_query::OnConflict,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -44,10 +48,18 @@ struct StoredTargetCapabilities {
     name: String,
     environment: TargetEnvironment,
     reset_endpoint: Option<String>,
+    #[serde(default)]
+    status_endpoint: Option<String>,
+    #[serde(default)]
+    terminal_response_key: Option<String>,
     auth_secret_ref: Option<String>,
     timeout_seconds: u64,
     evidence_mode: EvidenceMode,
+    #[serde(default)]
+    otlp_required: bool,
     production_credentials_allowed: bool,
+    #[serde(default)]
+    telemetry_boundary: governance_targets::TelemetryBoundaryConfig,
     capability: CapabilityReport,
 }
 
@@ -73,10 +85,14 @@ impl TargetRepository for SeaOrmTargetRepository {
             name: target.name.clone(),
             environment: target.environment,
             reset_endpoint: target.manifest.reset_endpoint.clone(),
+            status_endpoint: target.manifest.status_endpoint.clone(),
+            terminal_response_key: target.manifest.terminal_response_key.clone(),
             auth_secret_ref: target.manifest.auth_secret_ref.clone(),
             timeout_seconds: target.manifest.timeout_seconds,
             evidence_mode: target.manifest.evidence_mode,
+            otlp_required: target.manifest.otlp_required,
             production_credentials_allowed: target.manifest.production_credentials_allowed,
+            telemetry_boundary: target.manifest.telemetry_boundary.clone(),
             capability: target.capability.clone(),
         };
         targets::ActiveModel {
@@ -172,10 +188,14 @@ fn target_from_model(model: targets::Model) -> Result<RegisteredTarget, Applicat
             driver_type: enum_from_string(&model.driver_type)?,
             endpoint: model.endpoint,
             reset_endpoint: capabilities.reset_endpoint,
+            status_endpoint: capabilities.status_endpoint,
+            terminal_response_key: capabilities.terminal_response_key,
             auth_secret_ref: capabilities.auth_secret_ref,
             timeout_seconds: capabilities.timeout_seconds,
             evidence_mode: capabilities.evidence_mode,
+            otlp_required: capabilities.otlp_required,
             production_credentials_allowed: capabilities.production_credentials_allowed,
+            telemetry_boundary: capabilities.telemetry_boundary,
         },
         capability: capabilities.capability,
         created_at: model.created_at,
@@ -318,14 +338,8 @@ impl PolicyPackRepository for SeaOrmPolicyPackRepository {
     }
 
     async fn save_bundle(&self, bundle: &PolicyBundle) -> Result<(), ApplicationError> {
-        validate_policy_bundle(bundle)?;
         let transaction = self.database.begin().await.map_err(repository_error)?;
-        ensure_organization(&transaction, bundle.pack.organization_id).await?;
-        ensure_version_available(&transaction, &bundle.pack).await?;
-        insert_pack(&transaction, &bundle.pack).await?;
-        insert_rules(&transaction, &bundle.pack).await?;
-        insert_sources(&transaction, bundle).await?;
-        insert_obligations(&transaction, bundle).await?;
+        persist_bundle(&transaction, bundle).await?;
         transaction.commit().await.map_err(repository_error)
     }
 
@@ -408,6 +422,111 @@ impl PolicyPackRepository for SeaOrmPolicyPackRepository {
             .await?
             .ok_or_else(|| ApplicationError::NotFound(id.to_string()))
     }
+
+    async fn disable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
+    ) -> Result<PolicyPack, ApplicationError> {
+        transition_pack_status(
+            &self.database,
+            organization_id,
+            id,
+            "approved",
+            "disabled",
+            None,
+            change,
+        )
+        .await?;
+        self.get(organization_id, id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))
+    }
+
+    async fn enable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
+    ) -> Result<PolicyPack, ApplicationError> {
+        transition_pack_status(
+            &self.database,
+            organization_id,
+            id,
+            "disabled",
+            "approved",
+            Some(change.changed_at),
+            change,
+        )
+        .await?;
+        self.get(organization_id, id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))
+    }
+}
+
+async fn transition_pack_status(
+    database: &DatabaseConnection,
+    organization_id: OrganizationId,
+    id: PolicyPackId,
+    expected: &str,
+    next: &str,
+    published_at: Option<OffsetDateTime>,
+    change: &PolicyPackStatusChange,
+) -> Result<(), ApplicationError> {
+    if change.actor_id.trim().is_empty() {
+        return Err(ApplicationError::InvalidRequest(
+            "policy status changes require an actor identifier".to_owned(),
+        ));
+    }
+    let transaction = database.begin().await.map_err(repository_error)?;
+    let model = policy_packs::Entity::find()
+        .filter(policy_packs::Column::OrganizationId.eq(organization_id.0))
+        .filter(policy_packs::Column::Id.eq(id.0))
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .map_err(repository_error)?
+        .ok_or_else(|| ApplicationError::NotFound(id.to_string()))?;
+    if model.status != expected {
+        return Err(ApplicationError::Conflict(format!(
+            "only a {expected} policy pack can transition to {next}"
+        )));
+    }
+    let mut active: policy_packs::ActiveModel = model.into();
+    active.status = Set(next.to_owned());
+    active.published_at = Set(published_at);
+    active
+        .update(&transaction)
+        .await
+        .map_err(repository_error)?;
+    policy_reviews::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        organization_id: Set(organization_id.0),
+        policy_pack_id: Set(id.0),
+        status: Set(next.to_owned()),
+        reviewer_id: Set(change.actor_id.clone()),
+        notes: Set(change.notes.clone()),
+        reviewed_at: Set(change.changed_at),
+    }
+    .insert(&transaction)
+    .await
+    .map_err(repository_error)?;
+    transaction.commit().await.map_err(repository_error)
+}
+
+pub(crate) async fn persist_bundle<C: ConnectionTrait>(
+    connection: &C,
+    bundle: &PolicyBundle,
+) -> Result<(), ApplicationError> {
+    validate_policy_bundle(bundle)?;
+    ensure_organization(connection, bundle.pack.organization_id).await?;
+    ensure_version_available(connection, &bundle.pack).await?;
+    insert_pack(connection, &bundle.pack).await?;
+    insert_rules(connection, &bundle.pack).await?;
+    insert_sources(connection, bundle).await?;
+    insert_obligations(connection, bundle).await
 }
 
 fn validate_policy_bundle(bundle: &PolicyBundle) -> Result<(), ApplicationError> {

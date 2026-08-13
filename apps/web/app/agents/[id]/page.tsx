@@ -9,7 +9,7 @@ export default async function TargetDetailPage({ params }: { params: Promise<{ i
   const { id } = await params;
   const [target, policies] = await Promise.all([getAgent(id), getPolicies()]);
   if (!target) notFound();
-  const approvedPolicies = policies
+  const approvedPolicies = (policies.data ?? [])
     .filter((policy) => policy.status === "approved")
     .map(({ id: policyId, title }) => ({ id: policyId, title }));
 

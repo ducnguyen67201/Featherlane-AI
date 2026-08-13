@@ -3,10 +3,11 @@ import { ActivityChart } from "@/components/activity-chart";
 import { RunEvaluationButton } from "@/components/run-evaluation-button";
 import { RunTable } from "@/components/run-table";
 import { MetricCard, PageHeader, SectionHeader, StateBadge } from "@/components/ui";
-import { getAgents, getOverview } from "@/lib/api";
+import { getAgents, getOverview, getPolicies } from "@/lib/api";
 
 export default async function OverviewPage() {
-  const [overview, agents] = await Promise.all([getOverview(), getAgents()]);
+  const [overview, agents, policies] = await Promise.all([getOverview(), getAgents(), getPolicies()]);
+  const policyPackId = policies.data?.find((policy) => policy.status === "approved")?.id;
   const completeTargets = agents.filter((agent) => agent.latest_trace_quality === "complete").length;
   const needsInstrumentation = agents.filter((agent) => agent.latest_trace_quality && agent.latest_trace_quality !== "complete").length;
   return (
@@ -15,7 +16,7 @@ export default async function OverviewPage() {
         eyebrow="Governance workspace / Overview"
         title="Agent governance, backed by evidence"
         description="Test agent trajectories against approved policy packs before deployment and inspect production traces without taking over the customer workflow."
-        action={<RunEvaluationButton />}
+        action={<RunEvaluationButton policyPackId={policyPackId} />}
       />
 
       <section className="metric-grid" aria-label="Governance summary">

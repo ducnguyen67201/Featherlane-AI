@@ -128,6 +128,9 @@ pub(crate) async fn validate_common(
     if !reachable {
         issues.push("target endpoint did not return a successful readiness response".to_owned());
     }
+    if manifest.otlp_required && manifest.status_endpoint.is_none() {
+        issues.push("OTLP is required but no terminal/status endpoint is declared".to_owned());
+    }
     Ok(CapabilityReport {
         target_id: manifest.target_id.clone(),
         reachable,
@@ -145,6 +148,10 @@ pub(crate) fn start_session_common(context: RunContext) -> TargetSession {
     TargetSession {
         id: Uuid::now_v7().to_string(),
         traceparent: format!("00-{trace_id}-{parent_id}-01"),
+        baggage: format!(
+            "featherlane.eval_run.id={},featherlane.invocation.id={},featherlane.scenario.id={}",
+            context.eval_run_id, context.invocation_id, context.scenario_id
+        ),
         context,
     }
 }
@@ -224,16 +231,18 @@ fn authorize(
 }
 
 fn correlated(request: RequestBuilder, session: &TargetSession) -> RequestBuilder {
+    let eval_run_id = session.context.eval_run_id.to_string();
+    let invocation_id = session.context.invocation_id.to_string();
+    let scenario_id = session.context.scenario_id.to_string();
     request
         .header("traceparent", &session.traceparent)
-        .header(
-            "x-governance-eval-run-id",
-            session.context.eval_run_id.to_string(),
-        )
-        .header(
-            "x-governance-scenario-id",
-            session.context.scenario_id.to_string(),
-        )
+        .header("baggage", &session.baggage)
+        .header("x-featherlane-eval-run-id", &eval_run_id)
+        .header("x-featherlane-invocation-id", &invocation_id)
+        .header("x-featherlane-scenario-id", &scenario_id)
+        .header("x-governance-eval-run-id", &eval_run_id)
+        .header("x-governance-invocation-id", &invocation_id)
+        .header("x-governance-scenario-id", &scenario_id)
 }
 
 #[allow(clippy::needless_pass_by_value)] // Required as a direct `map_err` adapter.
@@ -255,7 +264,7 @@ mod tests {
         http::{HeaderMap, StatusCode as AxumStatusCode},
         routing::{get, post},
     };
-    use governance_domain::{EvalRunId, ScenarioId};
+    use governance_domain::{EvalRunId, InvocationId, ScenarioId};
     use serde_json::json;
 
     use super::*;
@@ -284,10 +293,14 @@ mod tests {
             driver_type,
             endpoint: format!("http://{address}{path}"),
             reset_endpoint: None,
+            status_endpoint: None,
+            terminal_response_key: None,
             auth_secret_ref: None,
             timeout_seconds: 5,
             evidence_mode: crate::EvidenceMode::Inline,
+            otlp_required: false,
             production_credentials_allowed: false,
+            telemetry_boundary: crate::TelemetryBoundaryConfig::default(),
         }
     }
 
@@ -295,6 +308,7 @@ mod tests {
     async fn generated_traceparent_has_w3c_shape() {
         let session = start_session_common(RunContext {
             eval_run_id: EvalRunId::new(),
+            invocation_id: InvocationId::new(),
             scenario_id: ScenarioId::new(),
         });
         let parts: Vec<&str> = session.traceparent.split('-').collect();
@@ -365,6 +379,7 @@ mod tests {
         );
         let session = driver.start_session(RunContext {
             eval_run_id: EvalRunId::new(),
+            invocation_id: InvocationId::new(),
             scenario_id: ScenarioId::new(),
         });
         driver.reset(&manifest, &session).await.expect("reset");
@@ -443,6 +458,7 @@ mod tests {
         let driver = WebhookDriver::new(Arc::new(FakeSecretResolver));
         let session = driver.start_session(RunContext {
             eval_run_id: EvalRunId::new(),
+            invocation_id: InvocationId::new(),
             scenario_id: ScenarioId::new(),
         });
         let payload = json!({"ticket": "T-1", "nested": {"ready": true}});
@@ -497,6 +513,7 @@ mod tests {
         let driver = HttpTextDriver::new(Arc::new(FakeSecretResolver));
         let session = driver.start_session(RunContext {
             eval_run_id: EvalRunId::new(),
+            invocation_id: InvocationId::new(),
             scenario_id: ScenarioId::new(),
         });
         let event = TestEvent::UserText {

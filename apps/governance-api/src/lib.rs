@@ -1,4 +1,5 @@
 pub mod loco_app;
+mod policy_imports;
 
 use axum::{
     Json, Router,
@@ -10,22 +11,21 @@ use axum::{
 use governance_application::{DashboardSnapshot, StoredEvaluationRun};
 use governance_corpus::PINNED_SNAPSHOT;
 use governance_domain::{
-    CompiledRule, EvalRunId, EventType, NormalizedEvent, Obligation, ObligationId, OrganizationId,
-    PolicyBundle, PolicyPack, PolicyPackId, ReviewStatus, ReviewerApproval, RunVerdict, Source,
-    SourceConfidence, SourceId, SourceLocator, SourceType, TargetId, TraceQualityStatus,
+    CompletionReason, EvalRunId, EvaluationRun, EvaluationSummary, EventType, EvidenceBundle,
+    InvocationId, NormalizedEvent, OrganizationId, PolicyBundle, PolicyPack, PolicyPackId,
+    RunBoundaryKind, RunVerdict, ScenarioId, SourceConfidence, TargetId, TraceQualityStatus,
 };
-use governance_policy::{PolicyDocument, compile_policy_document};
 use governance_targets::{
     CapabilityReport, DriverType, EvidenceMode, RegisteredTarget, ScenarioDefinition,
     TargetEnvironment, TargetManifest, validate_registration,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
+
+pub use governance_policy::{ObligationImport, PolicyImportRequest, PolicySourceImport};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TargetView {
@@ -119,10 +119,38 @@ pub struct JurisdictionView {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CreateEvaluationRequest {
+#[serde(untagged)]
+pub enum CreateEvaluationRequest {
+    Live(CreateLiveEvaluationRequest),
+    Correlated(CreateCorrelatedEvaluationRequest),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CreateLiveEvaluationRequest {
     pub target_id: TargetId,
     pub policy_pack_id: PolicyPackId,
     pub scenario: ScenarioDefinition,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CreateCorrelatedEvaluationRequest {
+    pub policy_pack_id: PolicyPackId,
+    #[serde(default = "default_target")]
+    pub target_id: String,
+    #[serde(default = "default_target_version")]
+    pub target_version: String,
+    #[serde(default)]
+    pub scenario_id: ScenarioId,
+    #[serde(default)]
+    pub rule_ids: Vec<String>,
+    #[serde(default = "default_boundary_kind")]
+    pub boundary_kind: RunBoundaryKind,
+    #[serde(default)]
+    pub external_run_id: Option<String>,
+    #[serde(default)]
+    pub invocation_id: Option<InvocationId>,
+    #[serde(default = "default_max_duration_seconds")]
+    pub max_duration_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -136,44 +164,77 @@ pub struct CreateTargetRequest {
     #[serde(default)]
     pub reset_endpoint: Option<String>,
     #[serde(default)]
+    pub status_endpoint: Option<String>,
+    #[serde(default)]
+    pub terminal_response_key: Option<String>,
+    #[serde(default)]
     pub auth_secret_ref: Option<String>,
     #[serde(default = "default_target_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default)]
+    pub otlp_required: bool,
+    #[serde(default)]
+    pub telemetry_boundary: governance_targets::TelemetryBoundaryConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PolicyImportRequest {
-    pub key: String,
-    pub version: u32,
-    pub title: String,
-    pub rules: Vec<CompiledRule>,
-    pub sources: Vec<PolicySourceImport>,
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompleteEvaluationRequest {
+    #[serde(default = "default_completion_reason")]
+    pub reason: CompletionReason,
+    pub terminal_state: Option<String>,
+    #[serde(default = "default_settle_seconds")]
+    pub settle_seconds: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PolicySourceImport {
-    pub source_type: SourceType,
-    pub title: String,
-    pub jurisdiction: String,
-    pub content_sha256: String,
-    pub confidence: SourceConfidence,
-    pub obligations: Vec<ObligationImport>,
+#[derive(Clone, Debug, Serialize)]
+pub struct EvaluationRunDetail {
+    pub run: EvaluationRun,
+    pub summary: Option<EvaluationSummary>,
+    pub evidence: Option<EvidenceBundle>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ObligationImport {
-    pub key: String,
-    pub statement: String,
-    pub locator: SourceLocator,
-    #[serde(default)]
-    pub applicability: Value,
-    #[serde(default)]
-    pub exceptions: Vec<String>,
-    #[serde(default)]
-    pub required_evidence: Vec<String>,
-    pub reviewer_id: Option<String>,
+#[derive(Clone, Debug, Serialize)]
+pub struct CreatedEvaluationRun {
+    #[serde(flatten)]
+    pub run: EvaluationRun,
+    pub telemetry: EvaluationTelemetryInstructions,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EvaluationTelemetryInstructions {
+    pub endpoint: String,
+    pub protocol: &'static str,
+    pub attributes: BTreeMap<String, String>,
+}
+
+impl CreatedEvaluationRun {
+    pub fn new(run: EvaluationRun, endpoint: String) -> Self {
+        let attributes = BTreeMap::from([
+            ("featherlane.eval_run.id".to_owned(), run.id.to_string()),
+            (
+                "featherlane.invocation.id".to_owned(),
+                run.primary_invocation_id.to_string(),
+            ),
+            (
+                "featherlane.scenario.id".to_owned(),
+                run.scenario_id.to_string(),
+            ),
+        ]);
+        Self {
+            run,
+            telemetry: EvaluationTelemetryInstructions {
+                endpoint,
+                protocol: "otlp_http",
+                attributes,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RotateTelemetryKeyRequest {
     #[serde(default, with = "time::serde::rfc3339::option")]
-    pub reviewed_at: Option<OffsetDateTime>,
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -183,8 +244,39 @@ pub struct ApprovePolicyPackRequest {
     pub notes: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct PolicyPackLifecycleRequest {
+    pub actor_id: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
 fn default_target_timeout() -> u64 {
     30
+}
+
+fn default_target() -> String {
+    "refund-agent-staging".to_owned()
+}
+
+fn default_target_version() -> String {
+    "unversioned".to_owned()
+}
+
+const fn default_boundary_kind() -> RunBoundaryKind {
+    RunBoundaryKind::ExplicitCi
+}
+
+const fn default_completion_reason() -> CompletionReason {
+    CompletionReason::Explicit
+}
+
+const fn default_settle_seconds() -> u64 {
+    10
+}
+
+const fn default_max_duration_seconds() -> u64 {
+    3_600
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -192,6 +284,7 @@ pub struct HealthResponse {
     pub status: &'static str,
     pub service: &'static str,
     pub version: &'static str,
+    pub policy_import_worker: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -226,14 +319,6 @@ impl ApiError {
             detail: resource.to_owned(),
         }
     }
-
-    fn internal(detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            title: "Internal error",
-            detail: detail.into(),
-        }
-    }
 }
 
 pub(crate) fn default_organization_id() -> OrganizationId {
@@ -252,10 +337,14 @@ pub(crate) fn build_registered_target(
         driver_type: request.driver_type,
         endpoint: request.endpoint,
         reset_endpoint: request.reset_endpoint,
+        status_endpoint: request.status_endpoint,
+        terminal_response_key: request.terminal_response_key,
         auth_secret_ref: request.auth_secret_ref,
         timeout_seconds: request.timeout_seconds,
         evidence_mode: EvidenceMode::Inline,
+        otlp_required: request.otlp_required,
         production_credentials_allowed: false,
+        telemetry_boundary: request.telemetry_boundary,
     };
     validate_registration(&request.name, &manifest)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -307,101 +396,8 @@ pub(crate) fn build_policy_bundle(
     organization_id: OrganizationId,
     request: &PolicyImportRequest,
 ) -> Result<PolicyBundle, ApiError> {
-    if request.key.trim().is_empty() || request.rules.is_empty() || request.sources.is_empty() {
-        return Err(ApiError::bad_request(
-            "key, at least one rule, and at least one source are required",
-        ));
-    }
-    let canonical =
-        serde_json::to_vec(request).map_err(|error| ApiError::internal(error.to_string()))?;
-    let pack = compile_policy_document(
-        organization_id,
-        PolicyDocument {
-            key: request.key.clone(),
-            version: request.version,
-            title: request.title.clone(),
-            status: ReviewStatus::Draft,
-            rules: request.rules.clone(),
-        },
-        format!("{:x}", Sha256::digest(canonical)),
-    )
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let mut sources = Vec::with_capacity(request.sources.len());
-    let mut obligations = Vec::new();
-    for imported_source in &request.sources {
-        if !valid_sha256(&imported_source.content_sha256) {
-            return Err(ApiError::bad_request(
-                "every source content_sha256 must be a 64-character hexadecimal digest",
-            ));
-        }
-        let source_id = SourceId::new();
-        sources.push(Source {
-            id: source_id,
-            organization_id,
-            source_type: imported_source.source_type,
-            title: imported_source.title.clone(),
-            jurisdiction: imported_source.jurisdiction.clone(),
-            effective_from: None,
-            content_sha256: imported_source.content_sha256.clone(),
-            confidence: imported_source.confidence,
-        });
-        for imported_obligation in &imported_source.obligations {
-            if !valid_sha256(&imported_obligation.locator.excerpt_sha256) {
-                return Err(ApiError::bad_request(
-                    "every obligation excerpt_sha256 must be a 64-character hexadecimal digest",
-                ));
-            }
-            let review = match (
-                imported_obligation.reviewer_id.as_ref(),
-                imported_obligation.reviewed_at,
-            ) {
-                (Some(reviewer_id), Some(reviewed_at)) => Some(ReviewerApproval {
-                    status: ReviewStatus::Approved,
-                    reviewer_id: reviewer_id.clone(),
-                    reviewed_at,
-                }),
-                (None, None) => None,
-                _ => {
-                    return Err(ApiError::bad_request(
-                        "obligation reviewer_id and reviewed_at must be supplied together",
-                    ));
-                }
-            };
-            obligations.push(Obligation {
-                id: ObligationId::new(),
-                organization_id,
-                source_id,
-                key: imported_obligation.key.clone(),
-                statement: imported_obligation.statement.clone(),
-                locator: imported_obligation.locator.clone(),
-                applicability: imported_obligation.applicability.clone(),
-                exceptions: imported_obligation.exceptions.clone(),
-                required_evidence: imported_obligation.required_evidence.clone(),
-                review,
-            });
-        }
-    }
-    let obligation_keys: std::collections::BTreeSet<&str> =
-        obligations.iter().map(|item| item.key.as_str()).collect();
-    if let Some(rule) = request
-        .rules
-        .iter()
-        .find(|rule| !obligation_keys.contains(rule.obligation_key.as_str()))
-    {
-        return Err(ApiError::bad_request(format!(
-            "rule {} references missing obligation {}",
-            rule.id, rule.obligation_key
-        )));
-    }
-    Ok(PolicyBundle {
-        pack,
-        sources,
-        obligations,
-    })
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    governance_policy::build_policy_bundle(organization_id, request)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 pub(crate) fn policy_pack_view(
@@ -489,6 +485,7 @@ pub(crate) async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "governance-api",
         version: env!("CARGO_PKG_VERSION"),
+        policy_import_worker: "not_checked",
     })
 }
 
@@ -578,3 +575,4 @@ pub(crate) fn timeline_item(event: &NormalizedEvent) -> TimelineItem {
 
 #[cfg(test)]
 mod tests;
+use std::collections::BTreeMap;

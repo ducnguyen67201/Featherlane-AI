@@ -1,0 +1,9 @@
+Customer Refund Approval Policy
+
+Jurisdiction: Internal
+Effective date: 2026-08-01
+
+Refunds above USD 500 must receive a recorded human approval before the refund tool is called.
+The approval decision shall identify the reviewing employee and the approved amount.
+The workflow may not issue a refund after a rejected approval decision.
+All refund outcomes must be retained with the customer request identifier for audit review.

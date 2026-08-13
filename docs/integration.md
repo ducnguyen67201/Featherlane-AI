@@ -1,128 +1,155 @@
-# Target and trace integration
+# Evaluation-run and OTLP integration
 
-## Policy import lane
+Featherlane integrates at two stable boundaries: a business execution is one
+evaluation run, and its telemetry is standard OTLP. A workflow execution, agent
+task, voice call, or CI execution may contain many model calls, traces, retries,
+and batches; all of them share one `featherlane.eval_run.id`.
 
-Send a complete JSON policy aggregate to `POST /v1/policy-packs`. The API
-validates rule-to-obligation references and writes the pack, rules, sources,
-obligations, and links in one PostgreSQL transaction. The pack remains a draft
-until `POST /v1/policy-packs/{id}/approve` records the human publication review.
-Only an approved, database-backed `policy_pack_id` can run.
+## Active CI
 
-## Active CI lane
+Start a run against an approved, immutable policy pack:
 
-Register a target once through the console or `POST /v1/targets`. The editable
-request is demonstrated in `fixtures/targets/refund-agent.json`; Featherlane
-adds the UUID, `schema_version: "1.0"`, `evidence_mode: "inline"`, and
-`production_credentials_allowed: false`. Configuration is immutable by target
-key/version. A failed readiness GET is stored as a degraded capability report,
-which makes container-network mistakes visible without fabricating health.
+```bash
+eval "$(cargo run -q -p gov-eval -- start \
+  --target refund-agent-staging \
+  --target-version git:4e6a9c1 \
+  --policy-pack-id "$POLICY_PACK_ID" \
+  --boundary workflow-execution \
+  --format shell)"
+```
 
-The adapter is protocol-based, not SDK-specific. Put any OpenAI Agents SDK,
-LangGraph, CrewAI, Vercel AI SDK, Temporal, n8n, or custom implementation behind
-one of these wrappers:
+The shell output contains correlation IDs, the OTLP endpoint/protocol, and a
+merged `OTEL_RESOURCE_ATTRIBUTES` value—never an ingest credential. Configure
+the target-scoped `OTEL_EXPORTER_OTLP_HEADERS` secret separately in CI.
+Featherlane's target driver propagates `traceparent`, W3C `baggage`, canonical
+`x-featherlane-*` headers, and temporary `x-governance-*` compatibility headers.
+Copy baggage values into span attributes if the SDK does not do that itself:
 
-- `http_text`: accepts only a `user_text` event and receives
-  `{ "session_id": "...", "message": "..." }`.
-- `webhook`: accepts `webhook` or `system` events and receives the configured
-  JSON payload unchanged.
+```text
+featherlane.eval_run.id
+featherlane.invocation.id
+featherlane.scenario.id
+```
 
-Before POSTing scenarios, the endpoint must answer a readiness GET with 2xx.
-Every reset and invocation request carries:
+After the full workflow/task has ended, close the boundary and wait for the one
+immutable result:
 
-- W3C `traceparent`;
-- `x-governance-eval-run-id`;
-- `x-governance-scenario-id`.
+```bash
+cargo run -q -p gov-eval -- complete \
+  --run-id "$FEATHERLANE_EVAL_RUN_ID" --terminal-state completed
+cargo run -q -p gov-eval -- wait \
+  --run-id "$FEATHERLANE_EVAL_RUN_ID" --format junit --fail-on-inconclusive
+```
 
-If `auth_secret_ref` is configured, it must be an uppercase environment-variable
-name available to the Rust API. Its resolved value is sent as a Bearer token and
-is never stored or returned. An authenticated reset endpoint must share the
-target endpoint's origin so the Bearer value cannot be forwarded to another
-service. Redirects are disabled.
+A successful target HTTP response is not automatically a completed workflow.
+The target contract must say it is terminal or the caller must invoke complete.
 
-The target must synchronously return HTTP 2xx with a terminal inline envelope:
+## Generic OTLP export
+
+Keep the OpenTelemetry/OpenInference instrumentation already used by Google ADK,
+Mastra, OpenAI Agents SDK, LangGraph, or a custom framework. Add a small resource
+or span processor that attaches the correlation attributes above, then point the
+normal OTLP/HTTP exporter at Featherlane:
+
+```text
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer flt_...
+```
+
+The endpoint accepts OTLP protobuf and OTLP JSON, optional gzip, and responds in
+the request format. The ingest key is target-scoped; tenant and target identity
+come from the key, never from customer-controlled span attributes. Exact span
+retries are idempotent. Conflicting retries receive an OTLP partial-success
+rejection.
+
+For passive workflows without a Featherlane-created ID, persist a target
+`telemetry_boundary` capability with its boundary kind, ordered external-ID
+attributes, approved default policy pack, and finite timeouts. For example:
 
 ```json
 {
-  "schema_version": "1.0",
-  "terminal": true,
-  "terminal_state": "completed",
-  "output": { "message": "Refund completed" },
-  "events": [
-    {
-      "event_type": "final_output",
-      "name": "refund completed",
-      "actor": { "actor_type": "agent", "id": "refund-agent" },
-      "input": null,
-      "output": { "message": "completed" },
-      "attributes": { "terminal_state": "completed" }
-    }
-  ],
-  "side_effects": []
+  "boundary_kind": "workflow_execution",
+  "external_id_attributes": ["workflow.run.id"],
+  "terminal_attribute": "workflow.completed",
+  "default_policy_pack_id": "<approved-policy-pack-uuid>",
+  "settle_seconds": 10,
+  "idle_timeout_seconds": 300,
+  "max_duration_seconds": 3600,
+  "conversation_id_is_task_boundary": false
 }
 ```
 
-`synthetic_events` is accepted as a compatibility alias for `events`. Responses
-are limited to 2 MiB and 1,000 observations. A scenario contains 1–50 events;
-text is limited to 32 KiB and JSON payloads to 256 KiB. Unknown schema versions,
-oversized content, malformed evidence, and non-2xx responses are operational
-errors and do not create a completed run. Missing final evidence or
-`terminal: false` becomes `INCONCLUSIVE`, never `PASS`.
+The first span with that configured external ID atomically finds or creates the
+run. `gen_ai.conversation.id` is considered only when it appears in the target's
+attribute list and `conversation_id_is_task_boundary` is true. A long-lived chat
+session must not be treated as an evaluation run by default.
 
-Before persistence, secret-like keys are recursively removed from observation
-inputs, outputs, attributes, and side-effect values. The stored run retains the
-original terminal state, trace quality/defects, redacted side effects, and
-evidence SHA-256 so reading a run does not silently recompute different evidence.
+## Human approval and terminal events
 
-Run `fixtures/scenarios/refund-approval.json` from CI:
+Framework spans are useful evidence but cannot reliably reveal every domain
+event. Emit a structured span attribute when the customer system records an
+approval decision:
+
+```text
+featherlane.event.type=human_approval_decision
+decision=approved
+```
+
+Likewise, a terminal event may use:
+
+```text
+featherlane.event.type=final_output
+featherlane.run.terminal=true
+featherlane.run.terminal_state=completed
+```
+
+Featherlane does not ask a model judge to invent an approval or guess where an
+opaque workflow ended. A target-specific deterministic mapping is acceptable;
+fabricated semantic evidence is not. If required approval evidence is absent,
+the policy's missing-evidence behavior yields `not_observable`, `fail`, or
+`error`—never a vacuous pass.
+
+## Unassigned telemetry
+
+Valid, redacted spans without a verified run or configured external boundary are
+stored as unassigned diagnostics. They are not evaluated. Inspect the target's
+correlation configuration, then resend with a canonical run ID or create the
+matching external-boundary run. Late spans are retained as diagnostics but never
+mutate an already finalized bundle or verdict.
+
+The sample requests in `fixtures/otlp/correlated-run/` put approval in trace A
+and execution/terminal events in linked trace B. Send `02-execution.json` first,
+then `01-approval.json`, and retry either file to exercise out-of-order and
+idempotent ingestion.
+
+## Synchronous inline target adapters
+
+For CI jobs that can finish in one bounded HTTP exchange, register a staging,
+preview, or sandbox target through the console or `POST /v1/targets`. The
+adapter is protocol-based rather than SDK-specific:
+
+- `http_text` accepts a `user_text` scenario event and sends a session ID plus
+  message.
+- `webhook` accepts `webhook` or `system` events and preserves the configured
+  JSON payload.
+
+Every request propagates `traceparent`, W3C `baggage`, and the canonical
+evaluation, invocation, and scenario headers. The target returns a bounded
+`schema_version: "1.0"` envelope with normalized observations, side effects,
+and an explicit terminal flag. Missing terminal evidence becomes
+`INCONCLUSIVE`; it never becomes a vacuous pass.
+
+Run a committed scenario from CI with:
 
 ```bash
 FEATHERLANE_API_URL=http://127.0.0.1:8080 cargo run -p gov-eval -- run \
-  --target-id TARGET_ID \
+  --target-id TARGET_UUID \
   --policy-pack-id POLICY_PACK_ID \
   --scenario fixtures/scenarios/refund-approval.json \
   --format junit --fail-on-inconclusive > governance-junit.xml
 ```
 
-Exit codes are `0` for pass, `1` for fail (and strict inconclusive), and `2` for
-invalid input or operational failure. JSON, JUnit, and HTML reports go to stdout;
-diagnostics go to stderr.
-
-The MVP never sends production credentials and supports only staging, preview,
-or a resettable sandbox. The Rust API—not the browser or CI runner—must be able
-to reach the saved endpoint. Active-CI webhooks must finish within the configured
-1–120 second timeout and return terminal evidence inline. SDK-specific packages,
-durable OTLP retrieval, and asynchronous workflow callbacks are intentionally
-outside this release.
-
-## Passive observability lane
-
-Production or staging services may send trace envelopes to `POST /v1/traces` on
-the telemetry gateway. The gateway allowlists governance/OpenInference
-attributes, removes secret-like keys before persistence, normalizes spans into
-the versioned event schema, and assigns a trace-quality result.
-
-Passive observation can detect evidence about naturally occurring behavior, but
-cannot prove scenarios that did not happen. Active CI testing and passive
-monitoring share the event schema and evaluator; they are different evidence
-sources.
-
-## Minimal GitHub Actions job
-
-```yaml
-jobs:
-  governance:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build -p gov-eval --locked
-      - name: Evaluate connected target
-        env:
-          FEATHERLANE_API_URL: ${{ secrets.FEATHERLANE_API_URL }}
-        run: target/debug/gov-eval run --target-id "${{ secrets.FEATHERLANE_TARGET_ID }}" --policy-pack-id "${{ secrets.FEATHERLANE_POLICY_PACK_ID }}" --scenario fixtures/scenarios/refund-approval.json --format junit --fail-on-inconclusive > governance-junit.xml
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: governance-junit
-          path: governance-junit.xml
-```
+Use this synchronous path for fast resettable test targets. Use the correlated
+OTLP run lifecycle above for asynchronous workflows, multiple traces, retries,
+or passive production observation.

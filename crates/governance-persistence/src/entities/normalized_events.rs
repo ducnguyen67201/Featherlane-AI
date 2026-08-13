@@ -9,6 +9,7 @@ pub struct Model {
     pub organization_id: Uuid,
     pub eval_run_id: Uuid,
     pub invocation_id: Uuid,
+    pub scenario_id: Uuid,
     pub trace_id: String,
     pub span_id: Option<String>,
     pub sequence: i64,
@@ -16,6 +17,8 @@ pub struct Model {
     pub name: String,
     pub payload: Json,
     pub started_at: OffsetDateTime,
+    pub ended_at: Option<OffsetDateTime>,
+    pub linked_event_ids: Json,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

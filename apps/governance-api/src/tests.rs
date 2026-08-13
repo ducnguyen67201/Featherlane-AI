@@ -1,6 +1,7 @@
 use std::fs;
 
 use axum::{body::Body, http::Request};
+use governance_domain::ReviewStatus;
 use tower::ServiceExt;
 
 use super::*;
@@ -113,8 +114,12 @@ fn target_versions_are_trimmed_before_persistence() {
         driver_type: DriverType::HttpText,
         endpoint: "http://127.0.0.1:8091/messages".to_owned(),
         reset_endpoint: None,
+        status_endpoint: None,
+        terminal_response_key: None,
         auth_secret_ref: None,
         timeout_seconds: 30,
+        otlp_required: false,
+        telemetry_boundary: governance_targets::TelemetryBoundaryConfig::default(),
     };
     let capability = CapabilityReport {
         target_id: request.key.clone(),

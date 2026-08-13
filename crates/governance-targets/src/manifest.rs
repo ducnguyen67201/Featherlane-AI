@@ -1,4 +1,4 @@
-use governance_domain::{OrganizationId, TargetId};
+use governance_domain::{OrganizationId, PolicyPackId, RunBoundaryKind, TargetId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -36,11 +36,57 @@ pub struct TargetManifest {
     pub driver_type: DriverType,
     pub endpoint: String,
     pub reset_endpoint: Option<String>,
+    #[serde(default)]
+    pub status_endpoint: Option<String>,
+    #[serde(default)]
+    pub terminal_response_key: Option<String>,
     pub auth_secret_ref: Option<String>,
     pub timeout_seconds: u64,
     #[serde(default)]
     pub evidence_mode: EvidenceMode,
+    #[serde(default)]
+    pub otlp_required: bool,
     pub production_credentials_allowed: bool,
+    #[serde(default)]
+    pub telemetry_boundary: TelemetryBoundaryConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TelemetryBoundaryConfig {
+    pub boundary_kind: RunBoundaryKind,
+    #[serde(default)]
+    pub external_id_attributes: Vec<String>,
+    #[serde(default)]
+    pub terminal_attribute: Option<String>,
+    #[serde(default)]
+    pub default_policy_pack_id: Option<PolicyPackId>,
+    #[serde(default = "default_settle_seconds")]
+    pub settle_seconds: u64,
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub conversation_id_is_task_boundary: bool,
+}
+
+const fn default_settle_seconds() -> u64 {
+    10
+}
+
+impl Default for TelemetryBoundaryConfig {
+    fn default() -> Self {
+        Self {
+            boundary_kind: RunBoundaryKind::ExplicitCi,
+            external_id_attributes: vec!["featherlane.external_run.id".to_owned()],
+            terminal_attribute: Some("featherlane.run.terminal".to_owned()),
+            default_policy_pack_id: None,
+            settle_seconds: default_settle_seconds(),
+            idle_timeout_seconds: None,
+            max_duration_seconds: None,
+            conversation_id_is_task_boundary: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -88,6 +134,10 @@ pub enum ManifestError {
     ProductionCredentials,
     #[error("an authenticated reset_endpoint must use the same origin as endpoint")]
     CrossOriginAuthenticatedReset,
+    #[error("an authenticated status_endpoint must use the same origin as endpoint")]
+    CrossOriginAuthenticatedStatus,
+    #[error("terminal_response_key must contain between 1 and 120 characters")]
+    InvalidTerminalResponseKey,
 }
 
 /// Validates the user-facing target name and its stored manifest.
@@ -128,6 +178,21 @@ pub fn validate_manifest(manifest: &TargetManifest) -> Result<(), ManifestError>
         {
             return Err(ManifestError::CrossOriginAuthenticatedReset);
         }
+    }
+    if let Some(status_endpoint) = &manifest.status_endpoint {
+        let status_endpoint = validate_url("status_endpoint", status_endpoint)?;
+        if manifest.auth_secret_ref.is_some()
+            && status_endpoint.origin() != target_endpoint.origin()
+        {
+            return Err(ManifestError::CrossOriginAuthenticatedStatus);
+        }
+    }
+    if manifest
+        .terminal_response_key
+        .as_ref()
+        .is_some_and(|key| key.trim().is_empty() || key.len() > 120)
+    {
+        return Err(ManifestError::InvalidTerminalResponseKey);
     }
     if !(1..=120).contains(&manifest.timeout_seconds) {
         return Err(ManifestError::InvalidTimeout);
@@ -196,10 +261,14 @@ mod tests {
             driver_type: DriverType::HttpText,
             endpoint: "http://refund-agent:8091/v1/messages".to_owned(),
             reset_endpoint: None,
+            status_endpoint: None,
+            terminal_response_key: None,
             auth_secret_ref: None,
             timeout_seconds: 30,
             evidence_mode: EvidenceMode::Inline,
+            otlp_required: false,
             production_credentials_allowed: false,
+            telemetry_boundary: TelemetryBoundaryConfig::default(),
         }
     }
 

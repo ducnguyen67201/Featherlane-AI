@@ -3,6 +3,7 @@ node_modules/
 /.next/
 /apps/web/.next/
 /apps/web/out/
+*.tsbuildinfo
 /.env
 /.env.local
 /.DS_Store

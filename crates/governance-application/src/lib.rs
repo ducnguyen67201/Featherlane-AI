@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use governance_domain::{
     Actor, ActorType, EvalRunId, EvaluationSummary, EventType, EvidenceBundle, InvocationId,
     ObservedEvent, OrganizationId, PolicyBundle, PolicyPack, PolicyPackApproval, PolicyPackId,
-    RuleResult, RunVerdict, ScenarioId, TargetId, TraceDefect, TraceQualityStatus,
+    PolicyPackStatusChange, RuleResult, RunVerdict, ScenarioId, TargetId, TraceDefect,
+    TraceQualityStatus,
 };
 use governance_evaluator::evaluate_pack;
 use governance_targets::{
@@ -18,6 +19,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
+mod evaluation_runs;
+mod policy_import;
+
+pub use evaluation_runs::*;
+pub use policy_import::*;
+
 #[derive(Debug, Error)]
 pub enum ApplicationError {
     #[error("repository operation failed: {0}")]
@@ -30,6 +37,8 @@ pub enum ApplicationError {
     InvalidRequest(String),
     #[error("application state conflict: {0}")]
     Conflict(String),
+    #[error("required service is unavailable: {0}")]
+    Unavailable(String),
     #[error("target transport failed: {0}")]
     TargetTransport(String),
     #[error("target request timed out: {0}")]
@@ -55,6 +64,18 @@ pub trait PolicyPackRepository: Send + Sync {
         organization_id: OrganizationId,
         id: PolicyPackId,
         approval: &PolicyPackApproval,
+    ) -> Result<PolicyPack, ApplicationError>;
+    async fn disable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
+    ) -> Result<PolicyPack, ApplicationError>;
+    async fn enable(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyPackId,
+        change: &PolicyPackStatusChange,
     ) -> Result<PolicyPack, ApplicationError>;
 }
 
@@ -98,7 +119,10 @@ pub struct StoredEvaluationRun {
     pub target_id: TargetId,
     pub target_name: String,
     pub target_version: String,
+    pub policy_pack_id: PolicyPackId,
     pub policy_pack_key: String,
+    pub policy_pack_version: u32,
+    pub policy_content_sha256: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -193,9 +217,9 @@ where
         let created_at = OffsetDateTime::now_utc();
         let context = RunContext {
             eval_run_id: EvalRunId::new(),
+            invocation_id: InvocationId::new(),
             scenario_id: ScenarioId::new(),
         };
-        let invocation_id = InvocationId::new();
         let driver = self.drivers.driver_for(target.manifest.driver_type);
         let session = driver.start_session(context);
         driver
@@ -253,7 +277,7 @@ where
         let normalization_context = NormalizationContext {
             organization_id,
             eval_run_id: context.eval_run_id,
-            invocation_id,
+            invocation_id: context.invocation_id,
             scenario_id: context.scenario_id,
         };
         let redaction_policy = RedactionPolicy::default();
@@ -296,7 +320,10 @@ where
             target_id: target.id,
             target_name: target.name,
             target_version: target.manifest.target_version,
+            policy_pack_id: pack.id,
             policy_pack_key: pack.key,
+            policy_pack_version: pack.version,
+            policy_content_sha256: pack.content_sha256,
             created_at,
             completed_at,
             evidence,

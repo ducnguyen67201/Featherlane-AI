@@ -1,4 +1,4 @@
-use governance_domain::{EvalRunId, ObservedEvent, ScenarioId};
+use governance_domain::{EvalRunId, InvocationId, ObservedEvent, ScenarioId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -38,6 +38,7 @@ pub struct ScenarioDefinition {
 #[derive(Clone, Copy, Debug)]
 pub struct RunContext {
     pub eval_run_id: EvalRunId,
+    pub invocation_id: InvocationId,
     pub scenario_id: ScenarioId,
 }
 
@@ -45,6 +46,7 @@ pub struct RunContext {
 pub struct TargetSession {
     pub id: String,
     pub traceparent: String,
+    pub baggage: String,
     pub context: RunContext,
 }
 
