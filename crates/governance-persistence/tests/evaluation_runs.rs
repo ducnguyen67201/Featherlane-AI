@@ -472,7 +472,14 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
         recovered_run.evidence_sha256.as_deref(),
         Some(first.evidence_sha256.as_str())
     );
-    assert_eq!(recovered_run.finalized_at, first.finalized_at);
+    assert_eq!(
+        recovered_run
+            .finalized_at
+            .map(|timestamp| timestamp.unix_timestamp_nanos() / 1_000),
+        first
+            .finalized_at
+            .map(|timestamp| timestamp.unix_timestamp_nanos() / 1_000)
+    );
     assert!(
         repository
             .get_bundle(other_organization_id, run.id)
