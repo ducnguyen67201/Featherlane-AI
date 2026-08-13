@@ -68,9 +68,18 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
+      args:
+        BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+        GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?Set GOOGLE_CLIENT_ID in .env}
+      secrets:
+        - better_auth_secret
+        - google_client_secret
     environment:
       GOVERNANCE_API_URL: http://governance-api:8080
-      NEXT_PUBLIC_GOVERNANCE_API_URL: http://localhost:8080
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in .env}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?Set GOOGLE_CLIENT_ID in .env}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?Set GOOGLE_CLIENT_SECRET in .env}
     depends_on: [governance-api]
     ports: ["3000:3000"]
 
@@ -87,3 +96,9 @@ services:
 volumes:
   postgres-data:
   minio-data:
+
+secrets:
+  better_auth_secret:
+    environment: BETTER_AUTH_SECRET
+  google_client_secret:
+    environment: GOOGLE_CLIENT_SECRET

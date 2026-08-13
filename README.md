@@ -20,10 +20,14 @@ and get `PASS`, `FAIL`, or `INCONCLUSIVE` with the evidence behind each result.
 ```bash
 git clone https://github.com/ducnguyen67201/Featherlane-AI.git
 cd Featherlane-AI
+cp .env.example .env
+pnpm dlx auth@latest secret
+# Add the generated secret and your Google OAuth credentials to .env
 docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Register `http://localhost:3000/api/auth/callback/google` as the Google OAuth
+callback, then open [http://localhost:3000](http://localhost:3000).
 
 Featherlane provides scope-limited evaluation evidence—not legal compliance
 certification. The project is a working, pre-pilot MVP.
