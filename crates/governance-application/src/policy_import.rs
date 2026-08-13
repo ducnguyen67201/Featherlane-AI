@@ -105,6 +105,8 @@ pub trait PolicyImportRepository: Send + Sync {
         &self,
         organization_id: OrganizationId,
         limit: u64,
+        status: Option<PolicyImportStatus>,
+        cursor: Option<PolicyImportId>,
     ) -> Result<Vec<PolicyImport>, ApplicationError>;
     async fn transition(
         &self,
@@ -598,6 +600,7 @@ pub async fn add_manual_policy_candidate<R: PolicyImportRepository>(
         ));
     }
     if command.reviewer_id.trim().is_empty()
+        || command.source_excerpt.trim().is_empty()
         || command.reviewer_id.chars().count() > 320
         || command.statement.chars().count() > 2_000
         || command.source_excerpt.chars().count() > 4_000
@@ -637,11 +640,12 @@ pub async fn add_manual_policy_candidate<R: PolicyImportRepository>(
         .list_candidates(command.organization_id, command.policy_import_id)
         .await?;
     let now = OffsetDateTime::now_utc();
-    let key = format!("POL-{:03}", existing.len() + 1);
+    let candidate_id = PolicyCandidateId::new();
+    let key = format!("MAN-{}", candidate_id.0.simple());
     let fingerprint =
         candidate_fingerprint(&import.content_sha256, &command.statement, &command.locator)?;
     let candidate = PolicyCandidate {
-        id: PolicyCandidateId::new(),
+        id: candidate_id,
         organization_id: command.organization_id,
         policy_import_id: command.policy_import_id,
         position: u32::try_from(existing.len()).unwrap_or(u32::MAX),
@@ -935,14 +939,15 @@ fn extracted_candidates(
                 &serde_json::to_vec(item)
                     .map_err(|error| ApplicationError::InvalidRequest(error.to_string()))?,
             );
+            let candidate_id = PolicyCandidateId::new();
             Ok(PolicyCandidate {
-                id: PolicyCandidateId::new(),
+                id: candidate_id,
                 organization_id: import.organization_id,
                 policy_import_id: import.id,
                 position: u32::try_from(position).unwrap_or(u32::MAX),
                 origin: PolicyCandidateOrigin::Model,
                 fingerprint,
-                key: format!("POL-{:03}", position + 1),
+                key: format!("EXT-{}", candidate_id.0.simple()),
                 statement: item.statement.trim().to_owned(),
                 locator,
                 source_excerpt: item.exact_excerpt.clone(),

@@ -248,7 +248,8 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
                     )?;
                     writeln!(
                         io::stdout(),
-                        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL='http/protobuf'"
+                        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL={}",
+                        shell_quote(&response.telemetry.protocol)
                     )?;
                     let correlation = response
                         .telemetry

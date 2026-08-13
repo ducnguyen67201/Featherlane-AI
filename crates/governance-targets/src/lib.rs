@@ -36,11 +36,15 @@ pub struct TelemetryBoundaryConfig {
     pub boundary_kind: RunBoundaryKind,
     #[serde(default)]
     pub external_id_attributes: Vec<String>,
+    #[serde(default)]
     pub terminal_attribute: Option<String>,
+    #[serde(default)]
     pub default_policy_pack_id: Option<PolicyPackId>,
     #[serde(default = "default_settle_seconds")]
     pub settle_seconds: u64,
+    #[serde(default)]
     pub idle_timeout_seconds: Option<u64>,
+    #[serde(default)]
     pub max_duration_seconds: Option<u64>,
     #[serde(default)]
     pub conversation_id_is_task_boundary: bool,

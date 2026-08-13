@@ -6,7 +6,7 @@ import { getEvaluations, getPolicies } from "@/lib/api";
 
 export default async function EvaluationsPage() {
   const [runs, policies] = await Promise.all([getEvaluations(), getPolicies()]);
-  const policyPackId = policies.find((policy) => policy.status === "approved")?.id;
+  const policyPackId = policies.data?.find((policy) => policy.status === "approved")?.id;
   return (
     <div className="page">
       <PageHeader

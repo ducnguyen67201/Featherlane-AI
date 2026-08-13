@@ -37,11 +37,9 @@ impl OpenDalArtifactStore {
             .endpoint(&config.object_store_url)
             .access_key_id(&config.object_store_access_key_id)
             .secret_access_key(&config.object_store_secret_access_key);
-        let operator = Operator::new(builder)
-            .map_err(|_| {
-                ApplicationError::Unavailable("object-store configuration is invalid".to_owned())
-            })?
-            .finish();
+        let operator = Operator::new(builder).map_err(|_| {
+            ApplicationError::Unavailable("object-store configuration is invalid".to_owned())
+        })?;
         Ok(Self { operator })
     }
 }
@@ -77,11 +75,9 @@ impl MemoryArtifactStore {
     ///
     /// Returns an error when the in-memory operator cannot be constructed.
     pub fn new() -> Result<Self, ApplicationError> {
-        let operator = Operator::new(services::Memory::default())
-            .map_err(|_| {
-                ApplicationError::Unavailable("memory object store is invalid".to_owned())
-            })?
-            .finish();
+        let operator = Operator::new(services::Memory::default()).map_err(|_| {
+            ApplicationError::Unavailable("memory object store is invalid".to_owned())
+        })?;
         Ok(Self { operator })
     }
 }

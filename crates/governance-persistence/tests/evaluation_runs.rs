@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use governance_application::{
     CompleteEvaluationRun, CompletionRequest, DurableJobRepository, EvaluateFinalizedRun,
     EvaluationRunRepository, EvidenceBundleRepository, FinalizeEvaluationRun, IngestTelemetryBatch,
-    SpanInsert, SpanInsertOutcome, TelemetrySpanRepository,
+    RotateTelemetryIngestKey, SpanInsert, SpanInsertOutcome, TelemetryIngestKeyRepository,
+    TelemetrySpanRepository,
 };
 use governance_domain::{
     CompletionReason, EvalRunId, EvaluationRun, EvaluationRunState, InvocationId, OrganizationId,
@@ -12,7 +13,7 @@ use governance_domain::{
 use governance_migration::Migrator;
 use governance_persistence::{
     SeaOrmEvaluationRepository, SeaOrmEvaluationRunRepository, SeaOrmPolicyPackRepository,
-    entities::{policy_rules, rule_results, targets},
+    entities::{jobs, policy_rules, rule_results, targets},
 };
 use governance_telemetry::{
     ATTR_EVAL_RUN_ID, ATTR_EVENT_TYPE, ATTR_INVOCATION_ID, ATTR_SCENARIO_ID, CorrelationCandidate,
@@ -148,6 +149,87 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
         .expect("passive run lookup should succeed")
         .expect("configured external ID should auto-create a run");
     assert_eq!(passive_run.state, EvaluationRunState::Collecting);
+    assert_eq!(
+        jobs::Entity::find()
+            .filter(jobs::Column::OrganizationId.eq(organization_id.0))
+            .filter(jobs::Column::DedupeKey.eq(format!("timeout:{}", passive_run.id)))
+            .count(&database)
+            .await
+            .expect("timeout job count should load"),
+        1
+    );
+    let finalize_job = governance_application::DurableJob {
+        organization_id,
+        eval_run_id: passive_run.id,
+        kind: "finalize_evidence".to_owned(),
+        dedupe_key: format!("finalize:{}", passive_run.id),
+        available_at: now + Duration::seconds(60),
+    };
+    repository
+        .enqueue(&finalize_job)
+        .await
+        .expect("finalization job should enqueue");
+    repository
+        .enqueue(&governance_application::DurableJob {
+            available_at: now + Duration::seconds(30),
+            ..finalize_job.clone()
+        })
+        .await
+        .expect("earlier duplicate job should coalesce");
+    assert_eq!(
+        jobs::Entity::find()
+            .filter(jobs::Column::OrganizationId.eq(organization_id.0))
+            .filter(jobs::Column::DedupeKey.eq(&finalize_job.dedupe_key))
+            .one(&database)
+            .await
+            .expect("coalesced finalization job should load")
+            .expect("coalesced finalization job should exist")
+            .available_at,
+        finalize_job.available_at
+    );
+
+    let initial_key = RotateTelemetryIngestKey::new(repository.clone())
+        .execute(organization_id, "passive-workflow".to_owned(), None)
+        .await
+        .expect("initial ingest key should rotate");
+    let left_rotation_service = RotateTelemetryIngestKey::new(repository.clone());
+    let right_rotation_service = RotateTelemetryIngestKey::new(repository.clone());
+    let (left_rotation, right_rotation) = tokio::join!(
+        left_rotation_service.execute(organization_id, "passive-workflow".to_owned(), None,),
+        right_rotation_service.execute(organization_id, "passive-workflow".to_owned(), None,)
+    );
+    left_rotation.expect("left concurrent key rotation should succeed");
+    right_rotation.expect("right concurrent key rotation should succeed");
+    assert_eq!(
+        governance_persistence::entities::telemetry_ingest_keys::Entity::find()
+            .filter(
+                governance_persistence::entities::telemetry_ingest_keys::Column::OrganizationId
+                    .eq(organization_id.0),
+            )
+            .filter(
+                governance_persistence::entities::telemetry_ingest_keys::Column::TargetId
+                    .eq("passive-workflow"),
+            )
+            .filter(
+                governance_persistence::entities::telemetry_ingest_keys::Column::Status
+                    .eq("active"),
+            )
+            .count(&database)
+            .await
+            .expect("active ingest keys should count"),
+        1
+    );
+    assert!(
+        repository
+            .resolve_key(
+                &initial_key.key.token_prefix,
+                &initial_key.key.token_sha256,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .expect("revoked initial key should resolve safely")
+            .is_none()
+    );
 
     let run = EvaluationRun {
         id: EvalRunId::new(),
@@ -190,6 +272,56 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
             .await
             .expect("cross-tenant query should succeed")
             .is_none()
+    );
+
+    let mut stale_collector = run.clone();
+    stale_collector.id = EvalRunId::new();
+    stale_collector.primary_invocation_id = InvocationId::new();
+    stale_collector.external_run_id = None;
+    stale_collector.state = EvaluationRunState::Created;
+    repository
+        .create_run(&stale_collector)
+        .await
+        .expect("race fixture should insert");
+    let mut terminal_transition = stale_collector.clone();
+    terminal_transition
+        .begin_settling(
+            CompletionReason::TerminalEvent,
+            Some("completed".to_owned()),
+            now + Duration::seconds(10),
+            now + Duration::milliseconds(1),
+        )
+        .expect("terminal transition should be valid");
+    assert!(
+        repository
+            .update_run(
+                &terminal_transition,
+                stale_collector.state,
+                stale_collector.updated_at,
+            )
+            .await
+            .expect("terminal compare-and-set should succeed")
+    );
+    stale_collector
+        .transition_to(
+            EvaluationRunState::Collecting,
+            now + Duration::milliseconds(2),
+        )
+        .expect("collector transition should be valid in isolation");
+    assert!(
+        !repository
+            .update_run(&stale_collector, EvaluationRunState::Created, now,)
+            .await
+            .expect("stale compare-and-set should be rejected")
+    );
+    assert_eq!(
+        repository
+            .get_run(organization_id, stale_collector.id)
+            .await
+            .expect("race fixture should load")
+            .expect("race fixture should exist")
+            .state,
+        EvaluationRunState::Settling
     );
 
     let approval = observed_span(
@@ -275,6 +407,26 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
         .await
         .expect("run should complete collection");
 
+    let mut interrupted_finalization = repository
+        .get_run(organization_id, run.id)
+        .await
+        .expect("settling run should load")
+        .expect("settling run should exist");
+    let expected_updated_at = interrupted_finalization.updated_at;
+    interrupted_finalization
+        .transition_to(EvaluationRunState::Finalizing, OffsetDateTime::now_utc())
+        .expect("finalizing transition should be valid");
+    assert!(
+        repository
+            .update_run(
+                &interrupted_finalization,
+                EvaluationRunState::Settling,
+                expected_updated_at,
+            )
+            .await
+            .expect("interrupted finalization fixture should persist")
+    );
+
     let finalizer = FinalizeEvaluationRun::new(
         repository.clone(),
         repository.clone(),
@@ -285,6 +437,18 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
         .execute(organization_id, run.id)
         .await
         .expect("run should finalize");
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!(
+                "UPDATE eval_runs SET state = 'finalizing', trace_count = 0, event_count = 0, \
+                 trace_quality = NULL, evidence_sha256 = NULL, finalized_at = NULL, updated_at = now() \
+                 WHERE organization_id = '{organization_id}' AND id = '{}'",
+                run.id
+            ),
+        ))
+        .await
+        .expect("post-bundle interruption fixture should persist");
     let replay = finalizer
         .execute(organization_id, run.id)
         .await
@@ -292,6 +456,20 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
     assert_eq!(first.evidence_sha256, replay.evidence_sha256);
     assert_eq!(first.trace_ids.len(), 2);
     assert_eq!(first.events.len(), 2);
+    let recovered_run = repository
+        .get_run(organization_id, run.id)
+        .await
+        .expect("recovered run should load")
+        .expect("recovered run should exist");
+    assert_eq!(recovered_run.state, EvaluationRunState::Evaluating);
+    assert_eq!(recovered_run.trace_count, 2);
+    assert_eq!(recovered_run.event_count, 2);
+    assert_eq!(recovered_run.trace_quality, Some(first.trace_quality));
+    assert_eq!(
+        recovered_run.evidence_sha256.as_deref(),
+        Some(first.evidence_sha256.as_str())
+    );
+    assert_eq!(recovered_run.finalized_at, first.finalized_at);
     assert!(
         repository
             .get_bundle(other_organization_id, run.id)
@@ -347,12 +525,46 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
             .expect("late span should persist as diagnostics"),
         SpanInsertOutcome::LateAfterFinalize
     );
+    let claimed_job = repository
+        .claim_due(OffsetDateTime::now_utc(), 30)
+        .await
+        .expect("due job should claim")
+        .expect("a due job should exist");
     assert!(
         repository
-            .claim_due(OffsetDateTime::now_utc(), 30)
+            .reschedule_job(
+                claimed_job.id,
+                claimed_job.attempts,
+                OffsetDateTime::UNIX_EPOCH,
+            )
             .await
-            .expect("due job should claim")
-            .is_some()
+            .expect("current lease reschedule should persist")
+    );
+    let claimed_job = repository
+        .claim_due(OffsetDateTime::now_utc(), 30)
+        .await
+        .expect("rescheduled job should claim")
+        .expect("rescheduled job should be due");
+    assert_eq!(claimed_job.attempts, 1);
+    assert!(
+        !repository
+            .complete_job(
+                claimed_job.id,
+                claimed_job.attempts.saturating_add(1),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .expect("stale lease completion should be rejected safely")
+    );
+    assert!(
+        repository
+            .complete_job(
+                claimed_job.id,
+                claimed_job.attempts,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .expect("current lease completion should persist")
     );
 
     database
@@ -430,5 +642,6 @@ fn span_insert(run: &EvaluationRun, span: ObservedSpan, hash: &str) -> SpanInser
         span,
         sanitized_payload_sha256: hash.to_owned(),
         received_at: OffsetDateTime::now_utc(),
+        max_spans_per_run: 100_000,
     }
 }

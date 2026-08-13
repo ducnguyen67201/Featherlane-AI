@@ -10,7 +10,8 @@ use governance_domain::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait, sea_query::Expr,
+    QuerySelect, Set, TransactionTrait,
+    sea_query::{Condition, Expr},
 };
 use time::OffsetDateTime;
 
@@ -79,10 +80,41 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         &self,
         organization_id: governance_domain::OrganizationId,
         limit: u64,
+        status: Option<PolicyImportStatus>,
+        cursor: Option<PolicyImportId>,
     ) -> Result<Vec<PolicyImport>, ApplicationError> {
-        policy_imports::Entity::find()
-            .filter(policy_imports::Column::OrganizationId.eq(organization_id.0))
+        let cursor = if let Some(cursor) = cursor {
+            Some(
+                policy_imports::Entity::find()
+                    .filter(policy_imports::Column::OrganizationId.eq(organization_id.0))
+                    .filter(policy_imports::Column::Id.eq(cursor.0))
+                    .one(&self.database)
+                    .await
+                    .map_err(repository_error)?
+                    .ok_or_else(|| ApplicationError::NotFound(cursor.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let mut query = policy_imports::Entity::find()
+            .filter(policy_imports::Column::OrganizationId.eq(organization_id.0));
+        if let Some(status) = status {
+            query = query.filter(policy_imports::Column::Status.eq(enum_string(status)?));
+        }
+        if let Some(cursor) = cursor {
+            query = query.filter(
+                Condition::any()
+                    .add(policy_imports::Column::CreatedAt.lt(cursor.created_at))
+                    .add(
+                        Condition::all()
+                            .add(policy_imports::Column::CreatedAt.eq(cursor.created_at))
+                            .add(policy_imports::Column::Id.lt(cursor.id)),
+                    ),
+            );
+        }
+        query
             .order_by_desc(policy_imports::Column::CreatedAt)
+            .order_by_desc(policy_imports::Column::Id)
             .limit(limit.min(100))
             .all(&self.database)
             .await
@@ -145,7 +177,15 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         document: &ParsedDocument,
         coverage: &PolicyImportCoverage,
     ) -> Result<PolicyImport, ApplicationError> {
-        let model = self.require_import(organization_id, id).await?;
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        let model = policy_imports::Entity::find()
+            .filter(policy_imports::Column::OrganizationId.eq(organization_id.0))
+            .filter(policy_imports::Column::Id.eq(id.0))
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .map_err(repository_error)?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))?;
         if model.status != enum_string(PolicyImportStatus::Parsing)? {
             return Err(ApplicationError::Conflict(
                 "policy import is not in parsing state".to_owned(),
@@ -168,9 +208,10 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         active.coverage_payload = Set(serde_json::to_value(coverage).map_err(serialization_error)?);
         active.updated_at = Set(OffsetDateTime::now_utc());
         active
-            .update(&self.database)
+            .update(&transaction)
             .await
             .map_err(repository_error)?;
+        transaction.commit().await.map_err(repository_error)?;
         self.get(organization_id, id)
             .await?
             .ok_or_else(|| ApplicationError::NotFound(id.to_string()))
@@ -187,6 +228,7 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         let import = policy_imports::Entity::find()
             .filter(policy_imports::Column::OrganizationId.eq(organization_id.0))
             .filter(policy_imports::Column::Id.eq(id.0))
+            .lock_exclusive()
             .one(&transaction)
             .await
             .map_err(repository_error)?
@@ -292,6 +334,19 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         expected_updated_at: Option<OffsetDateTime>,
     ) -> Result<PolicyCandidate, ApplicationError> {
         let transaction = self.database.begin().await.map_err(repository_error)?;
+        let import = policy_imports::Entity::find()
+            .filter(policy_imports::Column::OrganizationId.eq(candidate.organization_id.0))
+            .filter(policy_imports::Column::Id.eq(candidate.policy_import_id.0))
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .map_err(repository_error)?
+            .ok_or_else(|| ApplicationError::NotFound(candidate.policy_import_id.to_string()))?;
+        if import.status == enum_string(PolicyImportStatus::Compiled)? {
+            return Err(ApplicationError::Conflict(
+                "compiled imports are immutable".to_owned(),
+            ));
+        }
         let model = policy_candidates::Entity::find()
             .filter(policy_candidates::Column::OrganizationId.eq(candidate.organization_id.0))
             .filter(policy_candidates::Column::PolicyImportId.eq(candidate.policy_import_id.0))
@@ -326,6 +381,22 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         review: &PolicyCandidateReviewRecord,
     ) -> Result<PolicyCandidate, ApplicationError> {
         let transaction = self.database.begin().await.map_err(repository_error)?;
+        let import = policy_imports::Entity::find()
+            .filter(policy_imports::Column::OrganizationId.eq(candidate.organization_id.0))
+            .filter(policy_imports::Column::Id.eq(candidate.policy_import_id.0))
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .map_err(repository_error)?
+            .ok_or_else(|| ApplicationError::NotFound(candidate.policy_import_id.to_string()))?;
+        if !matches!(
+            enum_from_string(&import.status)?,
+            PolicyImportStatus::ReviewRequired | PolicyImportStatus::ReadyToCompile
+        ) {
+            return Err(ApplicationError::Conflict(
+                "manual candidates can only be added during review".to_owned(),
+            ));
+        }
         candidate_active_model(candidate)?
             .insert(&transaction)
             .await
@@ -357,9 +428,15 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         command: &VerifySourceCommand,
         reviewed_at: OffsetDateTime,
     ) -> Result<PolicyImport, ApplicationError> {
-        let model = self
-            .require_import(command.organization_id, command.policy_import_id)
-            .await?;
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        let model = policy_imports::Entity::find()
+            .filter(policy_imports::Column::OrganizationId.eq(command.organization_id.0))
+            .filter(policy_imports::Column::Id.eq(command.policy_import_id.0))
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .map_err(repository_error)?
+            .ok_or_else(|| ApplicationError::NotFound(command.policy_import_id.to_string()))?;
         if model.status == enum_string(PolicyImportStatus::Compiled)? {
             return Err(ApplicationError::Conflict(
                 "compiled imports are immutable".to_owned(),
@@ -386,9 +463,10 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         active.verification_notes = Set(Some(command.notes.clone()));
         active.updated_at = Set(reviewed_at);
         active
-            .update(&self.database)
+            .update(&transaction)
             .await
             .map_err(repository_error)?;
+        transaction.commit().await.map_err(repository_error)?;
         self.get(command.organization_id, command.policy_import_id)
             .await?
             .ok_or_else(|| ApplicationError::NotFound(command.policy_import_id.to_string()))

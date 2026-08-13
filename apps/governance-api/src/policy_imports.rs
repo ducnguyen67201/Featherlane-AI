@@ -257,6 +257,22 @@ pub async fn create_policy_import(
     }
     let title = title.unwrap_or_default();
     let jurisdiction = jurisdiction.unwrap_or_default();
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if title.chars().count() > 500
+        || jurisdiction.chars().count() > 200
+        || source_url
+            .as_deref()
+            .is_some_and(|value| value.chars().count() > 2_048)
+        || idempotency_key.chars().count() > 320
+    {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "policy import metadata exceeds the configured limit",
+        );
+    }
     let source_type = match source_type.and_then(|value| enum_from_form(&value).ok()) {
         Some(value) => value,
         None => return problem(StatusCode::BAD_REQUEST, "source_type is invalid"),
@@ -375,22 +391,25 @@ pub async fn list_policy_imports(
                 );
             }
         };
-    let imports = match repository.list(crate::default_organization_id(), 100).await {
+    let cursor = match query.cursor.as_deref() {
+        Some(cursor) => match parse_import_id(cursor) {
+            Some(cursor) => Some(cursor),
+            None => {
+                return problem(StatusCode::BAD_REQUEST, "invalid policy import cursor");
+            }
+        },
+        None => None,
+    };
+    let limit = query.limit.unwrap_or(25).min(100);
+    let imports = match repository
+        .list(crate::default_organization_id(), limit, status, cursor)
+        .await
+    {
         Ok(imports) => imports,
         Err(error) => return application_error(error),
     };
-    let limit = usize::try_from(query.limit.unwrap_or(25).min(100)).unwrap_or(100);
     let imports = imports
         .into_iter()
-        .skip_while(|import| {
-            query
-                .cursor
-                .as_deref()
-                .is_some_and(|cursor| import.id.to_string() != cursor)
-        })
-        .skip(usize::from(query.cursor.is_some()))
-        .filter(|import| status.is_none_or(|status| import.status == status))
-        .take(limit)
         .map(PolicyImportView::from)
         .collect::<Vec<_>>();
     Json(imports).into_response()
@@ -489,6 +508,12 @@ pub async fn add_manual_candidate(
     let Some(id) = parse_import_id(&id) else {
         return problem(StatusCode::BAD_REQUEST, "invalid policy import identifier");
     };
+    if request.source_excerpt.trim().is_empty() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "manual candidate source excerpt is required",
+        );
+    }
     let repository = SeaOrmPolicyImportRepository::new(context.db.clone());
     let document = match normalized_document(&repository, id).await {
         Ok((_, document)) => document,

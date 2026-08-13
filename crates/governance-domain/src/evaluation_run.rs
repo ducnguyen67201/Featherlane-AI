@@ -286,8 +286,14 @@ mod tests {
     #[test]
     fn event_ids_are_stable_per_source_span() {
         let organization_id = OrganizationId::new();
-        let first = crate::EventId::from_source_span(organization_id, "trace", "span");
-        let second = crate::EventId::from_source_span(organization_id, "trace", "span");
+        let eval_run_id = EvalRunId::new();
+        let first = crate::EventId::from_source_span(organization_id, eval_run_id, "trace", "span");
+        let second =
+            crate::EventId::from_source_span(organization_id, eval_run_id, "trace", "span");
         assert_eq!(first, second);
+        assert_ne!(
+            first,
+            crate::EventId::from_source_span(organization_id, EvalRunId::new(), "trace", "span")
+        );
     }
 }

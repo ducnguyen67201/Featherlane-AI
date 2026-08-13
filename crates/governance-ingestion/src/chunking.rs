@@ -73,6 +73,8 @@ pub fn chunk_document(
     }
     if !content.is_empty() && chunks.len() < max_chunks {
         push_chunk(&mut chunks, &mut ordinals, &mut content);
+    } else if !content.is_empty() {
+        fully_processed = false;
     }
     if fully_processed
         && chunks

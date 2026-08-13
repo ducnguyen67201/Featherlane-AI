@@ -24,8 +24,9 @@ RUN --mount=type=secret,id=better_auth_secret,env=BETTER_AUTH_SECRET \
 FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
-COPY --from=builder /workspace/apps/web/.next/standalone ./
-COPY --from=builder /workspace/apps/web/.next/static ./apps/web/.next/static
+COPY --chown=node:node --from=builder /workspace/apps/web/.next/standalone ./
+COPY --chown=node:node --from=builder /workspace/apps/web/.next/static ./apps/web/.next/static
+COPY --chown=node:node --from=builder /workspace/apps/web/public ./apps/web/public
 USER node
 EXPOSE 3000
 CMD ["node", "apps/web/server.js"]

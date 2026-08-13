@@ -7,7 +7,7 @@ use governance_migration::Migrator;
 use governance_persistence::SeaOrmPolicyImportRepository;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 #[tokio::test]
 async fn creating_multiple_imports_reuses_the_existing_organization() {
@@ -23,7 +23,10 @@ async fn creating_multiple_imports_reuses_the_existing_organization() {
 
     let repository = SeaOrmPolicyImportRepository::new(database.clone());
     let organization_id = OrganizationId::new();
-    let first = policy_import(organization_id, "first");
+    let mut first = policy_import(organization_id, "first");
+    first.status = PolicyImportStatus::FailedTerminal;
+    first.created_at -= Duration::days(1);
+    first.updated_at = first.created_at;
     let second = policy_import(organization_id, "second");
 
     repository
@@ -34,6 +37,12 @@ async fn creating_multiple_imports_reuses_the_existing_organization() {
         .create(&second)
         .await
         .expect("second import should reuse the organization");
+    for index in 0..103 {
+        repository
+            .create(&policy_import(organization_id, &format!("import-{index}")))
+            .await
+            .expect("additional import should create");
+    }
 
     assert!(
         repository
@@ -42,6 +51,37 @@ async fn creating_multiple_imports_reuses_the_existing_organization() {
             .expect("first import lookup should succeed")
             .is_some()
     );
+    let first_page = repository
+        .list(organization_id, 100, None, None)
+        .await
+        .expect("first import page should load");
+    assert_eq!(first_page.len(), 100);
+    let second_page = repository
+        .list(
+            organization_id,
+            100,
+            None,
+            first_page.last().map(|import| import.id),
+        )
+        .await
+        .expect("second import page should load");
+    assert_eq!(second_page.len(), 5);
+    assert!(
+        first_page
+            .iter()
+            .all(|first| second_page.iter().all(|second| first.id != second.id))
+    );
+    let terminal_imports = repository
+        .list(
+            organization_id,
+            25,
+            Some(PolicyImportStatus::FailedTerminal),
+            None,
+        )
+        .await
+        .expect("status-filtered import page should load");
+    assert_eq!(terminal_imports.len(), 1);
+    assert_eq!(terminal_imports[0].id, first.id);
     assert!(
         repository
             .get(organization_id, second.id)

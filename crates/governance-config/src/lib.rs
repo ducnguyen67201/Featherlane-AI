@@ -102,6 +102,8 @@ pub enum ConfigError {
     InvalidAddress { key: String, value: String },
     #[error("invalid positive integer in {key}: {value}")]
     InvalidNumber { key: String, value: String },
+    #[error("invalid value in {key}: {value}")]
+    InvalidValue { key: String, value: String },
 }
 
 impl AppConfig {
@@ -111,7 +113,7 @@ impl AppConfig {
     ///
     /// Returns an error when a configured socket address is invalid.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Ok(Self {
+        let config = Self {
             api_addr: address("GOVERNANCE_API_ADDR", "0.0.0.0:8080")?,
             gateway_addr: address("GOVERNANCE_GATEWAY_ADDR", "0.0.0.0:4318")?,
             sandbox_addr: address("GOVERNANCE_SANDBOX_ADDR", "0.0.0.0:8090")?,
@@ -139,7 +141,8 @@ impl AppConfig {
                 late_span_retention_days: positive_usize("OTLP_LATE_SPAN_RETENTION_DAYS", 7)?,
             },
             policy_import: PolicyImportConfig::from_env()?,
-        })
+        };
+        Ok(config)
     }
 }
 
@@ -150,7 +153,7 @@ impl PolicyImportConfig {
     ///
     /// Returns an error when a configured numeric limit is invalid or zero.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Ok(Self {
+        let config = Self {
             max_bytes: positive_usize("POLICY_IMPORT_MAX_BYTES", 26_214_400)?,
             max_pages: positive_usize("POLICY_IMPORT_MAX_PAGES", 250)?,
             max_chunks: positive_usize("POLICY_IMPORT_MAX_CHUNKS", 200)?,
@@ -160,16 +163,29 @@ impl PolicyImportConfig {
             object_store_region: env_value("OBJECT_STORE_REGION", "us-east-1"),
             object_store_access_key_id: env_value("OBJECT_STORE_ACCESS_KEY_ID", ""),
             object_store_secret_access_key: env_value("OBJECT_STORE_SECRET_ACCESS_KEY", ""),
-            llm_enabled: env_bool("POLICY_LLM_ENABLED", false),
+            llm_enabled: env_bool("POLICY_LLM_ENABLED", false)?,
             llm_provider: env_value("POLICY_LLM_PROVIDER", "openrouter"),
             llm_base_url: env_value("POLICY_LLM_BASE_URL", "https://openrouter.ai/api/v1"),
             llm_api_key: env_value("POLICY_LLM_API_KEY", ""),
             llm_model: env_value("POLICY_LLM_MODEL", ""),
             llm_prompt_version: env_value("POLICY_LLM_PROMPT_VERSION", "policy-extract-v1"),
-            llm_require_zdr: env_bool("POLICY_LLM_REQUIRE_ZDR", true),
+            llm_require_zdr: env_bool("POLICY_LLM_REQUIRE_ZDR", true)?,
             llm_data_collection: env_value("POLICY_LLM_DATA_COLLECTION", "deny"),
-            llm_allow_fallbacks: env_bool("POLICY_LLM_ALLOW_FALLBACKS", false),
-        })
+            llm_allow_fallbacks: env_bool("POLICY_LLM_ALLOW_FALLBACKS", false)?,
+        };
+        if !matches!(config.llm_provider.as_str(), "openrouter" | "heuristic") {
+            return Err(ConfigError::InvalidValue {
+                key: "POLICY_LLM_PROVIDER".to_owned(),
+                value: config.llm_provider,
+            });
+        }
+        if !matches!(config.llm_data_collection.as_str(), "allow" | "deny") {
+            return Err(ConfigError::InvalidValue {
+                key: "POLICY_LLM_DATA_COLLECTION".to_owned(),
+                value: config.llm_data_collection,
+            });
+        }
+        Ok(config)
     }
 }
 
@@ -185,11 +201,14 @@ fn env_value(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_owned())
 }
 
-fn env_bool(key: &str, default: bool) -> bool {
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn env_bool(key: &str, default: bool) -> Result<bool, ConfigError> {
+    let Ok(value) = env::var(key) else {
+        return Ok(default);
+    };
+    value.parse().map_err(|_| ConfigError::InvalidValue {
+        key: key.to_owned(),
+        value,
+    })
 }
 
 fn positive_usize(key: &str, default: usize) -> Result<usize, ConfigError> {

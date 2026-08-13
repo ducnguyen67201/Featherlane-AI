@@ -367,10 +367,11 @@ impl EventId {
     #[must_use]
     pub fn from_source_span(
         organization_id: OrganizationId,
+        eval_run_id: EvalRunId,
         trace_id: &str,
         span_id: &str,
     ) -> Self {
-        let source = format!("{trace_id}:{span_id}");
+        let source = format!("{eval_run_id}:{trace_id}:{span_id}");
         Self(Uuid::new_v5(&organization_id.0, source.as_bytes()))
     }
 }

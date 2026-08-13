@@ -14,6 +14,7 @@ export function PolicyImportProgress({ initialImport }: { initialImport: PolicyI
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
   const [visibilityVersion, setVisibilityVersion] = useState(0);
+  const [pollVersion, setPollVersion] = useState(0);
 
   useEffect(() => {
     const handleVisibility = () => setVisibilityVersion((version) => version + 1);
@@ -36,6 +37,7 @@ export function PolicyImportProgress({ initialImport }: { initialImport: PolicyI
       } catch (cause) {
         if (!controller.signal.aborted) {
           setError(cause instanceof Error ? cause.message : "Status refresh failed.");
+          setPollVersion((version) => version + 1);
         }
       }
     }, 2_000);
@@ -43,7 +45,7 @@ export function PolicyImportProgress({ initialImport }: { initialImport: PolicyI
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [policyImport, visibilityVersion]);
+  }, [policyImport, visibilityVersion, pollVersion]);
 
   async function retry() {
     setRetrying(true);

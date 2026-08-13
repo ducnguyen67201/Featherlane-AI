@@ -10,7 +10,7 @@ use axum::{
 };
 use flate2::read::GzDecoder;
 use governance_application::{
-    IngestTelemetryBatch, TelemetryIngestIdentity, TelemetryIngestKeyRepository,
+    ApplicationError, IngestTelemetryBatch, TelemetryIngestIdentity, TelemetryIngestKeyRepository,
 };
 use governance_config::{AppConfig, TelemetryConfig};
 use governance_persistence::{SeaOrmEvaluationRunRepository, SeaOrmPolicyPackRepository};
@@ -146,7 +146,7 @@ async fn ingest_inner(
     let outcome = service
         .execute(&identity, converted.spans)
         .await
-        .map_err(|error| GatewayError::Unavailable(error.to_string()))?;
+        .map_err(|error| ingest_error(&error))?;
     let rejected = conversion_rejected.saturating_add(outcome.rejected);
     let response = ExportTraceServiceResponse {
         partial_success: (rejected > 0).then(|| ExportTracePartialSuccess {
@@ -207,7 +207,11 @@ fn decode_body(
         "identity" | "" => body.to_vec(),
         "gzip" => {
             let decoder = GzDecoder::new(body);
-            let mut bounded = decoder.take(u64::try_from(decoded_limit).unwrap_or(u64::MAX) + 1);
+            let mut bounded = decoder.take(
+                u64::try_from(decoded_limit)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            );
             let mut output = Vec::new();
             bounded
                 .read_to_end(&mut output)
@@ -357,6 +361,7 @@ enum GatewayError {
     UnsupportedEncoding,
     InvalidPayload,
     PayloadTooLarge,
+    Conflict,
     Unavailable(String),
 }
 
@@ -374,6 +379,7 @@ impl IntoResponse for GatewayError {
             ),
             Self::InvalidPayload => (StatusCode::BAD_REQUEST, "invalid OTLP trace payload"),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "OTLP payload too large"),
+            Self::Conflict => (StatusCode::CONFLICT, "telemetry correlation conflict"),
             Self::Unavailable(ref detail) => {
                 tracing::warn!(error = %detail, "telemetry ingestion unavailable");
                 (
@@ -383,6 +389,19 @@ impl IntoResponse for GatewayError {
             }
         };
         (status, message).into_response()
+    }
+}
+
+fn ingest_error(error: &ApplicationError) -> GatewayError {
+    match error {
+        ApplicationError::InvalidRequest(_) | ApplicationError::NotFound(_) => {
+            GatewayError::InvalidPayload
+        }
+        ApplicationError::Forbidden(_) => GatewayError::Unauthorized,
+        ApplicationError::Conflict(_) => GatewayError::Conflict,
+        ApplicationError::Repository(_) | ApplicationError::Unavailable(_) => {
+            GatewayError::Unavailable(error.to_string())
+        }
     }
 }
 

@@ -1,10 +1,12 @@
 import "server-only";
 
 import { NextResponse } from "next/server";
+import { requireSession } from "./session";
 
 const API_URL = process.env.GOVERNANCE_API_URL ?? "http://127.0.0.1:8080";
 
 export async function proxyGovernanceRequest(request: Request, path: string, method = request.method) {
+  await requireSession();
   try {
     const headers = new Headers();
     const contentType = request.headers.get("content-type");
@@ -29,13 +31,14 @@ export async function proxyGovernanceRequest(request: Request, path: string, met
     });
   } catch {
     return NextResponse.json(
-      { detail: "The governance API is unavailable; no policy data was changed." },
+      { detail: "The governance API is unavailable. The request outcome is unknown; refresh before retrying." },
       { status: 503 },
     );
   }
 }
 
 export async function proxyGovernanceMultipart(request: Request, path: string) {
+  await requireSession();
   try {
     const headers = new Headers();
     const idempotencyKey = request.headers.get("idempotency-key");
@@ -57,7 +60,7 @@ export async function proxyGovernanceMultipart(request: Request, path: string) {
     });
   } catch {
     return NextResponse.json(
-      { detail: "The governance API is unavailable; no policy data was changed." },
+      { detail: "The governance API is unavailable. The request outcome is unknown; refresh before retrying." },
       { status: 503 },
     );
   }

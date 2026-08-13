@@ -93,6 +93,7 @@ pub struct SpanInsert {
     pub span: ObservedSpan,
     pub sanitized_payload_sha256: String,
     pub received_at: OffsetDateTime,
+    pub max_spans_per_run: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -139,6 +140,11 @@ pub struct RotatedTelemetryIngestKey {
 #[async_trait]
 pub trait EvaluationRunRepository: Send + Sync {
     async fn create_run(&self, run: &EvaluationRun) -> Result<(), ApplicationError>;
+    async fn create_run_with_job(
+        &self,
+        run: &EvaluationRun,
+        job: &DurableJob,
+    ) -> Result<(), ApplicationError>;
     async fn get_run(
         &self,
         organization_id: OrganizationId,
@@ -155,7 +161,31 @@ pub trait EvaluationRunRepository: Send + Sync {
         boundary_kind: RunBoundaryKind,
         external_run_id: &str,
     ) -> Result<Option<EvaluationRun>, ApplicationError>;
-    async fn update_run(&self, run: &EvaluationRun) -> Result<(), ApplicationError>;
+    async fn update_run(
+        &self,
+        run: &EvaluationRun,
+        expected_state: EvaluationRunState,
+        expected_updated_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError>;
+}
+
+async fn persist_run_update<R: EvaluationRunRepository>(
+    repository: &R,
+    run: &EvaluationRun,
+    expected_state: EvaluationRunState,
+    expected_updated_at: OffsetDateTime,
+) -> Result<(), ApplicationError> {
+    if repository
+        .update_run(run, expected_state, expected_updated_at)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(ApplicationError::Conflict(format!(
+            "evaluation run {} changed concurrently",
+            run.id
+        )))
+    }
 }
 
 #[async_trait]
@@ -199,20 +229,32 @@ pub trait DurableJobRepository: Send + Sync {
     async fn complete_job(
         &self,
         job_id: Uuid,
+        attempt: u32,
         completed_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<bool, ApplicationError>;
     async fn fail_job(
         &self,
         job_id: Uuid,
+        attempt: u32,
         error: &str,
         retry_at: OffsetDateTime,
         terminal: bool,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<bool, ApplicationError>;
+    async fn reschedule_job(
+        &self,
+        job_id: Uuid,
+        attempt: u32,
+        available_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError>;
 }
 
 #[async_trait]
 pub trait TelemetryIngestKeyRepository: Send + Sync {
-    async fn insert_key(&self, key: &TelemetryIngestKey) -> Result<(), ApplicationError>;
+    async fn rotate_key(
+        &self,
+        key: &TelemetryIngestKey,
+        revoked_at: OffsetDateTime,
+    ) -> Result<(), ApplicationError>;
     async fn resolve_key(
         &self,
         token_prefix: &str,
@@ -295,7 +337,14 @@ where
             finalized_at: None,
             completed_at: None,
         };
-        if let Err(error) = self.runs.create_run(&run).await {
+        let timeout_job = DurableJob {
+            organization_id: run.organization_id,
+            eval_run_id: run.id,
+            kind: "evaluation_run_timeout".to_owned(),
+            dedupe_key: format!("timeout:{}", run.id),
+            available_at: run.hard_deadline_at,
+        };
+        if let Err(error) = self.runs.create_run_with_job(&run, &timeout_job).await {
             if let Some(external_run_id) = run.external_run_id.as_deref()
                 && let Some(winner) = self
                     .runs
@@ -307,19 +356,19 @@ where
                     )
                     .await?
             {
+                self.jobs
+                    .enqueue(&DurableJob {
+                        organization_id: winner.organization_id,
+                        eval_run_id: winner.id,
+                        kind: "evaluation_run_timeout".to_owned(),
+                        dedupe_key: format!("timeout:{}", winner.id),
+                        available_at: winner.hard_deadline_at,
+                    })
+                    .await?;
                 return Ok(winner);
             }
             return Err(error);
         }
-        self.jobs
-            .enqueue(&DurableJob {
-                organization_id: run.organization_id,
-                eval_run_id: run.id,
-                kind: "evaluation_run_timeout".to_owned(),
-                dedupe_key: format!("timeout:{}", run.id),
-                available_at: run.hard_deadline_at,
-            })
-            .await?;
         Ok(run)
     }
 }
@@ -396,6 +445,10 @@ where
                 self.redaction.clone().with_allowed_attributes(allowed)
             },
         );
+        let settle_duration = Duration::seconds(configured_settle_seconds(
+            boundary.as_ref(),
+            self.settle_seconds,
+        ));
         let mut result = IngestBatchResult::default();
         for mut span in spans {
             if self.limits.validate_span(&span).is_err() {
@@ -417,9 +470,11 @@ where
                     .unwrap_or(false);
             }
             if correlation.eval_run_id.is_none() {
-                correlation.external_run_id = boundary
-                    .as_ref()
-                    .and_then(|target| configured_external_run_id(&span, &target.config));
+                correlation.external_run_id = correlation.external_run_id.or_else(|| {
+                    boundary
+                        .as_ref()
+                        .and_then(|target| configured_external_run_id(&span, &target.config))
+                });
                 if let (Some(target), Some(external_run_id)) =
                     (boundary.as_ref(), correlation.external_run_id.as_deref())
                 {
@@ -497,52 +552,80 @@ where
                     span,
                     sanitized_payload_sha256: format!("{:x}", Sha256::digest(sanitized)),
                     received_at: OffsetDateTime::now_utc(),
+                    max_spans_per_run: self.limits.max_spans_per_run,
                 })
                 .await?;
-            if outcome == SpanInsertOutcome::Inserted
-                && let Some(eval_run_id) = correlated_run_id
+            if matches!(
+                outcome,
+                SpanInsertOutcome::Inserted | SpanInsertOutcome::Duplicate
+            ) && let Some(eval_run_id) = correlated_run_id
             {
-                let mut run = self
-                    .runs
-                    .get_run(identity.organization_id, eval_run_id)
-                    .await?
-                    .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
+                let is_new_span = outcome == SpanInsertOutcome::Inserted;
+                let mut run = None;
+                for attempt in 0..8 {
+                    let mut candidate = self
+                        .runs
+                        .get_run(identity.organization_id, eval_run_id)
+                        .await?
+                        .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
+                    let expected_state = candidate.state;
+                    let expected_updated_at = candidate.updated_at;
+                    let now = OffsetDateTime::now_utc();
+                    let changed = if terminal
+                        && matches!(
+                            candidate.state,
+                            EvaluationRunState::Created | EvaluationRunState::Collecting
+                        ) {
+                        candidate
+                            .begin_settling(
+                                CompletionReason::TerminalEvent,
+                                terminal_state.clone(),
+                                now + settle_duration,
+                                now,
+                            )
+                            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
+                        true
+                    } else if candidate.state == EvaluationRunState::Created {
+                        candidate
+                            .transition_to(EvaluationRunState::Collecting, now)
+                            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
+                        true
+                    } else if candidate.state == EvaluationRunState::Settling && is_new_span {
+                        let proposed = (now + settle_duration).min(candidate.hard_deadline_at);
+                        let extended = candidate
+                            .settle_until
+                            .map_or(proposed, |current| current.max(proposed));
+                        if candidate.settle_until == Some(extended) {
+                            false
+                        } else {
+                            candidate.settle_until = Some(extended);
+                            candidate.updated_at = now;
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                    if !changed
+                        || self
+                            .runs
+                            .update_run(&candidate, expected_state, expected_updated_at)
+                            .await?
+                    {
+                        run = Some(candidate);
+                        break;
+                    }
+                    if attempt == 7 {
+                        return Err(ApplicationError::Conflict(format!(
+                            "evaluation run {eval_run_id} changed during telemetry ingestion"
+                        )));
+                    }
+                }
+                let run = run.ok_or_else(|| {
+                    ApplicationError::Conflict(format!(
+                        "evaluation run {eval_run_id} could not be reconciled"
+                    ))
+                })?;
                 let now = OffsetDateTime::now_utc();
-                if run.state == EvaluationRunState::Created && !terminal {
-                    run.transition_to(EvaluationRunState::Collecting, now)
-                        .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-                    self.runs.update_run(&run).await?;
-                }
-                if terminal
-                    && matches!(
-                        run.state,
-                        EvaluationRunState::Created | EvaluationRunState::Collecting
-                    )
-                {
-                    run.begin_settling(
-                        CompletionReason::TerminalEvent,
-                        terminal_state,
-                        now + Duration::seconds(
-                            i64::try_from(self.settle_seconds)
-                                .unwrap_or(i64::MAX)
-                                .clamp(0, 300),
-                        ),
-                        now,
-                    )
-                    .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-                    self.runs.update_run(&run).await?;
-                } else if run.state == EvaluationRunState::Settling {
-                    run.settle_until = Some(
-                        (now + Duration::seconds(
-                            i64::try_from(self.settle_seconds)
-                                .unwrap_or(i64::MAX)
-                                .clamp(0, 300),
-                        ))
-                        .min(run.hard_deadline_at),
-                    );
-                    run.updated_at = now;
-                    self.runs.update_run(&run).await?;
-                }
                 if run.state == EvaluationRunState::Settling {
                     self.jobs
                         .enqueue(&DurableJob {
@@ -623,9 +706,11 @@ impl<R: EvaluationRunRepository> CancelEvaluationRun<R> {
             .get_run(organization_id, eval_run_id)
             .await?
             .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
+        let expected_state = run.state;
+        let expected_updated_at = run.updated_at;
         run.transition_to(EvaluationRunState::Cancelled, OffsetDateTime::now_utc())
             .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-        self.runs.update_run(&run).await?;
+        persist_run_update(&self.runs, &run, expected_state, expected_updated_at).await?;
         Ok(run)
     }
 }
@@ -648,6 +733,8 @@ where
             .get_run(request.organization_id, request.eval_run_id)
             .await?
             .ok_or_else(|| ApplicationError::NotFound(request.eval_run_id.to_string()))?;
+        let expected_state = run.state;
+        let expected_updated_at = run.updated_at;
         let now = OffsetDateTime::now_utc();
         let settle_seconds = i64::try_from(request.settle_seconds)
             .unwrap_or(i64::MAX)
@@ -659,7 +746,7 @@ where
             now,
         )
         .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-        self.runs.update_run(&run).await?;
+        persist_run_update(&self.runs, &run, expected_state, expected_updated_at).await?;
         self.jobs
             .enqueue(&DurableJob {
                 organization_id: run.organization_id,
@@ -697,6 +784,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Recovery and first-finalization paths stay adjacent.
     pub async fn execute(
         &self,
         organization_id: OrganizationId,
@@ -714,9 +802,16 @@ where
                 .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
             if run.state == EvaluationRunState::Finalizing {
                 let now = OffsetDateTime::now_utc();
+                let expected_state = run.state;
+                let expected_updated_at = run.updated_at;
+                run.trace_count = u64::try_from(bundle.trace_ids.len()).unwrap_or(u64::MAX);
+                run.event_count = u64::try_from(bundle.events.len()).unwrap_or(u64::MAX);
+                run.trace_quality = Some(bundle.trace_quality);
+                run.evidence_sha256 = Some(bundle.evidence_sha256.clone());
+                run.finalized_at = bundle.finalized_at;
                 run.transition_to(EvaluationRunState::Evaluating, now)
                     .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-                self.runs.update_run(&run).await?;
+                persist_run_update(&self.runs, &run, expected_state, expected_updated_at).await?;
                 self.jobs
                     .enqueue(&DurableJob {
                         organization_id,
@@ -735,16 +830,26 @@ where
             .await?
             .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
         let now = OffsetDateTime::now_utc();
-        if run.settle_until.is_some_and(|deadline| deadline > now) {
-            return Err(ApplicationError::Conflict(
-                "run is still settling".to_owned(),
-            ));
+        if run.state == EvaluationRunState::Settling {
+            if run.settle_until.is_some_and(|deadline| deadline > now) {
+                return Err(ApplicationError::Conflict(
+                    "run is still settling".to_owned(),
+                ));
+            }
+            let expected_state = run.state;
+            let expected_updated_at = run.updated_at;
+            run.transition_to(EvaluationRunState::Finalizing, now)
+                .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
+            persist_run_update(&self.runs, &run, expected_state, expected_updated_at).await?;
+        } else if run.state != EvaluationRunState::Finalizing {
+            return Err(ApplicationError::Conflict(format!(
+                "run cannot finalize from {:?}",
+                run.state
+            )));
         }
-        run.transition_to(EvaluationRunState::Finalizing, now)
-            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-        self.runs.update_run(&run).await?;
         let spans = self.spans.list_spans(organization_id, eval_run_id).await?;
         let span_count = spans.len();
+        let finalization_redaction = finalization_redaction(&spans);
         let bundle = finalize_observed_spans(
             governance_telemetry::NormalizationContext {
                 organization_id,
@@ -761,7 +866,7 @@ where
             },
             spans,
             vec![],
-            &RedactionPolicy::default(),
+            &finalization_redaction,
         );
         self.evidence.insert_bundle(&bundle).await?;
         run.span_count = u64::try_from(span_count).unwrap_or(u64::MAX);
@@ -770,9 +875,11 @@ where
         run.trace_quality = Some(bundle.trace_quality);
         run.evidence_sha256 = Some(bundle.evidence_sha256.clone());
         run.finalized_at = Some(now);
+        let expected_state = run.state;
+        let expected_updated_at = run.updated_at;
         run.transition_to(EvaluationRunState::Evaluating, now)
             .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-        self.runs.update_run(&run).await?;
+        persist_run_update(&self.runs, &run, expected_state, expected_updated_at).await?;
         self.jobs
             .enqueue(&DurableJob {
                 organization_id,
@@ -826,14 +933,16 @@ where
                 .await?
                 .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
             if run.state == EvaluationRunState::Evaluating {
+                let expected_state = run.state;
+                let expected_updated_at = run.updated_at;
                 run.verdict = Some(summary.verdict);
                 run.transition_to(EvaluationRunState::Completed, OffsetDateTime::now_utc())
                     .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-                self.runs.update_run(&run).await?;
+                persist_run_update(&self.runs, &run, expected_state, expected_updated_at).await?;
             }
             return Ok(summary);
         }
-        let mut run = self
+        let run = self
             .runs
             .get_run(organization_id, eval_run_id)
             .await?
@@ -865,10 +974,17 @@ where
         self.evaluations
             .save_summary(organization_id, &summary)
             .await?;
+        let mut run = self
+            .runs
+            .get_run(organization_id, eval_run_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
+        let expected_state = run.state;
+        let expected_updated_at = run.updated_at;
         run.verdict = Some(summary.verdict);
         run.transition_to(EvaluationRunState::Completed, OffsetDateTime::now_utc())
             .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
-        self.runs.update_run(&run).await?;
+        persist_run_update(&self.runs, &run, expected_state, expected_updated_at).await?;
         Ok(summary)
     }
 }
@@ -890,9 +1006,6 @@ impl<K: TelemetryIngestKeyRepository> RotateTelemetryIngestKey<K> {
         expires_at: Option<OffsetDateTime>,
     ) -> Result<RotatedTelemetryIngestKey, ApplicationError> {
         let now = OffsetDateTime::now_utc();
-        self.keys
-            .revoke_target_keys(organization_id, &target_id, now)
-            .await?;
         let mut bytes = [0_u8; 32];
         rand::rng().fill(&mut bytes);
         let plaintext = format!("flt_{}", URL_SAFE_NO_PAD.encode(bytes));
@@ -906,7 +1019,7 @@ impl<K: TelemetryIngestKeyRepository> RotateTelemetryIngestKey<K> {
             created_at: now,
             expires_at,
         };
-        self.keys.insert_key(&key).await?;
+        self.keys.rotate_key(&key, now).await?;
         Ok(RotatedTelemetryIngestKey { key, plaintext })
     }
 }
@@ -943,6 +1056,25 @@ fn configured_external_run_id(
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
         })
+}
+
+fn configured_settle_seconds(boundary: Option<&TelemetryTargetBoundary>, fallback: u64) -> i64 {
+    i64::try_from(
+        boundary
+            .map_or(fallback, |target| target.config.settle_seconds)
+            .min(300),
+    )
+    .unwrap_or(300)
+}
+
+fn finalization_redaction(spans: &[ObservedSpan]) -> RedactionPolicy {
+    let allowed_attributes = spans.iter().flat_map(|span| {
+        span.attributes
+            .keys()
+            .chain(span.resource_attributes.keys())
+            .cloned()
+    });
+    RedactionPolicy::default().with_allowed_attributes(allowed_attributes)
 }
 
 fn merged_span_attributes(span: &ObservedSpan) -> BTreeMap<String, serde_json::Value> {
@@ -992,5 +1124,18 @@ mod tests {
             configured_external_run_id(&span, &config).as_deref(),
             Some("conversation-42")
         );
+    }
+
+    #[test]
+    fn target_settle_window_overrides_gateway_default() {
+        let boundary = TelemetryTargetBoundary {
+            target_version: "git:test".to_owned(),
+            config: TelemetryBoundaryConfig {
+                settle_seconds: 42,
+                ..TelemetryBoundaryConfig::default()
+            },
+        };
+        assert_eq!(configured_settle_seconds(Some(&boundary), 10), 42);
+        assert_eq!(configured_settle_seconds(None, 10), 10);
     }
 }

@@ -48,6 +48,14 @@ SET state = 'completed',
     primary_invocation_id = id,
     scenario_id = id;
 
+ALTER TABLE eval_runs
+    ALTER COLUMN target_version SET NOT NULL,
+    ALTER COLUMN policy_content_sha256 SET NOT NULL,
+    ALTER COLUMN policy_pack_version SET NOT NULL,
+    ALTER COLUMN primary_invocation_id SET NOT NULL,
+    ALTER COLUMN scenario_id SET NOT NULL,
+    ALTER COLUMN hard_deadline_at SET NOT NULL;
+
 CREATE INDEX idx_eval_runs_state_deadline
     ON eval_runs (state, hard_deadline_at);
 CREATE UNIQUE INDEX uq_eval_runs_external_boundary

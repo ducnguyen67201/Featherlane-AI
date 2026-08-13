@@ -7,7 +7,7 @@ import { getAgents, getOverview, getPolicies } from "@/lib/api";
 
 export default async function OverviewPage() {
   const [overview, agents, policies] = await Promise.all([getOverview(), getAgents(), getPolicies()]);
-  const policyPackId = policies.find((policy) => policy.status === "approved")?.id;
+  const policyPackId = policies.data?.find((policy) => policy.status === "approved")?.id;
   return (
     <div className="page">
       <PageHeader

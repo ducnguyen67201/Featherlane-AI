@@ -1,12 +1,13 @@
 import Link from "next/link";
 import { ArrowRight, CheckCircle2, Database, FileCheck2, GitBranch, ShieldCheck } from "lucide-react";
 import { ImportPolicyButton } from "@/components/import-policy-button";
+import { PolicyPackActions } from "@/components/policy-pack-actions";
 import { getPolicies, getPolicyImports, getPolicyPack } from "@/lib/api";
 import { PageHeader, StateBadge } from "@/components/ui";
 
 export default async function PoliciesPage() {
-  const packs = await getPolicies();
-  const imports = await getPolicyImports();
+  const [policies, imports] = await Promise.all([getPolicies(), getPolicyImports()]);
+  const packs = policies.data ?? [];
   const details = await Promise.all(packs.map((pack) => getPolicyPack(pack.id)));
   const sourceCount = packs.reduce((total, pack) => total + pack.source_count, 0);
   const ruleCount = packs.reduce((total, pack) => total + pack.rules, 0);
@@ -46,7 +47,11 @@ export default async function PoliciesPage() {
         )}
       </section>
 
-      {packs.length === 0 ? (
+      {policies.error ? (
+        <div className="inline-api-error">{policies.error} Policy packs are never replaced with demonstration data.</div>
+      ) : null}
+
+      {!policies.error && packs.length === 0 ? (
         <section className="panel policy-empty">
           <Database size={27} />
           <h2>No policy packs in PostgreSQL</h2>
@@ -54,6 +59,7 @@ export default async function PoliciesPage() {
         </section>
       ) : packs.map((pack, index) => {
         const detail = details[index];
+        const sourceImport = imports.data?.find((policyImport) => policyImport.compiled_policy_pack_id === pack.id);
         return (
           <section className="panel policy-card" key={pack.id}>
             <div className="policy-summary">
@@ -72,6 +78,11 @@ export default async function PoliciesPage() {
                 </div>
               ))}
             </div>
+            <PolicyPackActions
+              packId={pack.id}
+              status={pack.status}
+              sourceImportId={sourceImport?.id}
+            />
           </section>
         );
       })}

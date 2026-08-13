@@ -17,14 +17,13 @@ pub struct ProcessPolicyImportArgs {
 #[derive(Clone, Debug)]
 pub struct ProcessPolicyImportWorker {
     repository: SeaOrmPolicyImportRepository,
-    config: PolicyImportConfig,
+    config: Result<PolicyImportConfig, String>,
 }
 
 #[async_trait]
 impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
     fn build(context: &AppContext) -> Self {
-        let config = PolicyImportConfig::from_env()
-            .unwrap_or_else(|error| panic!("invalid policy import configuration: {error}"));
+        let config = PolicyImportConfig::from_env().map_err(|error| error.to_string());
         Self {
             repository: SeaOrmPolicyImportRepository::new(context.db.clone()),
             config,
@@ -37,7 +36,23 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
             organization_id = %args.organization_id,
             "policy source extraction started"
         );
-        let artifacts = match OpenDalArtifactStore::from_config(&self.config) {
+        let config = match &self.config {
+            Ok(config) => config,
+            Err(error) => {
+                let _ = self
+                    .repository
+                    .mark_failure(
+                        args.organization_id,
+                        args.policy_import_id,
+                        PolicyImportStatus::FailedRetryable,
+                        "configuration_missing",
+                        "policy import configuration is invalid",
+                    )
+                    .await;
+                return Err(loco_rs::Error::Worker(error.clone()));
+            }
+        };
+        let artifacts = match OpenDalArtifactStore::from_config(config) {
             Ok(artifacts) => artifacts,
             Err(error) => {
                 let _ = self
@@ -53,8 +68,8 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
                 return Err(loco_rs::Error::Worker(error.to_string()));
             }
         };
-        let parser = SafePolicyDocumentParser::from_config(&self.config);
-        let model = match ConfiguredPolicyExtractionModel::from_config(&self.config) {
+        let parser = SafePolicyDocumentParser::from_config(config);
+        let model = match ConfiguredPolicyExtractionModel::from_config(config) {
             Ok(model) => model,
             Err(error) => {
                 let _ = self

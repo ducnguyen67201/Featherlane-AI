@@ -398,7 +398,12 @@ fn normalize_spans_with_defects(
         .map(|span| {
             (
                 (span.trace_id.clone(), span.span_id.clone()),
-                EventId::from_source_span(context.organization_id, &span.trace_id, &span.span_id),
+                EventId::from_source_span(
+                    context.organization_id,
+                    context.eval_run_id,
+                    &span.trace_id,
+                    &span.span_id,
+                ),
             )
         })
         .collect();
@@ -498,7 +503,7 @@ fn causal_order(spans: &[TraceSpan]) -> (Vec<usize>, Vec<TraceDefect>) {
         .map(|(index, span)| ((span.trace_id.clone(), span.span_id.clone()), index))
         .collect();
     let mut indegree = vec![0_usize; spans.len()];
-    let mut outgoing = vec![Vec::<usize>::new(); spans.len()];
+    let mut outgoing = vec![HashSet::<usize>::new(); spans.len()];
     let mut defects = Vec::new();
 
     for (child_index, span) in spans.iter().enumerate() {
@@ -579,9 +584,8 @@ fn sort_key(span: &TraceSpan, index: usize) -> (OffsetDateTime, String, String, 
     )
 }
 
-fn add_edge(parent: usize, child: usize, indegree: &mut [usize], outgoing: &mut [Vec<usize>]) {
-    if parent != child && !outgoing[parent].contains(&child) {
-        outgoing[parent].push(child);
+fn add_edge(parent: usize, child: usize, indegree: &mut [usize], outgoing: &mut [HashSet<usize>]) {
+    if parent != child && outgoing[parent].insert(child) {
         indegree[child] = indegree[child].saturating_add(1);
     }
 }
@@ -703,7 +707,13 @@ pub fn finalize_observed_spans(
         &side_effects,
         &trace_defects,
     ))
-    .unwrap_or_default();
+    .unwrap_or_else(|error| {
+        format!(
+            "canonicalization-error:{}:{}:{}",
+            context.organization_id, context.eval_run_id, error
+        )
+        .into_bytes()
+    });
     let evidence_sha256 = format!("{:x}", Sha256::digest(canonical));
     EvidenceBundle {
         schema_version: "1.1".to_owned(),
@@ -737,8 +747,14 @@ pub fn finalize_evidence(
     let mut trace_ids: Vec<String> = events.iter().map(|event| event.trace_id.clone()).collect();
     trace_ids.sort();
     trace_ids.dedup();
-    let canonical =
-        serde_json::to_vec(&(target_version.as_str(), &events, &side_effects)).unwrap_or_default();
+    let canonical = serde_json::to_vec(&(target_version.as_str(), &events, &side_effects))
+        .unwrap_or_else(|error| {
+            format!(
+                "canonicalization-error:{}:{}:{}",
+                context.organization_id, context.eval_run_id, error
+            )
+            .into_bytes()
+        });
     let evidence_sha256 = format!("{:x}", Sha256::digest(canonical));
     EvidenceBundle {
         schema_version: "1.1".to_owned(),

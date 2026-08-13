@@ -12,9 +12,9 @@ use governance_domain::{
 use governance_targets::TelemetryBoundaryConfig;
 use governance_telemetry::{ObservedSpan, SpanLink};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
-    sea_query::{LockBehavior, LockType},
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbBackend,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    sea_query::{Expr, LockBehavior, LockType},
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -46,6 +46,39 @@ impl EvaluationRunRepository for SeaOrmEvaluationRunRepository {
             .await
             .map_err(repository_error)?;
         Ok(())
+    }
+
+    async fn create_run_with_job(
+        &self,
+        run: &EvaluationRun,
+        job: &DurableJob,
+    ) -> Result<(), ApplicationError> {
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        run_active_model(run)?
+            .insert(&transaction)
+            .await
+            .map_err(repository_error)?;
+        jobs::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            organization_id: Set(job.organization_id.0),
+            kind: Set(job.kind.clone()),
+            dedupe_key: Set(Some(job.dedupe_key.clone())),
+            status: Set("pending".to_owned()),
+            payload: Set(serde_json::json!({
+                "organization_id": job.organization_id,
+                "eval_run_id": job.eval_run_id,
+            })),
+            attempts: Set(0),
+            available_at: Set(job.available_at),
+            lease_expires_at: Set(None),
+            last_error: Set(None),
+            created_at: Set(run.created_at),
+            updated_at: Set(run.created_at),
+        }
+        .insert(&transaction)
+        .await
+        .map_err(repository_error)?;
+        transaction.commit().await.map_err(repository_error)
     }
 
     async fn get_run(
@@ -98,22 +131,75 @@ impl EvaluationRunRepository for SeaOrmEvaluationRunRepository {
             .transpose()
     }
 
-    async fn update_run(&self, run: &EvaluationRun) -> Result<(), ApplicationError> {
-        let existing = eval_runs::Entity::find()
+    async fn update_run(
+        &self,
+        run: &EvaluationRun,
+        expected_state: EvaluationRunState,
+        expected_updated_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        let result = eval_runs::Entity::update_many()
+            .col_expr(
+                eval_runs::Column::State,
+                Expr::value(enum_string(run.state)?),
+            )
+            .col_expr(
+                eval_runs::Column::CompletionReason,
+                Expr::value(run.completion_reason.map(enum_string).transpose()?),
+            )
+            .col_expr(
+                eval_runs::Column::TerminalState,
+                Expr::value(run.terminal_state.clone()),
+            )
+            .col_expr(
+                eval_runs::Column::Verdict,
+                Expr::value(run.verdict.map(enum_string).transpose()?),
+            )
+            .col_expr(
+                eval_runs::Column::SettleUntil,
+                Expr::value(run.settle_until),
+            )
+            .col_expr(
+                eval_runs::Column::HardDeadlineAt,
+                Expr::value(Some(run.hard_deadline_at)),
+            )
+            .col_expr(eval_runs::Column::LastSeenAt, Expr::value(run.last_seen_at))
+            .col_expr(
+                eval_runs::Column::FinalizedAt,
+                Expr::value(run.finalized_at),
+            )
+            .col_expr(eval_runs::Column::UpdatedAt, Expr::value(run.updated_at))
+            .col_expr(
+                eval_runs::Column::SpanCount,
+                Expr::value(i64::try_from(run.span_count).unwrap_or(i64::MAX)),
+            )
+            .col_expr(
+                eval_runs::Column::TraceCount,
+                Expr::value(i64::try_from(run.trace_count).unwrap_or(i64::MAX)),
+            )
+            .col_expr(
+                eval_runs::Column::EventCount,
+                Expr::value(i64::try_from(run.event_count).unwrap_or(i64::MAX)),
+            )
+            .col_expr(
+                eval_runs::Column::TraceQuality,
+                Expr::value(run.trace_quality.map(enum_string).transpose()?),
+            )
+            .col_expr(
+                eval_runs::Column::EvidenceSha256,
+                Expr::value(run.evidence_sha256.clone()),
+            )
+            .col_expr(
+                eval_runs::Column::CompletedAt,
+                Expr::value(run.completed_at),
+            )
             .filter(eval_runs::Column::OrganizationId.eq(run.organization_id.0))
             .filter(eval_runs::Column::Id.eq(run.id.0))
-            .one(&self.database)
-            .await
-            .map_err(repository_error)?
-            .ok_or_else(|| ApplicationError::NotFound(run.id.to_string()))?;
-        let summary = existing.summary;
-        let mut active = run_active_model(run)?;
-        active.summary = Set(summary);
-        active
-            .update(&self.database)
+            .filter(eval_runs::Column::State.eq(enum_string(expected_state)?))
+            .filter(eval_runs::Column::UpdatedAt.eq(expected_updated_at))
+            .exec(&self.database)
             .await
             .map_err(repository_error)?;
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 }
 
@@ -162,46 +248,70 @@ impl TelemetrySpanRepository for SeaOrmEvaluationRunRepository {
         &self,
         insert: &SpanInsert,
     ) -> Result<SpanInsertOutcome, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        let trace_lock = format!(
+            "{}:{}:{}",
+            insert.organization_id, insert.target_id, insert.span.trace_id
+        );
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                [trace_lock.into()],
+            ))
+            .await
+            .map_err(repository_error)?;
         let duplicate = ingested_spans::Entity::find()
             .filter(ingested_spans::Column::OrganizationId.eq(insert.organization_id.0))
             .filter(ingested_spans::Column::TargetId.eq(&insert.target_id))
             .filter(ingested_spans::Column::TraceId.eq(&insert.span.trace_id))
             .filter(ingested_spans::Column::SpanId.eq(&insert.span.span_id))
-            .one(&self.database)
+            .one(&transaction)
             .await
             .map_err(repository_error)?;
         if let Some(existing) = duplicate {
-            return Ok(
-                if existing.sanitized_payload_sha256 == insert.sanitized_payload_sha256 {
-                    SpanInsertOutcome::Duplicate
-                } else {
-                    SpanInsertOutcome::Conflict
-                },
-            );
+            let outcome = if existing.sanitized_payload_sha256 == insert.sanitized_payload_sha256 {
+                SpanInsertOutcome::Duplicate
+            } else {
+                SpanInsertOutcome::Conflict
+            };
+            transaction.commit().await.map_err(repository_error)?;
+            return Ok(outcome);
         }
 
         let mut late = false;
+        let mut locked_run = None;
         if let Some(eval_run_id) = insert.correlation.eval_run_id {
             let trace_owner = ingested_spans::Entity::find()
                 .filter(ingested_spans::Column::OrganizationId.eq(insert.organization_id.0))
                 .filter(ingested_spans::Column::TargetId.eq(&insert.target_id))
                 .filter(ingested_spans::Column::TraceId.eq(&insert.span.trace_id))
                 .filter(ingested_spans::Column::EvalRunId.is_not_null())
-                .one(&self.database)
+                .one(&transaction)
                 .await
                 .map_err(repository_error)?;
             if trace_owner.is_some_and(|owner| owner.eval_run_id != Some(eval_run_id.0)) {
+                transaction.commit().await.map_err(repository_error)?;
                 return Ok(SpanInsertOutcome::Conflict);
             }
             let run = eval_runs::Entity::find()
                 .filter(eval_runs::Column::OrganizationId.eq(insert.organization_id.0))
                 .filter(eval_runs::Column::Id.eq(eval_run_id.0))
-                .one(&self.database)
+                .filter(eval_runs::Column::TargetId.eq(&insert.target_id))
+                .lock_exclusive()
+                .one(&transaction)
                 .await
                 .map_err(repository_error)?
                 .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
             let state: EvaluationRunState = enum_from_string(&run.state)?;
             late = !state.accepts_spans();
+            if !late
+                && run.span_count >= i64::try_from(insert.max_spans_per_run).unwrap_or(i64::MAX)
+            {
+                transaction.commit().await.map_err(repository_error)?;
+                return Ok(SpanInsertOutcome::Conflict);
+            }
+            locked_run = Some(run);
         }
         let unassigned = insert.correlation.eval_run_id.is_none();
         let attributes =
@@ -241,42 +351,21 @@ impl TelemetrySpanRepository for SeaOrmEvaluationRunRepository {
             late_after_finalize: Set(late),
             received_at: Set(insert.received_at),
         };
-        if let Err(error) = active.insert(&self.database).await {
-            let winner = ingested_spans::Entity::find()
-                .filter(ingested_spans::Column::OrganizationId.eq(insert.organization_id.0))
-                .filter(ingested_spans::Column::TargetId.eq(&insert.target_id))
-                .filter(ingested_spans::Column::TraceId.eq(&insert.span.trace_id))
-                .filter(ingested_spans::Column::SpanId.eq(&insert.span.span_id))
-                .one(&self.database)
-                .await
-                .map_err(repository_error)?;
-            if let Some(winner) = winner {
-                return Ok(
-                    if winner.sanitized_payload_sha256 == insert.sanitized_payload_sha256 {
-                        SpanInsertOutcome::Duplicate
-                    } else {
-                        SpanInsertOutcome::Conflict
-                    },
-                );
-            }
-            return Err(repository_error(error));
-        }
-        if let Some(eval_run_id) = insert.correlation.eval_run_id
-            && !late
-            && let Some(model) = eval_runs::Entity::find_by_id(eval_run_id.0)
-                .one(&self.database)
-                .await
-                .map_err(repository_error)?
-        {
+        active
+            .insert(&transaction)
+            .await
+            .map_err(repository_error)?;
+        if !late && let Some(model) = locked_run {
             let mut active: eval_runs::ActiveModel = model.into();
             active.last_seen_at = Set(Some(insert.received_at));
             active.updated_at = Set(insert.received_at);
             active.span_count = Set(active.span_count.take().unwrap_or_default() + 1);
             active
-                .update(&self.database)
+                .update(&transaction)
                 .await
                 .map_err(repository_error)?;
         }
+        transaction.commit().await.map_err(repository_error)?;
         Ok(if late {
             SpanInsertOutcome::LateAfterFinalize
         } else if unassigned {
@@ -321,7 +410,7 @@ impl EvidenceBundleRepository for SeaOrmEvaluationRunRepository {
             };
         }
         let transaction = self.database.begin().await.map_err(repository_error)?;
-        evidence_bundles::ActiveModel {
+        let evidence_insert = evidence_bundles::ActiveModel {
             id: Set(Uuid::now_v7()),
             organization_id: Set(bundle.organization_id.0),
             eval_run_id: Set(bundle.eval_run_id.0),
@@ -331,8 +420,23 @@ impl EvidenceBundleRepository for SeaOrmEvaluationRunRepository {
             finalized_at: Set(bundle.finalized_at.unwrap_or_else(OffsetDateTime::now_utc)),
         }
         .insert(&transaction)
-        .await
-        .map_err(repository_error)?;
+        .await;
+        if let Err(error) = evidence_insert {
+            transaction.rollback().await.map_err(repository_error)?;
+            if let Some(existing) = self
+                .get_bundle(bundle.organization_id, bundle.eval_run_id)
+                .await?
+            {
+                return if existing.evidence_sha256 == bundle.evidence_sha256 {
+                    Ok(())
+                } else {
+                    Err(ApplicationError::Conflict(
+                        "run already has different immutable evidence".to_owned(),
+                    ))
+                };
+            }
+            return Err(repository_error(error));
+        }
         for event in &bundle.events {
             normalized_events::ActiveModel {
                 id: Set(event.id.0),
@@ -392,8 +496,9 @@ impl DurableJobRepository for SeaOrmEvaluationRunRepository {
             .await
             .map_err(repository_error)?;
         if let Some(existing) = existing {
+            let available_at = existing.available_at.max(job.available_at);
             let mut active: jobs::ActiveModel = existing.into();
-            active.available_at = Set(job.available_at);
+            active.available_at = Set(available_at);
             active.updated_at = Set(now);
             active
                 .update(&self.database)
@@ -427,8 +532,9 @@ impl DurableJobRepository for SeaOrmEvaluationRunRepository {
             let Some(winner) = winner else {
                 return Err(repository_error(error));
             };
+            let available_at = winner.available_at.max(job.available_at);
             let mut active: jobs::ActiveModel = winner.into();
-            active.available_at = Set(job.available_at);
+            active.available_at = Set(available_at);
             active.updated_at = Set(now);
             active
                 .update(&self.database)
@@ -502,53 +608,127 @@ impl DurableJobRepository for SeaOrmEvaluationRunRepository {
     async fn complete_job(
         &self,
         job_id: Uuid,
+        attempt: u32,
         completed_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        let model = jobs::Entity::find_by_id(job_id)
-            .one(&self.database)
-            .await
-            .map_err(repository_error)?
-            .ok_or_else(|| ApplicationError::NotFound(job_id.to_string()))?;
-        let mut active: jobs::ActiveModel = model.into();
-        active.status = Set("completed".to_owned());
-        active.lease_expires_at = Set(None);
-        active.updated_at = Set(completed_at);
-        active
-            .update(&self.database)
+    ) -> Result<bool, ApplicationError> {
+        let result = jobs::Entity::update_many()
+            .col_expr(jobs::Column::Status, Expr::value("completed"))
+            .col_expr(
+                jobs::Column::LeaseExpiresAt,
+                Expr::value(None::<OffsetDateTime>),
+            )
+            .col_expr(jobs::Column::UpdatedAt, Expr::value(completed_at))
+            .filter(jobs::Column::Id.eq(job_id))
+            .filter(jobs::Column::Status.eq("running"))
+            .filter(jobs::Column::Attempts.eq(i32::try_from(attempt).unwrap_or(i32::MAX)))
+            .exec(&self.database)
             .await
             .map_err(repository_error)?;
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 
     async fn fail_job(
         &self,
         job_id: Uuid,
+        attempt: u32,
         error: &str,
         retry_at: OffsetDateTime,
         terminal: bool,
-    ) -> Result<(), ApplicationError> {
-        let model = jobs::Entity::find_by_id(job_id)
-            .one(&self.database)
-            .await
-            .map_err(repository_error)?
-            .ok_or_else(|| ApplicationError::NotFound(job_id.to_string()))?;
-        let mut active: jobs::ActiveModel = model.into();
-        active.status = Set(if terminal { "failed" } else { "pending" }.to_owned());
-        active.available_at = Set(retry_at);
-        active.lease_expires_at = Set(None);
-        active.last_error = Set(Some(error.chars().take(1_024).collect()));
-        active.updated_at = Set(OffsetDateTime::now_utc());
-        active
-            .update(&self.database)
+    ) -> Result<bool, ApplicationError> {
+        let result = jobs::Entity::update_many()
+            .col_expr(
+                jobs::Column::Status,
+                Expr::value(if terminal { "failed" } else { "pending" }),
+            )
+            .col_expr(jobs::Column::AvailableAt, Expr::value(retry_at))
+            .col_expr(
+                jobs::Column::LeaseExpiresAt,
+                Expr::value(None::<OffsetDateTime>),
+            )
+            .col_expr(
+                jobs::Column::LastError,
+                Expr::value(Some(error.chars().take(1_024).collect::<String>())),
+            )
+            .col_expr(
+                jobs::Column::UpdatedAt,
+                Expr::value(OffsetDateTime::now_utc()),
+            )
+            .filter(jobs::Column::Id.eq(job_id))
+            .filter(jobs::Column::Status.eq("running"))
+            .filter(jobs::Column::Attempts.eq(i32::try_from(attempt).unwrap_or(i32::MAX)))
+            .exec(&self.database)
             .await
             .map_err(repository_error)?;
-        Ok(())
+        Ok(result.rows_affected == 1)
+    }
+
+    async fn reschedule_job(
+        &self,
+        job_id: Uuid,
+        attempt: u32,
+        available_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        let result = jobs::Entity::update_many()
+            .col_expr(jobs::Column::Status, Expr::value("pending"))
+            .col_expr(jobs::Column::AvailableAt, Expr::value(available_at))
+            .col_expr(
+                jobs::Column::LeaseExpiresAt,
+                Expr::value(None::<OffsetDateTime>),
+            )
+            .col_expr(
+                jobs::Column::Attempts,
+                Expr::value(i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX)),
+            )
+            .col_expr(
+                jobs::Column::UpdatedAt,
+                Expr::value(OffsetDateTime::now_utc()),
+            )
+            .filter(jobs::Column::Id.eq(job_id))
+            .filter(jobs::Column::Status.eq("running"))
+            .filter(jobs::Column::Attempts.eq(i32::try_from(attempt).unwrap_or(i32::MAX)))
+            .exec(&self.database)
+            .await
+            .map_err(repository_error)?;
+        Ok(result.rows_affected == 1)
     }
 }
 
 #[async_trait]
 impl TelemetryIngestKeyRepository for SeaOrmEvaluationRunRepository {
-    async fn insert_key(&self, key: &TelemetryIngestKey) -> Result<(), ApplicationError> {
+    async fn rotate_key(
+        &self,
+        key: &TelemetryIngestKey,
+        revoked_at: OffsetDateTime,
+    ) -> Result<(), ApplicationError> {
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        let rotation_lock = format!("{}:{}", key.organization_id, key.target_id);
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                [rotation_lock.into()],
+            ))
+            .await
+            .map_err(repository_error)?;
+        telemetry_ingest_keys::Entity::update_many()
+            .col_expr(
+                telemetry_ingest_keys::Column::Status,
+                Expr::value("revoked"),
+            )
+            .col_expr(
+                telemetry_ingest_keys::Column::RevokedAt,
+                Expr::value(Some(revoked_at)),
+            )
+            .col_expr(
+                telemetry_ingest_keys::Column::UpdatedAt,
+                Expr::value(revoked_at),
+            )
+            .filter(telemetry_ingest_keys::Column::OrganizationId.eq(key.organization_id.0))
+            .filter(telemetry_ingest_keys::Column::TargetId.eq(&key.target_id))
+            .filter(telemetry_ingest_keys::Column::Status.eq("active"))
+            .exec(&transaction)
+            .await
+            .map_err(repository_error)?;
         telemetry_ingest_keys::ActiveModel {
             id: Set(key.id),
             organization_id: Set(key.organization_id.0),
@@ -561,10 +741,10 @@ impl TelemetryIngestKeyRepository for SeaOrmEvaluationRunRepository {
             created_at: Set(key.created_at),
             updated_at: Set(key.created_at),
         }
-        .insert(&self.database)
+        .insert(&transaction)
         .await
         .map_err(repository_error)?;
-        Ok(())
+        transaction.commit().await.map_err(repository_error)
     }
 
     async fn resolve_key(
@@ -594,23 +774,25 @@ impl TelemetryIngestKeyRepository for SeaOrmEvaluationRunRepository {
         target_id: &str,
         revoked_at: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
-        let models = telemetry_ingest_keys::Entity::find()
+        telemetry_ingest_keys::Entity::update_many()
+            .col_expr(
+                telemetry_ingest_keys::Column::Status,
+                Expr::value("revoked"),
+            )
+            .col_expr(
+                telemetry_ingest_keys::Column::RevokedAt,
+                Expr::value(Some(revoked_at)),
+            )
+            .col_expr(
+                telemetry_ingest_keys::Column::UpdatedAt,
+                Expr::value(revoked_at),
+            )
             .filter(telemetry_ingest_keys::Column::OrganizationId.eq(organization_id.0))
             .filter(telemetry_ingest_keys::Column::TargetId.eq(target_id))
             .filter(telemetry_ingest_keys::Column::Status.eq("active"))
-            .all(&self.database)
+            .exec(&self.database)
             .await
             .map_err(repository_error)?;
-        for model in models {
-            let mut active: telemetry_ingest_keys::ActiveModel = model.into();
-            active.status = Set("revoked".to_owned());
-            active.revoked_at = Set(Some(revoked_at));
-            active.updated_at = Set(revoked_at);
-            active
-                .update(&self.database)
-                .await
-                .map_err(repository_error)?;
-        }
         Ok(())
     }
 }

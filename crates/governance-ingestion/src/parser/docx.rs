@@ -1,5 +1,6 @@
 use std::io::Cursor;
 
+use docx_rs::{DocumentChild, Paragraph, Table, TableCellContent, TableChild, TableRowChild};
 use governance_application::{ApplicationError, sha256_hex};
 use governance_domain::{DocumentFormat, ParsedDocument, SourceSegment};
 use serde_json::Value;
@@ -9,11 +10,20 @@ pub fn parse(content: &[u8], max_characters: usize) -> Result<ParsedDocument, Ap
     let document = docx_rs::read_docx(content).map_err(|_| {
         ApplicationError::InvalidRequest("invalid_docx: DOCX could not be parsed".to_owned())
     })?;
-    let value: Value = serde_json::from_str(&document.json()).map_err(|_| {
-        ApplicationError::InvalidRequest("invalid_docx: DOCX text could not be decoded".to_owned())
-    })?;
     let mut paragraphs = Vec::new();
-    collect_text(&value, &mut paragraphs);
+    for paragraph in document_paragraphs(&document.document.children) {
+        let value = serde_json::to_value(paragraph).map_err(|_| {
+            ApplicationError::InvalidRequest(
+                "invalid_docx: DOCX text could not be decoded".to_owned(),
+            )
+        })?;
+        let mut fragments = Vec::new();
+        collect_text(&value, &mut fragments);
+        let text = fragments.concat().trim().to_owned();
+        if !text.is_empty() {
+            paragraphs.push(text);
+        }
+    }
     paragraphs.retain(|text| !text.trim().is_empty());
     let total: usize = paragraphs.iter().map(|text| text.chars().count()).sum();
     if total == 0 {
@@ -47,6 +57,47 @@ pub fn parse(content: &[u8], max_characters: usize) -> Result<ParsedDocument, Ap
     })
 }
 
+enum DocumentBlock<'a> {
+    Child(&'a DocumentChild),
+    Table(&'a Table),
+    Cell(&'a TableCellContent),
+}
+
+fn document_paragraphs(children: &[DocumentChild]) -> Vec<&Paragraph> {
+    let mut paragraphs = Vec::new();
+    let mut pending = children
+        .iter()
+        .rev()
+        .map(DocumentBlock::Child)
+        .collect::<Vec<_>>();
+
+    while let Some(block) = pending.pop() {
+        match block {
+            DocumentBlock::Child(DocumentChild::Paragraph(paragraph))
+            | DocumentBlock::Cell(TableCellContent::Paragraph(paragraph)) => {
+                paragraphs.push(paragraph.as_ref());
+            }
+            DocumentBlock::Child(DocumentChild::Table(table))
+            | DocumentBlock::Cell(TableCellContent::Table(table)) => {
+                pending.push(DocumentBlock::Table(table));
+            }
+            DocumentBlock::Table(table) => {
+                for TableChild::TableRow(row) in table.rows.iter().rev() {
+                    for TableRowChild::TableCell(cell) in row.cells.iter().rev() {
+                        pending.extend(cell.children.iter().rev().map(DocumentBlock::Cell));
+                    }
+                }
+            }
+            DocumentBlock::Cell(
+                TableCellContent::StructuredDataTag(_) | TableCellContent::TableOfContents(_),
+            )
+            | DocumentBlock::Child(_) => {}
+        }
+    }
+
+    paragraphs
+}
+
 fn validate_package_limits(content: &[u8], max_characters: usize) -> Result<(), ApplicationError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(content)).map_err(|_| {
         ApplicationError::InvalidRequest("invalid_docx: invalid ZIP package".to_owned())
@@ -75,29 +126,30 @@ fn validate_package_limits(content: &[u8], max_characters: usize) -> Result<(), 
 }
 
 fn collect_text(value: &Value, output: &mut Vec<String>) {
-    match value {
-        Value::Object(object) => {
-            if let Some(Value::String(text)) = object.get("text") {
-                output.push(text.trim().to_owned());
-            }
-            for (key, child) in object {
-                if key != "text" {
-                    collect_text(child, output);
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(object) => {
+                if let Some(Value::String(text)) = object.get("text") {
+                    output.push(text.to_owned());
+                }
+                for (key, child) in object.iter().rev() {
+                    if key != "text" {
+                        pending.push(child);
+                    }
                 }
             }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_text(item, output);
+            Value::Array(items) => {
+                pending.extend(items.iter().rev());
             }
+            _ => {}
         }
-        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use docx_rs::{Docx, Paragraph, Run};
+    use docx_rs::{Docx, Paragraph, Run, Table, TableCell, TableRow};
 
     use super::*;
 
@@ -110,19 +162,54 @@ mod tests {
     fn parses_generated_policy_docx() {
         let mut bytes = Cursor::new(Vec::new());
         Docx::new()
-            .add_paragraph(Paragraph::new().add_run(
-                Run::new().add_text("Refunds above USD 500 must receive recorded human approval."),
-            ))
+            .add_paragraph(
+                Paragraph::new()
+                    .add_run(Run::new().add_text("Refunds above USD 500 "))
+                    .add_run(Run::new().add_text("must receive recorded human approval.")),
+            )
             .build()
             .pack(&mut bytes)
             .expect("DOCX fixture should serialize");
         let document = parse(bytes.get_ref(), 10_000).expect("DOCX fixture should parse");
         assert_eq!(document.format, DocumentFormat::Docx);
-        assert!(
-            document
-                .segments
-                .iter()
-                .any(|segment| segment.text.contains("human approval"))
+        assert!(document.segments.iter().any(|segment| {
+            segment
+                .text
+                .contains("Refunds above USD 500 must receive recorded human approval.")
+        }));
+    }
+
+    #[test]
+    fn preserves_paragraphs_inside_tables_in_document_order() {
+        let mut bytes = Cursor::new(Vec::new());
+        let table = Table::new(vec![TableRow::new(vec![
+            TableCell::new()
+                .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Approval threshold"))),
+            TableCell::new()
+                .add_paragraph(Paragraph::new().add_run(Run::new().add_text("USD 500"))),
+        ])]);
+        Docx::new()
+            .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Refund policy")))
+            .add_table(table)
+            .add_paragraph(Paragraph::new().add_run(Run::new().add_text("End of policy")))
+            .build()
+            .pack(&mut bytes)
+            .expect("DOCX fixture should serialize");
+
+        let document = parse(bytes.get_ref(), 10_000).expect("DOCX fixture should parse");
+        let text = document
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text,
+            vec![
+                "Refund policy",
+                "Approval threshold",
+                "USD 500",
+                "End of policy"
+            ]
         );
     }
 }

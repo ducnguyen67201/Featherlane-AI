@@ -44,7 +44,7 @@ export async function getEvaluations(): Promise<RunListItem[]> {
     passed: 0,
     failed: 0,
     inconclusive: 0,
-    duration_ms: Math.max(0, new Date(run.updated_at).getTime() - new Date(run.created_at).getTime()),
+    duration_ms: Math.max(0, new Date(run.completed_at ?? run.updated_at).getTime() - new Date(run.created_at).getTime()),
     created_at: run.created_at,
     trace_count: run.trace_count,
     event_count: run.event_count,
@@ -55,8 +55,8 @@ export function getEvaluation(id: string): Promise<EvaluationRunDetail | null> {
   return getJson(`/v1/evaluations/${encodeURIComponent(id)}`, null);
 }
 
-export function getPolicies(): Promise<PolicyPack[]> {
-  return getJson("/v1/policy-packs", seed.policies);
+export function getPolicies(): Promise<{ data: PolicyPack[] | null; error: string | null }> {
+  return getLiveJson("/v1/policy-packs");
 }
 
 export function getPolicyPack(id: string): Promise<PolicyPackDetail | null> {
@@ -72,6 +72,7 @@ export function getCorpus(setName: string): Promise<Corpus> {
 }
 
 async function getLiveJson<T>(path: string): Promise<{ data: T | null; error: string | null }> {
+  await requireSession();
   try {
     const response = await fetch(`${API_URL}${path}`, {
       cache: "no-store",

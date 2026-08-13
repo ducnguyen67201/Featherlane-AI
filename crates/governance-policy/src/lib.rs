@@ -153,7 +153,7 @@ pub fn build_policy_bundle(
             title: imported_source.title.clone(),
             jurisdiction: imported_source.jurisdiction.clone(),
             effective_from: None,
-            content_sha256: imported_source.content_sha256.clone(),
+            content_sha256: imported_source.content_sha256.to_ascii_lowercase(),
             confidence: imported_source.confidence,
         });
         for imported_obligation in &imported_source.obligations {
@@ -180,13 +180,15 @@ pub fn build_policy_bundle(
                     ));
                 }
             };
+            let mut locator = imported_obligation.locator.clone();
+            locator.excerpt_sha256.make_ascii_lowercase();
             obligations.push(Obligation {
                 id: ObligationId::new(),
                 organization_id,
                 source_id,
                 key: imported_obligation.key.clone(),
                 statement: imported_obligation.statement.clone(),
-                locator: imported_obligation.locator.clone(),
+                locator,
                 applicability: imported_obligation.applicability.clone(),
                 exceptions: imported_obligation.exceptions.clone(),
                 required_evidence: imported_obligation.required_evidence.clone(),
@@ -196,6 +198,11 @@ pub fn build_policy_bundle(
     }
     let obligation_keys: std::collections::BTreeSet<&str> =
         obligations.iter().map(|item| item.key.as_str()).collect();
+    if obligation_keys.len() != obligations.len() {
+        return Err(PolicyError::InvalidPolicy(
+            "obligation keys must be unique across all imported sources".to_owned(),
+        ));
+    }
     if let Some(rule) = request
         .rules
         .iter()

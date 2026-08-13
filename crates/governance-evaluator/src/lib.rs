@@ -261,11 +261,16 @@ fn has_required_evidence(requirement: &str, evidence: &EvidenceBundle) -> bool {
             Value::String(event_type.to_owned()),
         )
     {
-        return evidence
-            .events
-            .iter()
-            .filter(|event| event.event_type == event_type)
-            .any(|event| event_has_path(event, path));
+        let supported_path = path.starts_with("input.")
+            || path.starts_with("output.")
+            || path.starts_with("attributes.");
+        if supported_path {
+            return evidence
+                .events
+                .iter()
+                .filter(|event| event.event_type == event_type)
+                .any(|event| event_has_path(event, path));
+        }
     }
 
     evidence.events.iter().any(|event| {

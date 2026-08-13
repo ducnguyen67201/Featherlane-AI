@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Check, FileCheck2, LoaderCircle, Plus, ShieldCheck, X } from "lucide-react";
 import type { PolicyCandidate, PolicyImport, RuleSuggestion } from "@/lib/types";
+import { PolicyPackActions } from "./policy-pack-actions";
 import { StateBadge } from "./ui";
 
 const DEFAULT_RULE: RuleSuggestion = {
@@ -14,22 +15,26 @@ const DEFAULT_RULE: RuleSuggestion = {
 
 const EVENT_TYPES = ["scenario_input", "agent_start", "model_call", "model_result", "tool_call", "tool_result", "retrieval", "handoff", "guardrail_decision", "human_approval_request", "human_approval_decision", "final_output", "side_effect", "retry", "error", "timeout", "cancellation", "unclassified"];
 
-export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { initialImport: PolicyImport; initialCandidates: PolicyCandidate[] }) {
+export function PolicyReviewWorkspace({ initialImport, initialCandidates, reviewerIdentity, compiledPackStatus }: {
+  initialImport: PolicyImport;
+  initialCandidates: PolicyCandidate[];
+  reviewerIdentity: string;
+  compiledPackStatus: string | null;
+}) {
   const router = useRouter();
   const [policyImport, setPolicyImport] = useState(initialImport);
   const [candidates, setCandidates] = useState(initialCandidates);
-  const [reviewer, setReviewer] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
-  const [dirty, setDirty] = useState(false);
+  const [dirtyIds, setDirtyIds] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
-      if (dirty) event.preventDefault();
+      if (dirtyIds.size > 0) event.preventDefault();
     };
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
-  }, [dirty]);
+  }, [dirtyIds]);
 
   async function refreshImport() {
     const response = await fetch(`/api/policy-imports/${policyImport.id}`, { cache: "no-store" });
@@ -37,11 +42,9 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
   }
 
   async function verifySource(decision: "verified" | "rejected") {
-    if (!reviewer.trim()) return setMessage("Enter your reviewer identity first.");
     setBusy(true);
     const result = await mutate<PolicyImport>(`/api/policy-imports/${policyImport.id}/verify-source`, {
       decision,
-      reviewer_id: reviewer,
       notes: decision === "verified" ? "Verified against the displayed source metadata and excerpts." : "Source provenance could not be verified.",
     });
     setBusy(false);
@@ -50,14 +53,13 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
   }
 
   async function compile(form: HTMLFormElement) {
-    if (!reviewer.trim()) return setMessage("Enter your reviewer identity first.");
     setBusy(true);
     const formData = new FormData(form);
     const result = await mutate<{ id: string }>(`/api/policy-imports/${policyImport.id}/compile`, {
       key: String(formData.get("key") ?? ""),
       version: Number(formData.get("version") ?? 1),
       title: String(formData.get("title") ?? ""),
-    });
+    }, "POST", { "idempotency-key": crypto.randomUUID() });
     setBusy(false);
     if (result.data) {
       setPolicyImport({ ...policyImport, status: "compiled", compiled_policy_pack_id: result.data.id });
@@ -69,7 +71,6 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
   }
 
   async function addManual(form: HTMLFormElement) {
-    if (!reviewer.trim()) return setMessage("Enter your reviewer identity first.");
     const formData = new FormData(form);
     const excerpt = String(formData.get("source_excerpt") ?? "").trim();
     const statement = String(formData.get("statement") ?? "").trim();
@@ -82,7 +83,6 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
     }
     setBusy(true);
     const result = await mutate<PolicyCandidate>(`/api/policy-imports/${policyImport.id}/candidates`, {
-      reviewer_id: reviewer,
       statement,
       source_excerpt: excerpt,
       locator: {
@@ -114,21 +114,36 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
 
   const disposed = candidates.filter((candidate) => candidate.status !== "pending").length;
   const ready = policyImport.status === "ready_to_compile";
+  const compiled = policyImport.status === "compiled";
 
   return (
     <>
-      <section className="review-toolbar panel">
-        <div><span>Review identity</span><input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="name@company.com" aria-label="Reviewer identity" /></div>
+      <section className={`review-toolbar panel${compiled ? " compiled" : ""}`}>
+        <div><span>Signed-in reviewer</span><input value={reviewerIdentity} readOnly aria-label="Reviewer identity" /></div>
         <div><span>Source verification</span><StateBadge state={policyImport.verification_status} /></div>
-        <button className="secondary-button" type="button" onClick={() => void verifySource("rejected")} disabled={busy}><X size={14} /> Reject source</button>
-        <button className="primary-button" type="button" onClick={() => void verifySource("verified")} disabled={busy}><FileCheck2 size={14} /> Verify source</button>
+        {!compiled && <button className="secondary-button" type="button" onClick={() => void verifySource("rejected")} disabled={busy}><X size={14} /> Reject source</button>}
+        {!compiled && <button className="primary-button" type="button" onClick={() => void verifySource("verified")} disabled={busy}><FileCheck2 size={14} /> Verify source</button>}
       </section>
 
       <section className="review-summary">
         <article><span>Coverage</span><strong>{policyImport.coverage.processed_chunks}/{policyImport.coverage.total_chunks}</strong><small>{policyImport.coverage.failed_chunks.length ? "Failed chunks block compilation" : "All extracted chunks accounted for"}</small></article>
         <article><span>Candidate decisions</span><strong>{disposed}/{candidates.length}</strong><small>Every candidate must be disposed</small></article>
-        <article><span>Compile gate</span><strong>{ready ? "Ready" : "Blocked"}</strong><small>{ready ? "All evidence gates passed" : "Verify source and complete review"}</small></article>
+        <article><span>Compile gate</span><strong>{compiled ? "Compiled" : ready ? "Ready" : "Blocked"}</strong><small>{compiled ? "Candidate decisions are frozen" : ready ? "All evidence gates passed" : "Verify source and complete review"}</small></article>
       </section>
+
+      {compiled && policyImport.compiled_policy_pack_id && (
+        <section className="panel compiled-policy-action">
+          <div><ShieldCheck size={20} /><div><strong>Candidate review is complete and immutable</strong><p>The resulting policy pack is {compiledPackStatus ?? "loading"}. Publish a draft pack to make its rules selectable for evaluations.</p></div></div>
+          {compiledPackStatus ? (
+            <PolicyPackActions
+              packId={policyImport.compiled_policy_pack_id}
+              status={compiledPackStatus}
+            />
+          ) : (
+            <span className="policy-action-message" role="status">Policy pack status is unavailable.</span>
+          )}
+        </section>
+      )}
 
       {policyImport.coverage.warnings.length > 0 && (
         <div className="boundary-callout"><ShieldCheck size={18} /><div><strong>Extraction disclosure</strong><p>{policyImport.coverage.warnings.join(" ")}</p></div></div>
@@ -137,24 +152,27 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
       <div className="candidate-stack">
         {candidates.map((candidate) => (
           <CandidateCard
-            key={`${candidate.id}:${candidate.updated_at}`}
+            key={candidate.id}
             candidate={candidate}
-            reviewer={reviewer}
-            disabled={busy || policyImport.status === "compiled"}
+            disabled={busy}
+            readOnly={compiled}
             onBusy={setBusy}
-            onDirty={() => setDirty(true)}
+            onDirty={() => setDirtyIds((current) => new Set(current).add(candidate.id))}
             onMessage={setMessage}
             onSaved={(saved) => {
               setCandidates((current) => current.map((item) => item.id === saved.id ? saved : item));
-              setDirty(false);
+              setDirtyIds((current) => {
+                const next = new Set(current);
+                next.delete(saved.id);
+                return next;
+              });
               void refreshImport();
-              router.refresh();
             }}
           />
         ))}
       </div>
 
-      <details className="panel manual-candidate">
+      {!compiled && <details className="panel manual-candidate">
         <summary><Plus size={15} /> Add a policy candidate missed by extraction</summary>
         <form onSubmit={(event) => { event.preventDefault(); void addManual(event.currentTarget); }}>
           <label className="field field-wide"><span>Policy statement</span><textarea name="statement" rows={3} required /></label>
@@ -166,9 +184,9 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
           <label className="field field-wide"><span>Deterministic rule JSON</span><textarea className="mono" name="suggested_rule" rows={9} defaultValue={JSON.stringify(DEFAULT_RULE, null, 2)} required /></label>
           <button className="secondary-button" type="submit" disabled={busy}><Plus size={14} /> Add approved candidate</button>
         </form>
-      </details>
+      </details>}
 
-      <form className="panel compile-panel" onSubmit={(event) => { event.preventDefault(); void compile(event.currentTarget); }}>
+      {!compiled && <form className="panel compile-panel" onSubmit={(event) => { event.preventDefault(); void compile(event.currentTarget); }}>
         <div><ShieldCheck size={21} /><div><h2>Compile approved candidates</h2><p>Creates a database-backed draft pack. Publishing remains a separate policy-owner action.</p></div></div>
         <label className="field"><span>Pack key</span><input name="key" required defaultValue={slug(policyImport.title)} /></label>
         <label className="field"><span>Version</span><input name="version" type="number" min="1" required defaultValue="1" /></label>
@@ -177,7 +195,7 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
           {busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
           {policyImport.status === "compiled" ? "Compiled" : "Compile draft pack"}
         </button>
-      </form>
+      </form>}
 
       <div className="boundary-callout review-boundary"><ShieldCheck size={18} /><div><strong>Suggestions are not published until human review and pack approval.</strong><p>Compilation creates a draft only. A policy owner must still use the existing pack approval step before any evaluation can select it.</p></div></div>
 
@@ -186,10 +204,10 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates }: { in
   );
 }
 
-function CandidateCard({ candidate, reviewer, disabled, onBusy, onDirty, onMessage, onSaved }: {
+function CandidateCard({ candidate, disabled, readOnly, onBusy, onDirty, onMessage, onSaved }: {
   candidate: PolicyCandidate;
-  reviewer: string;
   disabled: boolean;
+  readOnly: boolean;
   onBusy: (busy: boolean) => void;
   onDirty: () => void;
   onMessage: (message: string) => void;
@@ -234,7 +252,6 @@ function CandidateCard({ candidate, reviewer, disabled, onBusy, onDirty, onMessa
   }
 
   async function decide(decision: "approved" | "rejected") {
-    if (!reviewer.trim()) return onMessage("Enter your reviewer identity first.");
     let parsedRule: RuleSuggestion | null = null;
     if (rule.trim() && rule.trim() !== "null") {
       try {
@@ -246,7 +263,6 @@ function CandidateCard({ candidate, reviewer, disabled, onBusy, onDirty, onMessa
     onBusy(true);
     const result = await mutate<PolicyCandidate>(`/api/policy-imports/${candidate.policy_import_id}/candidates/${candidate.id}`, {
       decision,
-      reviewer_id: reviewer,
       notes,
       expected_updated_at: candidate.updated_at,
       candidate: {
@@ -269,7 +285,7 @@ function CandidateCard({ candidate, reviewer, disabled, onBusy, onDirty, onMessa
   }
 
   return (
-    <article className="panel candidate-card">
+    <article className={`panel candidate-card${readOnly ? " read-only" : ""}`}>
       <header>
         <div><span className="eyebrow">{candidate.key} · {candidate.origin}</span><StateBadge state={candidate.status} /></div>
         <span>{candidate.model_confidence === null ? "Human-added" : `${Math.round(candidate.model_confidence * 100)}% extraction confidence`}</span>
@@ -281,19 +297,24 @@ function CandidateCard({ candidate, reviewer, disabled, onBusy, onDirty, onMessa
         {sourceContext ? <pre>{sourceContext}</pre> : <p>{contextError || "Loading source context…"}</p>}
       </details>
       <div className="candidate-fields">
-        <label className="field field-wide"><span>Normalized policy statement</span><textarea rows={3} value={statement} onChange={(event) => { setStatement(event.target.value); onDirty(); }} /></label>
-        <label className="field"><span>Severity</span><select value={severity} onChange={(event) => { setSeverity(event.target.value as typeof severity); onDirty(); }}><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="advisory">Advisory</option></select></label>
-        <label className="field"><span>Rule mapping</span><select value={mappingStatus} onChange={(event) => { setMappingStatus(event.target.value as typeof mappingStatus); onDirty(); }}><option value="ready">Ready</option><option value="manual_required">Manual required</option><option value="unsupported">Unsupported</option></select></label>
-        <label className="field field-wide"><span>Required evidence</span><input value={evidence} onChange={(event) => { setEvidence(event.target.value); onDirty(); }} /></label>
-        <label className="field"><span>Trigger event</span><select value={triggerEvent} onChange={(event) => applyTypedRule(event.target.value, assertionKind, assertionEvent)}>{EVENT_TYPES.map((eventType) => <option key={eventType} value={eventType}>{eventType.replaceAll("_", " ")}</option>)}</select></label>
-        <label className="field"><span>Assertion</span><select value={assertionKind} onChange={(event) => applyTypedRule(triggerEvent, event.target.value, assertionEvent)}><option value="exists_before">Exists before</option><option value="absent">Absent</option><option value="max_count">Maximum count: 1</option><option value="terminal_state">Terminal state: completed</option></select></label>
-        {assertionKind !== "terminal_state" && <label className="field field-wide"><span>Assertion event</span><select value={assertionEvent} onChange={(event) => applyTypedRule(triggerEvent, assertionKind, event.target.value)}>{EVENT_TYPES.map((eventType) => <option key={eventType} value={eventType}>{eventType.replaceAll("_", " ")}</option>)}</select></label>}
-        <details className="field field-wide rule-json"><summary>Advanced deterministic rule JSON</summary><textarea className="mono" rows={8} value={rule} onChange={(event) => { setRule(event.target.value); onDirty(); }} /></details>
-        <label className="field field-wide"><span>Review notes</span><input value={notes} onChange={(event) => { setNotes(event.target.value); onDirty(); }} placeholder="Why this decision is supportable" /></label>
+        <label className="field field-wide"><span>Normalized policy statement</span><textarea rows={3} value={statement} readOnly={readOnly} onChange={(event) => { setStatement(event.target.value); onDirty(); }} /></label>
+        <label className="field"><span>Severity</span><select value={severity} disabled={readOnly} onChange={(event) => { setSeverity(event.target.value as typeof severity); onDirty(); }}><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="advisory">Advisory</option></select></label>
+        <label className="field"><span>Rule mapping</span><select value={mappingStatus} disabled={readOnly} onChange={(event) => { setMappingStatus(event.target.value as typeof mappingStatus); onDirty(); }}><option value="ready">Ready</option><option value="manual_required">Manual required</option><option value="unsupported">Unsupported</option></select></label>
+        <label className="field field-wide"><span>Required evidence</span><input value={evidence} readOnly={readOnly} onChange={(event) => { setEvidence(event.target.value); onDirty(); }} /></label>
+        <label className="field"><span>Trigger event</span><select value={triggerEvent} disabled={readOnly} onChange={(event) => applyTypedRule(event.target.value, assertionKind, assertionEvent)}>{EVENT_TYPES.map((eventType) => <option key={eventType} value={eventType}>{eventType.replaceAll("_", " ")}</option>)}</select></label>
+        <label className="field"><span>Assertion</span><select value={assertionKind} disabled={readOnly} onChange={(event) => applyTypedRule(triggerEvent, event.target.value, assertionEvent)}><option value="exists_before">Exists before</option><option value="absent">Absent</option><option value="max_count">Maximum count: 1</option><option value="terminal_state">Terminal state: completed</option></select></label>
+        {assertionKind !== "terminal_state" && <label className="field field-wide"><span>Assertion event</span><select value={assertionEvent} disabled={readOnly} onChange={(event) => applyTypedRule(triggerEvent, assertionKind, event.target.value)}>{EVENT_TYPES.map((eventType) => <option key={eventType} value={eventType}>{eventType.replaceAll("_", " ")}</option>)}</select></label>}
+        <details className="field field-wide rule-json"><summary>Advanced deterministic rule JSON</summary><textarea className="mono" rows={8} value={rule} readOnly={readOnly} onChange={(event) => { setRule(event.target.value); onDirty(); }} /></details>
+        <label className="field field-wide"><span>Review notes</span><input value={notes} readOnly={readOnly} onChange={(event) => { setNotes(event.target.value); onDirty(); }} placeholder="Why this decision is supportable" /></label>
       </div>
       <footer>
-        <button className="secondary-button" type="button" disabled={disabled} onClick={() => void decide("rejected")}><X size={14} /> Reject</button>
-        <button className="primary-button" type="button" disabled={disabled} onClick={() => void decide("approved")}><Check size={14} /> Approve</button>
+        <span className="candidate-save-state" role="status">
+          {candidate.review
+            ? `Saved as ${candidate.status} by ${candidate.review.reviewer_id}`
+            : "Not reviewed yet"}
+        </span>
+        {!readOnly && <button className="secondary-button" type="button" disabled={disabled} onClick={() => void decide("rejected")}><X size={14} /> Reject</button>}
+        {!readOnly && <button className="primary-button" type="button" disabled={disabled} onClick={() => void decide("approved")}><Check size={14} /> Approve</button>}
       </footer>
     </article>
   );
@@ -303,9 +324,9 @@ function SeveritySelect() {
   return <select name="severity" defaultValue="medium"><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="advisory">Advisory</option></select>;
 }
 
-async function mutate<T>(path: string, body: unknown, method = "POST"): Promise<{ data: T | null; error: string | null }> {
+async function mutate<T>(path: string, body: unknown, method = "POST", headers: Record<string, string> = {}): Promise<{ data: T | null; error: string | null }> {
   try {
-    const response = await fetch(path, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const response = await fetch(path, { method, headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
     const payload = (await response.json().catch(() => null)) as T | { detail?: string } | null;
     if (!response.ok) return { data: null, error: payload && typeof payload === "object" && "detail" in payload ? payload.detail ?? "Request failed." : `Request failed (${response.status})` };
     return { data: payload as T, error: null };

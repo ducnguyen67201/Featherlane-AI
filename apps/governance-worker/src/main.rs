@@ -42,7 +42,14 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = interval.tick() => {
-                let Some(job) = runs.claim_due(OffsetDateTime::now_utc(), lease_seconds).await? else {
+                let job = match runs.claim_due(OffsetDateTime::now_utc(), lease_seconds).await {
+                    Ok(job) => job,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to claim a durable evaluation job");
+                        continue;
+                    }
+                };
+                let Some(job) = job else {
                     continue;
                 };
                 let result = match job.kind.as_str() {
@@ -98,14 +105,18 @@ async fn main() -> anyhow::Result<()> {
                                                 i64::try_from(idle_seconds).unwrap_or(i64::MAX),
                                             );
                                         if deadline > OffsetDateTime::now_utc() {
-                                            runs.fail_job(
+                                            runs.reschedule_job(
                                                 job.id,
-                                                "idle deadline advanced",
+                                                job.attempts,
                                                 deadline,
-                                                false,
                                             )
                                             .await
-                                            .map(|()| JobOutcome::Rescheduled)
+                                            .map(|failure_recorded| {
+                                                if !failure_recorded {
+                                                    tracing::warn!(job_id = %job.id, attempts = job.attempts, "job lease was superseded before rescheduling");
+                                                }
+                                                JobOutcome::Rescheduled
+                                            })
                                         } else {
                                             CompleteEvaluationRun::new(
                                                 runs.clone(),
@@ -158,31 +169,62 @@ async fn main() -> anyhow::Result<()> {
                 };
                 match result {
                     Ok(JobOutcome::Complete) => {
-                        runs.complete_job(job.id, OffsetDateTime::now_utc()).await?;
+                        match runs
+                            .complete_job(job.id, job.attempts, OffsetDateTime::now_utc())
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => tracing::warn!(job_id = %job.id, attempts = job.attempts, "job lease was superseded before completion"),
+                            Err(error) => tracing::warn!(job_id = %job.id, error = %error, "failed to complete durable job"),
+                        }
                     }
                     Ok(JobOutcome::Rescheduled) => {}
                     Err(error) => {
                         let terminal = job.attempts >= max_attempts;
                         let backoff_seconds = 2_i64.pow(job.attempts.min(8));
-                        runs.fail_job(
-                            job.id,
-                            &error.to_string(),
-                            OffsetDateTime::now_utc() + Duration::seconds(backoff_seconds),
-                            terminal,
-                        )
-                        .await?;
-                        if terminal
-                            && let Some(mut run) = runs
-                                .get_run(job.organization_id, job.eval_run_id)
-                                .await?
-                            && !run.state.is_terminal()
+                        let failure_recorded = match runs
+                            .fail_job(
+                                job.id,
+                                job.attempts,
+                                &error.to_string(),
+                                OffsetDateTime::now_utc() + Duration::seconds(backoff_seconds),
+                                terminal,
+                            )
+                            .await
                         {
-                            run.transition_to(
+                            Ok(recorded) => recorded,
+                            Err(persistence_error) => {
+                                tracing::warn!(job_id = %job.id, error = %persistence_error, "failed to persist durable job failure");
+                                continue;
+                            }
+                        };
+                        if !failure_recorded {
+                            tracing::warn!(job_id = %job.id, attempts = job.attempts, "job lease was superseded before failure handling");
+                        }
+                        if failure_recorded && terminal {
+                            let run = match runs.get_run(job.organization_id, job.eval_run_id).await {
+                                Ok(run) => run,
+                                Err(persistence_error) => {
+                                    tracing::warn!(eval_run_id = %job.eval_run_id, error = %persistence_error, "failed to load run after terminal job failure");
+                                    continue;
+                                }
+                            };
+                            if let Some(mut run) = run && !run.state.is_terminal() {
+                            let expected_state = run.state;
+                            let expected_updated_at = run.updated_at;
+                            if let Err(transition) = run.transition_to(
                                 EvaluationRunState::Failed,
                                 OffsetDateTime::now_utc(),
-                            )
-                            .map_err(|transition| anyhow::anyhow!(transition.to_string()))?;
-                            runs.update_run(&run).await?;
+                            ) {
+                                tracing::warn!(eval_run_id = %run.id, error = %transition, "run rejected terminal failure transition");
+                            } else {
+                                match runs.update_run(&run, expected_state, expected_updated_at).await {
+                                    Ok(true) => {}
+                                    Ok(false) => tracing::warn!(eval_run_id = %run.id, "run changed while marking a terminal job failure"),
+                                    Err(persistence_error) => tracing::warn!(eval_run_id = %run.id, error = %persistence_error, "failed to persist terminal run failure"),
+                                }
+                            }
+                            }
                         }
                         tracing::warn!(
                             job_id = %job.id,

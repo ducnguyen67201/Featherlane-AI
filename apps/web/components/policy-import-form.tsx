@@ -46,11 +46,11 @@ export function PolicyImportForm() {
         return;
       }
     }
-    const effectiveFrom = data.get("effective_from");
-    if (typeof effectiveFrom === "string" && effectiveFrom) {
-      data.set("effective_from", new Date(effectiveFrom).toISOString());
-    }
     try {
+      const effectiveFrom = data.get("effective_from");
+      if (typeof effectiveFrom === "string" && effectiveFrom) {
+        data.set("effective_from", new Date(effectiveFrom).toISOString());
+      }
       const response = await fetch("/api/policy-imports", {
         method: "POST",
         headers: { "idempotency-key": crypto.randomUUID() },

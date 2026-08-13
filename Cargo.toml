@@ -50,7 +50,7 @@ docx-rs = { version = "0.4.22", default-features = false }
 base64 = "0.23.1"
 flate2 = "1.1.9"
 loco-rs = { version = "1.0.0", default-features = false, features = ["cli", "with-db", "worker"] }
-opendal = { version = "0.57.0", default-features = false, features = ["executors-tokio", "reqwest-rustls-tls", "services-memory", "services-s3"] }
+opendal = { version = "0.58.1", default-features = false, features = ["executors-tokio", "reqwest-rustls-tls", "services-memory", "services-s3"] }
 opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }
 pdf-extract = "0.12.0"
 prost = "0.14.4"

@@ -17,7 +17,7 @@ use governance_domain::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait, sea_query::OnConflict,
+    QueryOrder, QuerySelect, Set, TransactionTrait, sea_query::OnConflict,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -527,6 +527,7 @@ impl EvaluationRepository for SeaOrmEvaluationRepository {
         let existing = eval_runs::Entity::find()
             .filter(eval_runs::Column::OrganizationId.eq(organization_id.0))
             .filter(eval_runs::Column::Id.eq(summary.eval_run_id.0))
+            .lock_exclusive()
             .one(&transaction)
             .await
             .map_err(repository_error)?;
