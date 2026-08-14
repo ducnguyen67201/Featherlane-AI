@@ -12,9 +12,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use governance_application::{
-    ApplicationError, CandidateEdit, CompilePolicyImportCommand, CreatePolicyImport,
-    ManualCandidateCommand, NewPolicyImport, PolicyImportRepository, ReviewCandidateCommand,
-    SourceArtifactStore, VerifySourceCommand, add_manual_policy_candidate, compile_policy_import,
+    ApplicationError, AttachPolicyImportTransformation, AttachPolicyImportTransformationCommand,
+    CandidateEdit, CompilePolicyImportCommand, CreatePolicyImport, ManualCandidateCommand,
+    NewPolicyImport, PolicyImportRepository, ReviewCandidateCommand, SourceArtifactStore,
+    VerifySourceCommand, add_manual_policy_candidate, compile_policy_import,
     detect_document_format, refresh_import_readiness, review_policy_candidate,
 };
 use governance_config::PolicyImportConfig;
@@ -34,9 +35,9 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyImportServices {
-    config: PolicyImportConfig,
-    artifacts: OpenDalArtifactStore,
-    model: ConfiguredPolicyExtractionModel,
+    pub(crate) config: PolicyImportConfig,
+    pub(crate) artifacts: OpenDalArtifactStore,
+    pub(crate) model: ConfiguredPolicyExtractionModel,
 }
 
 impl PolicyImportServices {
@@ -144,6 +145,13 @@ pub struct PolicyImportView {
     pub detected_mime_type: String,
     pub byte_length: u64,
     pub content_sha256: String,
+    pub processing_content_sha256: String,
+    pub processing_mime_type: String,
+    pub active_transformation_id: Option<governance_domain::PolicyImportTransformationId>,
+    pub transformations: Vec<governance_domain::PolicyImportTransformation>,
+    pub ingestion_item_id: Option<governance_domain::SourceIngestionItemId>,
+    pub source_subscription_id: Option<governance_domain::SourceSubscriptionId>,
+    pub external_revision: Option<String>,
     pub parser_kind: Option<String>,
     pub parser_version: Option<String>,
     pub model_provider: Option<String>,
@@ -188,6 +196,13 @@ impl From<PolicyImport> for PolicyImportView {
             detected_mime_type: import.detected_mime_type,
             byte_length: import.byte_length,
             content_sha256: import.content_sha256,
+            processing_content_sha256: import.processing_content_sha256,
+            processing_mime_type: import.processing_mime_type,
+            active_transformation_id: import.active_transformation_id,
+            transformations: Vec::new(),
+            ingestion_item_id: import.ingestion_item_id,
+            source_subscription_id: import.source_subscription_id,
+            external_revision: import.external_revision,
             parser_kind: import.parser_kind,
             parser_version: import.parser_version,
             model_provider: import.model_provider,
@@ -470,7 +485,17 @@ pub async fn get_policy_import(
     };
     let repository = SeaOrmPolicyImportRepository::new(context.db.clone());
     match repository.get(crate::default_organization_id(), id).await {
-        Ok(Some(import)) => Json(PolicyImportView::from(import)).into_response(),
+        Ok(Some(import)) => {
+            let mut view = PolicyImportView::from(import);
+            view.transformations = match repository
+                .list_transformations(crate::default_organization_id(), id)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return application_error(error),
+            };
+            Json(view).into_response()
+        }
         Ok(None) => problem(StatusCode::NOT_FOUND, "policy import was not found"),
         Err(error) => application_error(error),
     }
@@ -704,6 +729,109 @@ pub async fn retry_policy_import(
     (StatusCode::ACCEPTED, Json(PolicyImportView::from(import))).into_response()
 }
 
+pub async fn attach_ocr_source(
+    State(context): State<AppContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let Some(id) = parse_import_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid policy import identifier");
+    };
+    let connector_config = match context
+        .shared_store
+        .get::<governance_config::SourceConnectorConfig>()
+    {
+        Some(config) => config,
+        None => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector services are unavailable",
+            );
+        }
+    };
+    let actor = match crate::console_auth::authenticate(&headers, &connector_config) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let services = match services(&context) {
+        Ok(services) => services,
+        Err(error) => return application_error(error),
+    };
+    let mut file = None;
+    while let Ok(Some(mut field)) = multipart.next_field().await {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let declared = field.content_type().map(ToOwned::to_owned);
+        let mut bytes = Vec::new();
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk))
+                    if bytes.len().saturating_add(chunk.len()) <= services.config.max_bytes =>
+                {
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(Some(_)) => {
+                    return problem(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "OCR source exceeds the import limit",
+                    );
+                }
+                Ok(None) => break,
+                Err(_) => return problem(StatusCode::BAD_REQUEST, "OCR source upload is invalid"),
+            }
+        }
+        file = Some((bytes, declared));
+    }
+    let Some((content, declared)) = file else {
+        return problem(StatusCode::BAD_REQUEST, "one OCR source file is required");
+    };
+    let (_, detected_mime_type) = match detect_document_format(&content) {
+        Ok(value) => value,
+        Err(error) => return application_error(error),
+    };
+    let repository = SeaOrmPolicyImportRepository::new(context.db.clone());
+    let import = match AttachPolicyImportTransformation::new(repository.clone(), services.artifacts)
+        .execute(AttachPolicyImportTransformationCommand {
+            organization_id: crate::default_organization_id(),
+            policy_import_id: id,
+            mime_type: declared.unwrap_or_else(|| detected_mime_type.to_owned()),
+            content,
+            actor_id: actor.id,
+        })
+        .await
+    {
+        Ok(import) => import,
+        Err(error) => return application_error(error),
+    };
+    if ProcessPolicyImportWorker::perform_later(
+        &context,
+        ProcessPolicyImportArgs {
+            organization_id: import.organization_id,
+            policy_import_id: import.id,
+        },
+    )
+    .await
+    .is_err()
+    {
+        let _ = repository
+            .mark_failure(
+                import.organization_id,
+                import.id,
+                PolicyImportStatus::FailedRetryable,
+                "queue_unavailable",
+                "the extraction queue is temporarily unavailable",
+            )
+            .await;
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the extraction queue is unavailable",
+        );
+    }
+    (StatusCode::ACCEPTED, Json(PolicyImportView::from(import))).into_response()
+}
+
 pub async fn compile_import(
     State(context): State<AppContext>,
     Path(id): Path<String>,
@@ -867,7 +995,7 @@ fn sanitize_filename(filename: &str) -> String {
     }
 }
 
-fn application_error(error: governance_application::ApplicationError) -> Response {
+pub(crate) fn application_error(error: governance_application::ApplicationError) -> Response {
     let status = match &error {
         governance_application::ApplicationError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         governance_application::ApplicationError::Conflict(_) => StatusCode::CONFLICT,

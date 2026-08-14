@@ -5,8 +5,10 @@ import { getEventTypes, getPolicyCandidates, getPolicyImport, getPolicyPack } fr
 import { requireSession } from "@/lib/session";
 import { PageHeader } from "@/components/ui";
 
-export default async function PolicyReviewPage({ params }: { params: Promise<{ id: string }> }) {
+export default async function PolicyReviewPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ collection?: string | string[] }> }) {
   const { id } = await params;
+  const query = await searchParams;
+  const collectionId = Array.isArray(query.collection) ? query.collection[0] : query.collection;
   const session = await requireSession();
   const [importResult, candidateResult, eventTypes] = await Promise.all([
     getPolicyImport(id),
@@ -39,6 +41,7 @@ export default async function PolicyReviewPage({ params }: { params: Promise<{ i
           reviewerIdentity={session.user.email || session.user.id}
           compiledPackStatus={compiledPack?.status ?? null}
           eventTypes={eventTypes}
+          collectionId={collectionId}
         />
       ) : (
         <section className="panel policy-empty"><h2>Review workspace unavailable</h2><p>{importResult.error ?? candidateResult.error}</p></section>

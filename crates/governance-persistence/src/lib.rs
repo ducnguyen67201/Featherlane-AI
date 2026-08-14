@@ -3,11 +3,20 @@
 pub mod entities;
 mod evaluation_runs;
 mod live_evaluations;
+mod policy_collections;
 mod policy_imports;
+mod source_connections;
+mod source_ingestion;
 
 pub use evaluation_runs::SeaOrmEvaluationRunRepository;
 pub use live_evaluations::SeaOrmEvaluationRepository;
+pub use policy_collections::SeaOrmPolicyCollectionRepository;
 pub use policy_imports::SeaOrmPolicyImportRepository;
+pub use source_connections::{
+    NewOAuthState, NewSourceSubscription, NewStoredConnection, SeaOrmSourceConnectionRepository,
+    StoredEncryptedCredential,
+};
+pub use source_ingestion::SeaOrmSourceIngestionRepository;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -657,20 +666,33 @@ async fn insert_sources<C: ConnectionTrait>(
 ) -> Result<(), ApplicationError> {
     for source in &bundle.sources {
         let payload = serde_json::to_value(source).map_err(serialization_error)?;
-        sources::ActiveModel {
-            id: Set(source.id.0),
-            organization_id: Set(source.organization_id.0),
-            source_type: Set(enum_string(source.source_type)?),
-            title: Set(source.title.clone()),
-            jurisdiction: Set(source.jurisdiction.clone()),
-            content_sha256: Set(source.content_sha256.clone()),
-            confidence: Set(enum_string(source.confidence)?),
-            payload: Set(payload),
-            created_at: Set(OffsetDateTime::now_utc()),
+        if let Some(existing) = sources::Entity::find_by_id(source.id.0)
+            .one(connection)
+            .await
+            .map_err(repository_error)?
+        {
+            if existing.organization_id != source.organization_id.0 || existing.payload != payload {
+                return Err(ApplicationError::Conflict(format!(
+                    "source {} already exists with different immutable content",
+                    source.id
+                )));
+            }
+        } else {
+            sources::ActiveModel {
+                id: Set(source.id.0),
+                organization_id: Set(source.organization_id.0),
+                source_type: Set(enum_string(source.source_type)?),
+                title: Set(source.title.clone()),
+                jurisdiction: Set(source.jurisdiction.clone()),
+                content_sha256: Set(source.content_sha256.clone()),
+                confidence: Set(enum_string(source.confidence)?),
+                payload: Set(payload),
+                created_at: Set(OffsetDateTime::now_utc()),
+            }
+            .insert(connection)
+            .await
+            .map_err(repository_error)?;
         }
-        .insert(connection)
-        .await
-        .map_err(repository_error)?;
         policy_pack_sources::ActiveModel {
             policy_pack_id: Set(bundle.pack.id.0),
             source_id: Set(source.id.0),

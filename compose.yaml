@@ -34,6 +34,16 @@ services:
       POLICY_LLM_ENABLED: "true"
       POLICY_LLM_PROVIDER: heuristic
       POLICY_LLM_PROMPT_VERSION: policy-extract-v1
+      GOVERNANCE_CONSOLE_API_KEY: ${GOVERNANCE_CONSOLE_API_KEY:?Set GOVERNANCE_CONSOLE_API_KEY in .env}
+      SOURCE_CONNECTOR_ACTIVE_KEY_VERSION: ${SOURCE_CONNECTOR_ACTIVE_KEY_VERSION:?Set SOURCE_CONNECTOR_ACTIVE_KEY_VERSION in .env}
+      SOURCE_CONNECTOR_ENCRYPTION_KEY_V1: ${SOURCE_CONNECTOR_ENCRYPTION_KEY_V1:?Set SOURCE_CONNECTOR_ENCRYPTION_KEY_V1 in .env}
+      SOURCE_CONNECTOR_CALLBACK_BASE_URL: ${SOURCE_CONNECTOR_CALLBACK_BASE_URL:-http://localhost:3000}
+      GOOGLE_DRIVE_CLIENT_ID: ${GOOGLE_DRIVE_CLIENT_ID:-}
+      GOOGLE_DRIVE_CLIENT_SECRET: ${GOOGLE_DRIVE_CLIENT_SECRET:-}
+      MICROSOFT_GRAPH_CLIENT_ID: ${MICROSOFT_GRAPH_CLIENT_ID:-}
+      MICROSOFT_GRAPH_CLIENT_SECRET: ${MICROSOFT_GRAPH_CLIENT_SECRET:-}
+      NOTION_CLIENT_ID: ${NOTION_CLIENT_ID:-}
+      NOTION_CLIENT_SECRET: ${NOTION_CLIENT_SECRET:-}
       PORT: "8080"
       RUST_LOG: info
     depends_on:
@@ -41,7 +51,7 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
-    ports: ["8080:8080"]
+    ports: ["${GOVERNANCE_API_PORT:-8080}:8080"]
 
   telemetry-gateway:
     build:
@@ -57,7 +67,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    ports: ["4318:4318"]
+    ports: ["${TELEMETRY_GATEWAY_PORT:-4318}:4318"]
 
   governance-worker:
     build:
@@ -68,6 +78,22 @@ services:
         RUST_BINARY: governance-worker
     environment:
       DATABASE_URL: postgres://featherlane:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/featherlane
+      OBJECT_STORE_URL: http://minio:9000
+      OBJECT_STORE_BUCKET: featherlane
+      OBJECT_STORE_REGION: us-east-1
+      OBJECT_STORE_ACCESS_KEY_ID: ${OBJECT_STORE_ACCESS_KEY_ID:?Set OBJECT_STORE_ACCESS_KEY_ID in .env}
+      OBJECT_STORE_SECRET_ACCESS_KEY: ${OBJECT_STORE_SECRET_ACCESS_KEY:?Set OBJECT_STORE_SECRET_ACCESS_KEY in .env}
+      POLICY_LLM_ENABLED: "true"
+      POLICY_LLM_PROVIDER: heuristic
+      POLICY_LLM_PROMPT_VERSION: policy-extract-v1
+      SOURCE_CONNECTOR_ACTIVE_KEY_VERSION: ${SOURCE_CONNECTOR_ACTIVE_KEY_VERSION:?Set SOURCE_CONNECTOR_ACTIVE_KEY_VERSION in .env}
+      SOURCE_CONNECTOR_ENCRYPTION_KEY_V1: ${SOURCE_CONNECTOR_ENCRYPTION_KEY_V1:?Set SOURCE_CONNECTOR_ENCRYPTION_KEY_V1 in .env}
+      GOOGLE_DRIVE_CLIENT_ID: ${GOOGLE_DRIVE_CLIENT_ID:-}
+      GOOGLE_DRIVE_CLIENT_SECRET: ${GOOGLE_DRIVE_CLIENT_SECRET:-}
+      MICROSOFT_GRAPH_CLIENT_ID: ${MICROSOFT_GRAPH_CLIENT_ID:-}
+      MICROSOFT_GRAPH_CLIENT_SECRET: ${MICROSOFT_GRAPH_CLIENT_SECRET:-}
+      NOTION_CLIENT_ID: ${NOTION_CLIENT_ID:-}
+      NOTION_CLIENT_SECRET: ${NOTION_CLIENT_SECRET:-}
       RUST_LOG: info
     depends_on:
       postgres:
@@ -82,7 +108,7 @@ services:
         RUST_BINARY: governance-sandbox
     environment:
       GOVERNANCE_SANDBOX_ADDR: 0.0.0.0:8090
-    ports: ["8090:8090"]
+    ports: ["${SANDBOX_PORT:-8090}:8090"]
 
   refund-agent:
     build:
@@ -91,7 +117,7 @@ services:
       args:
         RUST_PACKAGE: refund-agent
         RUST_BINARY: refund-agent
-    ports: ["8091:8091"]
+    ports: ["${REFUND_AGENT_PORT:-8091}:8091"]
 
   web:
     build:
@@ -100,6 +126,8 @@ services:
       args:
         BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
         GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?Set GOOGLE_CLIENT_ID in .env}
+        NEXT_PUBLIC_GOOGLE_PICKER_API_KEY: ${NEXT_PUBLIC_GOOGLE_PICKER_API_KEY:-}
+        NEXT_PUBLIC_GOOGLE_PICKER_APP_ID: ${NEXT_PUBLIC_GOOGLE_PICKER_APP_ID:-}
       secrets:
         - better_auth_secret
         - google_client_secret
@@ -109,8 +137,11 @@ services:
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in .env}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?Set GOOGLE_CLIENT_ID in .env}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?Set GOOGLE_CLIENT_SECRET in .env}
+      GOVERNANCE_CONSOLE_API_KEY: ${GOVERNANCE_CONSOLE_API_KEY:?Set GOVERNANCE_CONSOLE_API_KEY in .env}
+      NEXT_PUBLIC_GOOGLE_PICKER_API_KEY: ${NEXT_PUBLIC_GOOGLE_PICKER_API_KEY:-}
+      NEXT_PUBLIC_GOOGLE_PICKER_APP_ID: ${NEXT_PUBLIC_GOOGLE_PICKER_APP_ID:-}
     depends_on: [governance-api]
-    ports: ["3000:3000"]
+    ports: ["${WEB_PORT:-3000}:3000"]
 
   minio:
     image: minio/minio:RELEASE.2025-07-23T15-54-02Z
@@ -118,7 +149,9 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
-    ports: ["9000:9000", "9001:9001"]
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes: ["minio-data:/data"]
 
   minio-init:

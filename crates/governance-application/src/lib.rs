@@ -20,10 +20,14 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 mod evaluation_runs;
+mod policy_collections;
 mod policy_import;
+mod source_acquisition;
 
 pub use evaluation_runs::*;
+pub use policy_collections::*;
 pub use policy_import::*;
+pub use source_acquisition::*;
 
 #[derive(Debug, Error)]
 pub enum ApplicationError {

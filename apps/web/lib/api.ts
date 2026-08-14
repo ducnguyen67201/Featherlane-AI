@@ -11,6 +11,10 @@ import {
   type PolicyPackDetail,
   type PolicyCandidate,
   type PolicyImport,
+  type PolicyCollection,
+  type PolicyCollectionDetail,
+  type PolicyCollectionReadiness,
+  type SourceConnection,
 } from "./types";
 import * as seed from "./seed";
 import { requireSession } from "./session";
@@ -117,4 +121,40 @@ export function getPolicyImport(id: string): Promise<{ data: PolicyImport | null
 
 export function getPolicyCandidates(id: string): Promise<{ data: PolicyCandidate[] | null; error: string | null }> {
   return getLiveJson(`/v1/policy-imports/${encodeURIComponent(id)}/candidates`);
+}
+
+async function getConsoleJson<T>(path: string): Promise<{ data: T | null; error: string | null }> {
+  const session = await requireSession();
+  const consoleKey = process.env.GOVERNANCE_CONSOLE_API_KEY;
+  if (!consoleKey) return { data: null, error: "The governance console boundary is not configured." };
+  try {
+    const response = await fetch(`${API_URL}${path}`, {
+      headers: {
+        "x-featherlane-console-key": consoleKey,
+        "x-featherlane-actor-id": session.user.email?.trim() || session.user.id,
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!response.ok) return { data: null, error: `Governance API returned ${response.status}` };
+    return { data: (await response.json()) as T, error: null };
+  } catch {
+    return { data: null, error: "The governance API is unavailable." };
+  }
+}
+
+export function getPolicyCollections() {
+  return getConsoleJson<PolicyCollection[]>("/v1/policy-collections");
+}
+
+export function getPolicyCollection(id: string) {
+  return getConsoleJson<PolicyCollectionDetail>(`/v1/policy-collections/${encodeURIComponent(id)}`);
+}
+
+export function getPolicyCollectionReadiness(id: string) {
+  return getConsoleJson<PolicyCollectionReadiness>(`/v1/policy-collections/${encodeURIComponent(id)}/readiness`);
+}
+
+export function getSourceConnections() {
+  return getConsoleJson<SourceConnection[]>("/v1/source-connections");
 }

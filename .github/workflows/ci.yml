@@ -76,4 +76,35 @@ jobs:
           echo "MINIO_ROOT_PASSWORD=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
           echo "OBJECT_STORE_ACCESS_KEY_ID=ci-featherlane-service" >> "$GITHUB_ENV"
           echo "OBJECT_STORE_SECRET_ACCESS_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "GOVERNANCE_CONSOLE_API_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "SOURCE_CONNECTOR_ACTIVE_KEY_VERSION=1" >> "$GITHUB_ENV"
+          echo "SOURCE_CONNECTOR_ENCRYPTION_KEY_V1=$(openssl rand -base64 32 | tr -d '\n')" >> "$GITHUB_ENV"
       - run: docker compose config --quiet
+
+  ingestion-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure ephemeral stack secrets
+        run: |
+          echo "BETTER_AUTH_URL=http://localhost:3000" >> "$GITHUB_ENV"
+          echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "GOOGLE_CLIENT_ID=ci-build-only.apps.googleusercontent.com" >> "$GITHUB_ENV"
+          echo "GOOGLE_CLIENT_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "MINIO_ROOT_USER=ci-minio-admin" >> "$GITHUB_ENV"
+          echo "MINIO_ROOT_PASSWORD=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "OBJECT_STORE_ACCESS_KEY_ID=ci-featherlane-service" >> "$GITHUB_ENV"
+          echo "OBJECT_STORE_SECRET_ACCESS_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "GOVERNANCE_CONSOLE_API_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "SOURCE_CONNECTOR_ACTIVE_KEY_VERSION=1" >> "$GITHUB_ENV"
+          echo "SOURCE_CONNECTOR_ENCRYPTION_KEY_V1=$(openssl rand -base64 32 | tr -d '\n')" >> "$GITHUB_ENV"
+      - run: docker compose up --build -d postgres minio minio-init governance-api governance-worker telemetry-gateway refund-agent
+      - run: |
+          for attempt in $(seq 1 90); do curl --fail --silent http://localhost:8080/health >/dev/null && exit 0; sleep 2; done
+          exit 1
+      - run: ./scripts/smoke-ingestion-to-evaluation.sh
+      - if: failure()
+        run: docker compose logs --no-color governance-api governance-worker telemetry-gateway
+      - if: always()
+        run: docker compose down -v

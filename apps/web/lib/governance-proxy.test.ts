@@ -12,6 +12,7 @@ describe("governance proxy", () => {
     getCurrentSession.mockReset();
     fetchMock.mockReset();
     vi.stubGlobal("fetch", fetchMock);
+    vi.stubEnv("GOVERNANCE_CONSOLE_API_KEY", "server-console-key");
   });
 
   it("rejects unauthenticated requests before reading their body", async () => {
@@ -50,6 +51,28 @@ describe("governance proxy", () => {
     expect((init as RequestInit & { duplex?: string })?.duplex).toBe("half");
     expect(response.status).toBe(201);
     expect(response.headers.get("location")).toBe("/v1/policy-imports/import-1");
+  });
+
+  it("replaces spoofed internal identity and preserves safe response controls", async () => {
+    getCurrentSession.mockResolvedValue({ user: { id: "user-1", email: "owner@example.com" } });
+    fetchMock.mockResolvedValue(new Response("{}", {
+      status: 429,
+      headers: { "cache-control": "no-store", "retry-after": "12" },
+    }));
+    const request = new Request("http://localhost/api/source-connections", {
+      headers: {
+        "x-featherlane-console-key": "browser-spoof",
+        "x-featherlane-actor-id": "attacker@example.com",
+      },
+    });
+
+    const response = await proxyGovernanceRequest(request, "/v1/source-connections");
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+
+    expect(headers.get("x-featherlane-console-key")).toBe("server-console-key");
+    expect(headers.get("x-featherlane-actor-id")).toBe("owner@example.com");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("retry-after")).toBe("12");
   });
 
   it("reports an unknown mutation outcome when the upstream is unavailable", async () => {

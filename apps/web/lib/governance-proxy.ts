@@ -6,7 +6,8 @@ import { getCurrentSession } from "./session";
 const API_URL = process.env.GOVERNANCE_API_URL ?? "http://127.0.0.1:8080";
 
 export async function proxyGovernanceRequest(request: Request, path: string, method = request.method) {
-  if (!await getCurrentSession()) {
+  const session = await getCurrentSession();
+  if (!session) {
     return NextResponse.json({ detail: "Authentication required." }, { status: 401 });
   }
   try {
@@ -15,6 +16,12 @@ export async function proxyGovernanceRequest(request: Request, path: string, met
     const idempotencyKey = request.headers.get("idempotency-key");
     if (contentType) headers.set("content-type", contentType);
     if (idempotencyKey) headers.set("idempotency-key", idempotencyKey);
+    const consoleKey = process.env.GOVERNANCE_CONSOLE_API_KEY;
+    if (consoleKey) headers.set("x-featherlane-console-key", consoleKey);
+    headers.set(
+      "x-featherlane-actor-id",
+      session.user.email?.trim() || session.user.id,
+    );
     const body = method === "GET" || method === "HEAD" ? undefined : request.body;
     const init: RequestInit & { duplex?: "half" } = {
       method,
@@ -29,6 +36,10 @@ export async function proxyGovernanceRequest(request: Request, path: string, met
     responseHeaders.set("content-type", response.headers.get("content-type") ?? "application/json");
     const location = response.headers.get("location");
     if (location) responseHeaders.set("location", location);
+    const cacheControl = response.headers.get("cache-control");
+    if (cacheControl) responseHeaders.set("cache-control", cacheControl);
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter) responseHeaders.set("retry-after", retryAfter);
     return new NextResponse(await response.arrayBuffer(), {
       status: response.status,
       headers: responseHeaders,

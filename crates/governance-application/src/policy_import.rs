@@ -6,9 +6,11 @@ use governance_domain::{
     MissingEvidencePolicy, Obligation, ObligationId, OrganizationId, ParsedDocument, PolicyBundle,
     PolicyCandidate, PolicyCandidateId, PolicyCandidateOrigin, PolicyCandidateReviewId,
     PolicyCandidateReviewRecord, PolicyCandidateStatus, PolicyImport, PolicyImportCoverage,
-    PolicyImportId, PolicyImportReadiness, PolicyImportStatus, PolicyPack, PolicySourceId,
+    PolicyImportId, PolicyImportReadiness, PolicyImportStatus, PolicyImportTransformation,
+    PolicyImportTransformationId, PolicyImportTransformationKind, PolicyPack, PolicySourceId,
     ReviewStatus, ReviewerApproval, RuleMappingStatus, RuleSuggestion, Severity, Source,
-    SourceConfidence, SourceId, SourceLocator, SourceType, SourceVerificationStatus,
+    SourceConfidence, SourceId, SourceIngestionItemId, SourceLocator, SourceSubscriptionId,
+    SourceType, SourceVerificationStatus,
 };
 use governance_policy::{PolicyDocument, compile_policy_document};
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,42 @@ pub struct NewPolicyImport {
     pub content: Vec<u8>,
     pub idempotency_key: Option<String>,
     pub supersedes_import_id: Option<PolicyImportId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedPolicyArtifactInput {
+    pub kind: PolicyImportTransformationKind,
+    pub processor: String,
+    pub processor_version: String,
+    pub mime_type: String,
+    pub content: Vec<u8>,
+    pub metadata: Value,
+    pub created_by: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PolicyImportAcquisition {
+    pub ingestion_item_id: Option<SourceIngestionItemId>,
+    pub source_subscription_id: Option<SourceSubscriptionId>,
+    pub external_revision: Option<String>,
+    pub external_modified_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PolicyImportTransformationRecord {
+    pub transformation: PolicyImportTransformation,
+    pub input_object_key: String,
+    pub output_object_key: String,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachPolicyImportTransformationCommand {
+    pub organization_id: OrganizationId,
+    pub policy_import_id: PolicyImportId,
+    pub mime_type: String,
+    pub content: Vec<u8>,
+    pub actor_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,11 +135,26 @@ pub struct CompilePolicyImportCommand {
 #[async_trait]
 pub trait PolicyImportRepository: Send + Sync {
     async fn create(&self, import: &PolicyImport) -> Result<PolicyImport, ApplicationError>;
+    async fn create_with_transformation(
+        &self,
+        import: &PolicyImport,
+        transformation: &PolicyImportTransformationRecord,
+    ) -> Result<PolicyImport, ApplicationError> {
+        let _ = transformation;
+        self.create(import).await
+    }
     async fn get(
         &self,
         organization_id: OrganizationId,
         id: PolicyImportId,
     ) -> Result<Option<PolicyImport>, ApplicationError>;
+    async fn list_transformations(
+        &self,
+        _organization_id: OrganizationId,
+        _id: PolicyImportId,
+    ) -> Result<Vec<PolicyImportTransformation>, ApplicationError> {
+        Ok(Vec::new())
+    }
     async fn list(
         &self,
         organization_id: OrganizationId,
@@ -182,6 +235,15 @@ pub trait PolicyImportRepository: Send + Sync {
         organization_id: OrganizationId,
         import_id: PolicyImportId,
     ) -> Result<Option<PolicyPack>, ApplicationError>;
+    async fn activate_transformation(
+        &self,
+        record: &PolicyImportTransformationRecord,
+    ) -> Result<PolicyImport, ApplicationError> {
+        let _ = record;
+        Err(ApplicationError::Unavailable(
+            "policy import transformations are not supported by this repository".to_owned(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -224,6 +286,16 @@ where
     }
 
     pub async fn execute(&self, input: NewPolicyImport) -> Result<PolicyImport, ApplicationError> {
+        self.execute_prepared(input, None, PolicyImportAcquisition::default())
+            .await
+    }
+
+    pub async fn execute_prepared(
+        &self,
+        input: NewPolicyImport,
+        prepared: Option<PreparedPolicyArtifactInput>,
+        acquisition: PolicyImportAcquisition,
+    ) -> Result<PolicyImport, ApplicationError> {
         validate_new_import(&input)?;
         let id = PolicyImportId::new();
         let content_sha256 = sha256_hex(&input.content);
@@ -251,6 +323,54 @@ where
             "organizations/{}/policy-imports/{}/raw/{}",
             input.organization_id, id, content_sha256
         );
+        let (processing_object_key, processing_content_sha256, processing_mime_type, record) =
+            if let Some(prepared) = prepared {
+                if prepared.content.is_empty() {
+                    return Err(ApplicationError::InvalidRequest(
+                        "prepared policy source cannot be empty".to_owned(),
+                    ));
+                }
+                let output_sha256 = sha256_hex(&prepared.content);
+                let output_object_key = format!(
+                    "organizations/{}/policy-imports/{}/transformations/{}",
+                    input.organization_id, id, output_sha256
+                );
+                let transformation = PolicyImportTransformation {
+                    id: PolicyImportTransformationId::new(),
+                    organization_id: input.organization_id,
+                    policy_import_id: id,
+                    kind: prepared.kind,
+                    input_sha256: content_sha256.clone(),
+                    output_sha256: output_sha256.clone(),
+                    output_mime_type: prepared.mime_type.clone(),
+                    processor: prepared.processor,
+                    processor_version: prepared.processor_version,
+                    created_by: prepared.created_by,
+                    created_at: OffsetDateTime::now_utc(),
+                };
+                let record = PolicyImportTransformationRecord {
+                    transformation,
+                    input_object_key: raw_object_key.clone(),
+                    output_object_key: output_object_key.clone(),
+                    metadata: prepared.metadata,
+                };
+                self.artifacts
+                    .put(&output_object_key, prepared.content)
+                    .await?;
+                (
+                    output_object_key,
+                    output_sha256,
+                    prepared.mime_type,
+                    Some(record),
+                )
+            } else {
+                (
+                    raw_object_key.clone(),
+                    content_sha256.clone(),
+                    input.detected_mime_type.clone(),
+                    None,
+                )
+            };
         let now = OffsetDateTime::now_utc();
         let import = PolicyImport {
             id,
@@ -271,6 +391,14 @@ where
             byte_length: u64::try_from(input.content.len()).unwrap_or(u64::MAX),
             content_sha256,
             raw_object_key: raw_object_key.clone(),
+            processing_object_key,
+            processing_content_sha256,
+            processing_mime_type,
+            active_transformation_id: record.as_ref().map(|record| record.transformation.id),
+            ingestion_item_id: acquisition.ingestion_item_id,
+            source_subscription_id: acquisition.source_subscription_id,
+            external_revision: acquisition.external_revision,
+            external_modified_at: acquisition.external_modified_at,
             normalized_object_key: None,
             parser_kind: None,
             parser_version: None,
@@ -293,7 +421,13 @@ where
             updated_at: now,
             completed_at: None,
         };
-        self.repository.create(&import).await?;
+        if let Some(record) = record.as_ref() {
+            self.repository
+                .create_with_transformation(&import, record)
+                .await?;
+        } else {
+            self.repository.create(&import).await?;
+        }
         if let Err(error) = self.artifacts.put(&raw_object_key, input.content).await {
             let _ = self
                 .repository
@@ -386,7 +520,7 @@ where
                 PolicyImportStatus::Parsing,
             )
             .await?;
-        let raw = match self.artifacts.get(&import.raw_object_key).await {
+        let raw = match self.artifacts.get(&import.processing_object_key).await {
             Ok(raw) => raw,
             Err(error) => {
                 let (status, code, detail) = if matches!(error, ApplicationError::NotFound(_)) {
@@ -409,7 +543,7 @@ where
                 return Err(error);
             }
         };
-        if sha256_hex(&raw) != import.content_sha256 {
+        if sha256_hex(&raw) != import.processing_content_sha256 {
             return self
                 .repository
                 .mark_failure(
@@ -426,7 +560,7 @@ where
                     ))
                 });
         }
-        let document = match self.parser.parse(&import.detected_mime_type, raw).await {
+        let document = match self.parser.parse(&import.processing_mime_type, raw).await {
             Ok(document) => document,
             Err(ApplicationError::InvalidRequest(detail)) if detail.starts_with("needs_ocr") => {
                 return self
@@ -553,7 +687,7 @@ pub async fn refresh_import_readiness<R: PolicyImportRepository>(
         .list_candidates(organization_id, import_id)
         .await?;
     let readiness = PolicyImportReadiness::calculate(&import, &candidates);
-    let status = if readiness.is_ready() {
+    let status = if readiness.review_complete() {
         PolicyImportStatus::ReadyToCompile
     } else {
         PolicyImportStatus::ReviewRequired
@@ -561,6 +695,86 @@ pub async fn refresh_import_readiness<R: PolicyImportRepository>(
     repository
         .set_review_state(organization_id, import_id, status)
         .await
+}
+
+#[derive(Debug)]
+pub struct AttachPolicyImportTransformation<R, S> {
+    repository: R,
+    artifacts: S,
+}
+
+impl<R, S> AttachPolicyImportTransformation<R, S>
+where
+    R: PolicyImportRepository,
+    S: SourceArtifactStore,
+{
+    pub fn new(repository: R, artifacts: S) -> Self {
+        Self {
+            repository,
+            artifacts,
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        command: AttachPolicyImportTransformationCommand,
+    ) -> Result<PolicyImport, ApplicationError> {
+        if command.actor_id.trim().is_empty() || command.content.is_empty() {
+            return Err(ApplicationError::InvalidRequest(
+                "OCR source and actor are required".to_owned(),
+            ));
+        }
+        if !matches!(
+            command.mime_type.as_str(),
+            "application/pdf"
+                | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                | "text/plain"
+                | "text/markdown"
+        ) {
+            return Err(ApplicationError::InvalidRequest(
+                "OCR output must be PDF, DOCX, text, or Markdown".to_owned(),
+            ));
+        }
+        let import = self
+            .repository
+            .get(command.organization_id, command.policy_import_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(command.policy_import_id.to_string()))?;
+        if import.status != PolicyImportStatus::NeedsOcr
+            || import.active_transformation_id.is_some()
+        {
+            return Err(ApplicationError::Conflict(
+                "OCR output can only be attached once to an import awaiting OCR".to_owned(),
+            ));
+        }
+        let output_sha256 = sha256_hex(&command.content);
+        let output_object_key = format!(
+            "organizations/{}/policy-imports/{}/transformations/{}",
+            command.organization_id, command.policy_import_id, output_sha256
+        );
+        self.artifacts
+            .put(&output_object_key, command.content)
+            .await?;
+        let record = PolicyImportTransformationRecord {
+            transformation: PolicyImportTransformation {
+                id: PolicyImportTransformationId::new(),
+                organization_id: command.organization_id,
+                policy_import_id: command.policy_import_id,
+                kind: PolicyImportTransformationKind::ManualOcr,
+                input_sha256: import.content_sha256.clone(),
+                output_sha256,
+                output_mime_type: command.mime_type,
+                processor: "manual_ocr".to_owned(),
+                processor_version: "reviewer-supplied-v1".to_owned(),
+                created_by: command.actor_id,
+                created_at: OffsetDateTime::now_utc(),
+            },
+            input_object_key: import.raw_object_key,
+            output_object_key,
+            metadata: serde_json::json!({"verification_required": true}),
+        };
+        self.repository.activate_transformation(&record).await
+    }
 }
 
 pub async fn review_policy_candidate<R: PolicyImportRepository>(

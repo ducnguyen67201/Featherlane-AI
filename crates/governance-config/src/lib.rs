@@ -1,9 +1,12 @@
 //! Typed environment configuration shared by first-party binaries.
 
-use std::{env, fmt, net::SocketAddr, str::FromStr};
+use std::{collections::BTreeMap, env, fmt, net::SocketAddr, str::FromStr};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -14,6 +17,7 @@ pub struct AppConfig {
     pub web_origin: String,
     pub telemetry: TelemetryConfig,
     pub policy_import: PolicyImportConfig,
+    pub source_connectors: SourceConnectorConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,6 +59,30 @@ pub struct PolicyImportConfig {
     pub llm_allow_fallbacks: bool,
 }
 
+#[derive(Clone)]
+pub struct SourceConnectorConfig {
+    pub console_api_key: SecretString,
+    pub encryption_keys: BTreeMap<u32, SecretString>,
+    pub active_key_version: Option<u32>,
+    pub callback_base_url: Url,
+    pub max_items_per_batch: usize,
+    pub max_batch_bytes: usize,
+    pub max_redirects: usize,
+    pub oauth_state_ttl_seconds: usize,
+    pub connect_timeout_seconds: usize,
+    pub response_timeout_seconds: usize,
+    pub google: Option<ProviderOAuthConfig>,
+    pub microsoft: Option<ProviderOAuthConfig>,
+    pub notion: Option<ProviderOAuthConfig>,
+}
+
+#[derive(Clone)]
+pub struct ProviderOAuthConfig {
+    pub client_id: String,
+    pub client_secret: SecretString,
+    pub callback_url: Url,
+}
+
 impl fmt::Debug for AppConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -66,6 +94,45 @@ impl fmt::Debug for AppConfig {
             .field("web_origin", &self.web_origin)
             .field("telemetry", &self.telemetry)
             .field("policy_import", &self.policy_import)
+            .field("source_connectors", &self.source_connectors)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SourceConnectorConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SourceConnectorConfig")
+            .field("console_api_key", &"<redacted>")
+            .field(
+                "encryption_keys",
+                &format_args!("<{} configured>", self.encryption_keys.len()),
+            )
+            .field("active_key_version", &self.active_key_version)
+            .field("callback_base_url", &self.callback_base_url)
+            .field("max_items_per_batch", &self.max_items_per_batch)
+            .field("max_batch_bytes", &self.max_batch_bytes)
+            .field("max_redirects", &self.max_redirects)
+            .field("oauth_state_ttl_seconds", &self.oauth_state_ttl_seconds)
+            .field("connect_timeout_seconds", &self.connect_timeout_seconds)
+            .field("response_timeout_seconds", &self.response_timeout_seconds)
+            .field("google", &self.google.as_ref().map(|_| "<configured>"))
+            .field(
+                "microsoft",
+                &self.microsoft.as_ref().map(|_| "<configured>"),
+            )
+            .field("notion", &self.notion.as_ref().map(|_| "<configured>"))
+            .finish()
+    }
+}
+
+impl fmt::Debug for ProviderOAuthConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderOAuthConfig")
+            .field("client_id", &"<configured>")
+            .field("client_secret", &"<redacted>")
+            .field("callback_url", &self.callback_url)
             .finish()
     }
 }
@@ -104,6 +171,8 @@ pub enum ConfigError {
     InvalidNumber { key: String, value: String },
     #[error("invalid value in {key}: {value}")]
     InvalidValue { key: String, value: String },
+    #[error("invalid connector configuration in {key}")]
+    InvalidConnector { key: String },
 }
 
 impl AppConfig {
@@ -141,9 +210,132 @@ impl AppConfig {
                 late_span_retention_days: positive_usize("OTLP_LATE_SPAN_RETENTION_DAYS", 7)?,
             },
             policy_import: PolicyImportConfig::from_env()?,
+            source_connectors: SourceConnectorConfig::from_env()?,
         };
         Ok(config)
     }
+}
+
+impl SourceConnectorConfig {
+    /// Loads bounded acquisition, credential-encryption, and OAuth settings.
+    ///
+    /// Providers are optional, but each provider's ID and secret must be configured together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured URL, limit, key, or provider credential is invalid.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let callback_base_url = Url::parse(&env_value(
+            "SOURCE_CONNECTOR_CALLBACK_BASE_URL",
+            "http://localhost:3000",
+        ))
+        .map_err(|_| ConfigError::InvalidConnector {
+            key: "SOURCE_CONNECTOR_CALLBACK_BASE_URL".to_owned(),
+        })?;
+        let environment = env_value("FEATHERLANE_ENVIRONMENT", "development");
+        if environment != "development" && callback_base_url.scheme() != "https" {
+            return Err(ConfigError::InvalidConnector {
+                key: "SOURCE_CONNECTOR_CALLBACK_BASE_URL".to_owned(),
+            });
+        }
+
+        let active_key_version = optional_u32("SOURCE_CONNECTOR_ACTIVE_KEY_VERSION")?;
+        let mut encryption_keys = BTreeMap::new();
+        for (name, value) in env::vars() {
+            let Some(version) = name
+                .strip_prefix("SOURCE_CONNECTOR_ENCRYPTION_KEY_V")
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let decoded = STANDARD
+                .decode(value.as_bytes())
+                .map_err(|_| ConfigError::InvalidConnector { key: name.clone() })?;
+            if decoded.len() != 32 {
+                return Err(ConfigError::InvalidConnector { key: name });
+            }
+            encryption_keys.insert(version, SecretString::from(value));
+        }
+        if active_key_version.is_some_and(|version| !encryption_keys.contains_key(&version)) {
+            return Err(ConfigError::InvalidConnector {
+                key: "SOURCE_CONNECTOR_ACTIVE_KEY_VERSION".to_owned(),
+            });
+        }
+
+        let google = provider_config(
+            "GOOGLE_DRIVE_CLIENT_ID",
+            "GOOGLE_DRIVE_CLIENT_SECRET",
+            callback_base_url.join("/api/source-connections/google_drive/callback"),
+        )?;
+        let microsoft = provider_config(
+            "MICROSOFT_GRAPH_CLIENT_ID",
+            "MICROSOFT_GRAPH_CLIENT_SECRET",
+            callback_base_url.join("/api/source-connections/microsoft_graph/callback"),
+        )?;
+        let notion = provider_config(
+            "NOTION_CLIENT_ID",
+            "NOTION_CLIENT_SECRET",
+            callback_base_url.join("/api/source-connections/notion/callback"),
+        )?;
+
+        Ok(Self {
+            console_api_key: SecretString::from(env_value("GOVERNANCE_CONSOLE_API_KEY", "")),
+            encryption_keys,
+            active_key_version,
+            callback_base_url,
+            max_items_per_batch: positive_usize("SOURCE_INGESTION_MAX_ITEMS", 25)?,
+            max_batch_bytes: positive_usize("SOURCE_INGESTION_MAX_BATCH_BYTES", 104_857_600)?,
+            max_redirects: positive_usize("SOURCE_FETCH_MAX_REDIRECTS", 5)?,
+            oauth_state_ttl_seconds: positive_usize("SOURCE_OAUTH_STATE_TTL_SECONDS", 600)?,
+            connect_timeout_seconds: positive_usize("SOURCE_FETCH_CONNECT_TIMEOUT_SECONDS", 5)?,
+            response_timeout_seconds: positive_usize("SOURCE_FETCH_RESPONSE_TIMEOUT_SECONDS", 30)?,
+            google,
+            microsoft,
+            notion,
+        })
+    }
+
+    #[must_use]
+    pub fn encryption_configured(&self) -> bool {
+        self.active_key_version.is_some() && !self.encryption_keys.is_empty()
+    }
+}
+
+fn provider_config(
+    id_key: &str,
+    secret_key: &str,
+    callback: Result<Url, url::ParseError>,
+) -> Result<Option<ProviderOAuthConfig>, ConfigError> {
+    let id = env::var(id_key).ok().filter(|value| !value.is_empty());
+    let secret = env::var(secret_key).ok().filter(|value| !value.is_empty());
+    match (id, secret) {
+        (None, None) => Ok(None),
+        (Some(client_id), Some(client_secret)) => Ok(Some(ProviderOAuthConfig {
+            client_id,
+            client_secret: SecretString::from(client_secret),
+            callback_url: callback.map_err(|_| ConfigError::InvalidConnector {
+                key: "SOURCE_CONNECTOR_CALLBACK_BASE_URL".to_owned(),
+            })?,
+        })),
+        _ => Err(ConfigError::InvalidConnector {
+            key: id_key.to_owned(),
+        }),
+    }
+}
+
+fn optional_u32(key: &str) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = env::var(key).ok().filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|number| *number > 0)
+        .map(Some)
+        .ok_or(ConfigError::InvalidNumber {
+            key: key.to_owned(),
+            value,
+        })
 }
 
 impl PolicyImportConfig {
@@ -235,5 +427,41 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         assert!(address("FEATHERLANE_TEST_MISSING_ADDR", "127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn connector_debug_output_redacts_every_secret() {
+        let mut encryption_keys = BTreeMap::new();
+        encryption_keys.insert(1, SecretString::from("encryption-key-material".to_owned()));
+        let config = SourceConnectorConfig {
+            console_api_key: SecretString::from("console-secret".to_owned()),
+            encryption_keys,
+            active_key_version: Some(1),
+            callback_base_url: Url::parse("https://console.example.test").expect("valid URL"),
+            max_items_per_batch: 25,
+            max_batch_bytes: 100,
+            max_redirects: 5,
+            oauth_state_ttl_seconds: 600,
+            connect_timeout_seconds: 5,
+            response_timeout_seconds: 30,
+            google: Some(ProviderOAuthConfig {
+                client_id: "visible-client-id".to_owned(),
+                client_secret: SecretString::from("provider-secret".to_owned()),
+                callback_url: Url::parse("https://console.example.test/callback")
+                    .expect("valid URL"),
+            }),
+            microsoft: None,
+            notion: None,
+        };
+
+        let rendered = format!("{config:?}");
+        for secret in [
+            "console-secret",
+            "encryption-key-material",
+            "visible-client-id",
+            "provider-secret",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
     }
 }

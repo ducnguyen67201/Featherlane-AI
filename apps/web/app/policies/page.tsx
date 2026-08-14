@@ -2,11 +2,11 @@ import Link from "next/link";
 import { ArrowRight, CheckCircle2, Database, FileCheck2, GitBranch, ShieldCheck } from "lucide-react";
 import { ImportPolicyButton } from "@/components/import-policy-button";
 import { PolicyPackActions } from "@/components/policy-pack-actions";
-import { getPolicies, getPolicyImports, getPolicyPack } from "@/lib/api";
+import { getPolicies, getPolicyCollections, getPolicyImports, getPolicyPack } from "@/lib/api";
 import { PageHeader, StateBadge } from "@/components/ui";
 
 export default async function PoliciesPage() {
-  const [policies, imports] = await Promise.all([getPolicies(), getPolicyImports()]);
+  const [policies, imports, collections] = await Promise.all([getPolicies(), getPolicyImports(), getPolicyCollections()]);
   const packs = policies.data ?? [];
   const details = await Promise.all(packs.map((pack) => getPolicyPack(pack.id)));
   const sourceCount = packs.reduce((total, pack) => total + pack.source_count, 0);
@@ -26,6 +26,20 @@ export default async function PoliciesPage() {
         <div><GitBranch size={18} /><span>Extracted obligations</span><strong>Human review required</strong></div>
         <i />
         <div><ShieldCheck size={18} /><span>Executable packs</span><strong>{ruleCount} database rules</strong></div>
+      </section>
+
+      <section className="panel">
+        <div className="section-header"><div><h2>Policy collections</h2><p>Exact source revisions compiled together into one policy pack.</p></div></div>
+        {collections.error ? <div className="inline-api-error">{collections.error}</div> : collections.data?.length ? (
+          <div className="import-list">
+            {collections.data.map((collection) => (
+              <Link key={collection.id} href={`/policies/collections/${collection.id}`}>
+                <div><strong>{collection.title}</strong><span>{collection.key} · version {collection.version}</span></div>
+                <StateBadge state={collection.status} /><ArrowRight size={14} />
+              </Link>
+            ))}
+          </div>
+        ) : <div className="inline-empty">No collections yet. Create one to ingest and compile multiple documents.</div>}
       </section>
 
       <section className="panel">

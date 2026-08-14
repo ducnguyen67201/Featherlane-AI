@@ -5,7 +5,8 @@ use time::OffsetDateTime;
 
 use crate::{
     EventMatcher, OrganizationId, PolicyCandidateId, PolicyCandidateReviewId, PolicyImportId,
-    PolicyPackId, PolicySourceId, RuleAssertion, Severity, SourceId, SourceLocator, SourceType,
+    PolicyImportTransformationId, PolicyPackId, PolicySourceId, RuleAssertion, Severity, SourceId,
+    SourceIngestionItemId, SourceLocator, SourceSubscriptionId, SourceType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -33,7 +34,7 @@ impl PolicyImportStatus {
 
         matches!(
             (self, next),
-            (Uploading | FailedRetryable, Queued)
+            (Uploading | FailedRetryable | NeedsOcr, Queued)
                 | (Uploading, FailedRetryable | FailedTerminal)
                 | (Queued, Parsing | FailedRetryable | FailedTerminal)
                 | (
@@ -63,6 +64,10 @@ impl PolicyImportStatus {
 pub enum PolicyInputKind {
     File,
     PastedText,
+    Url,
+    GoogleDrive,
+    MicrosoftGraph,
+    Notion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -164,6 +169,15 @@ pub struct PolicyImport {
     pub byte_length: u64,
     pub content_sha256: String,
     pub raw_object_key: String,
+    pub processing_object_key: String,
+    pub processing_content_sha256: String,
+    pub processing_mime_type: String,
+    pub active_transformation_id: Option<PolicyImportTransformationId>,
+    pub ingestion_item_id: Option<SourceIngestionItemId>,
+    pub source_subscription_id: Option<SourceSubscriptionId>,
+    pub external_revision: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub external_modified_at: Option<OffsetDateTime>,
     pub normalized_object_key: Option<String>,
     pub parser_kind: Option<String>,
     pub parser_version: Option<String>,
@@ -348,6 +362,23 @@ impl PolicyImportReadiness {
     pub fn is_ready(&self) -> bool {
         self.blockers.is_empty()
     }
+
+    #[must_use]
+    pub fn review_complete(&self) -> bool {
+        self.source_verified
+            && self.coverage_complete
+            && self.all_candidates_disposed
+            && self.approved_mappings_ready
+    }
+
+    #[must_use]
+    pub fn review_blockers(&self) -> Vec<String> {
+        self.blockers
+            .iter()
+            .filter(|blocker| blocker.as_str() != "at least one candidate must be approved")
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +409,14 @@ mod tests {
             byte_length: 10,
             content_sha256: "a".repeat(64),
             raw_object_key: "raw".to_owned(),
+            processing_object_key: "raw".to_owned(),
+            processing_content_sha256: "a".repeat(64),
+            processing_mime_type: "text/plain".to_owned(),
+            active_transformation_id: None,
+            ingestion_item_id: None,
+            source_subscription_id: None,
+            external_revision: None,
+            external_modified_at: None,
             normalized_object_key: Some("normalized".to_owned()),
             parser_kind: Some("plain_text".to_owned()),
             parser_version: Some("1".to_owned()),
@@ -494,6 +533,7 @@ mod tests {
             (ReviewRequired, ReadyToCompile),
             (ReadyToCompile, ReviewRequired),
             (ReadyToCompile, Compiled),
+            (NeedsOcr, Queued),
             (FailedRetryable, Queued),
         ];
         for from in statuses {
@@ -522,6 +562,25 @@ mod tests {
         candidate.suggested_rule = None;
         let readiness = PolicyImportReadiness::calculate(&import, &[candidate]);
         assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn all_rejected_candidates_complete_review_without_enabling_single_source_compile() {
+        let import = import();
+        let mut candidate = candidate(&import);
+        candidate.status = PolicyCandidateStatus::Rejected;
+        candidate.suggested_rule = None;
+        candidate.review = Some(CandidateReview {
+            reviewer_id: "reviewer".to_owned(),
+            notes: "not an enforceable obligation".to_owned(),
+            reviewed_at: OffsetDateTime::now_utc(),
+        });
+
+        let readiness = PolicyImportReadiness::calculate(&import, &[candidate]);
+
+        assert!(readiness.review_complete());
+        assert!(!readiness.is_ready());
+        assert!(readiness.review_blockers().is_empty());
     }
 
     #[test]
