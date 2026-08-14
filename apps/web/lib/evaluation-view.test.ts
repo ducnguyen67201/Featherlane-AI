@@ -41,14 +41,7 @@ describe("evaluation result presentation", () => {
       message: "all deterministic assertions passed",
       evidence_event_ids: [approval.id, "missing-event"],
     };
-    expect(evidenceCitations(result, [approval])).toEqual([{
-      id: approval.id,
-      sequence: 1,
-      eventType: "human_approval_decision",
-      name: "approval",
-      actor: "reviewer",
-      traceId: approval.trace_id,
-    }]);
+    expect(evidenceCitations(result, [approval])).toEqual([approval]);
     expect(citedEventIds({
       verdict: "PASS",
       results: [result],

@@ -207,7 +207,7 @@ function RuleResultCard({ result, events }: { result: RuleResult; events: Eviden
                 <a href={`#event-${citation.id}`} key={citation.id}>
                   <span>#{String(citation.sequence).padStart(2, "0")}</span>
                   <strong>{citation.name}</strong>
-                  <small>{words(citation.eventType)}</small>
+                  <small>{words(citation.event_type)}</small>
                   <ArrowRight size={12} aria-hidden="true" />
                 </a>
               ))}

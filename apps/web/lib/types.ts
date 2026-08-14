@@ -277,14 +277,6 @@ export interface CreateTargetInput {
 }
 
 export interface RotatedTelemetryIngestKey {
-  key: {
-    id: string;
-    organization_id: string;
-    target_id: string;
-    token_prefix: string;
-    created_at: string;
-    expires_at: string | null;
-  };
   plaintext: string;
 }
 

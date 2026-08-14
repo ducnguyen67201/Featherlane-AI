@@ -161,10 +161,6 @@ where
         )
         .await?;
         self.targets
-            .get(request.organization_id, request.target_id)
-            .await?
-            .ok_or_else(|| ApplicationError::NotFound(request.target_id.to_string()))?;
-        self.targets
             .save_telemetry_boundary(request.organization_id, request.target_id, &request.config)
             .await
     }

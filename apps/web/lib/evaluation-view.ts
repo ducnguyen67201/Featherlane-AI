@@ -7,28 +7,6 @@ import type {
   Verdict,
 } from "./types";
 
-export type EvidenceCitation = {
-  id: string;
-  sequence: number;
-  eventType: string;
-  name: string;
-  actor: string;
-  traceId: string;
-};
-
-export type WaterfallSegment = {
-  event: EvidenceEvent;
-  offsetMs: number;
-  durationMs: number;
-  startPercent: number;
-  widthPercent: number;
-};
-
-export type TraceWaterfall = {
-  durationMs: number;
-  segments: WaterfallSegment[];
-};
-
 export function words(value: string): string {
   return value.replaceAll("_", " ").replaceAll("-", " ");
 }
@@ -45,7 +23,7 @@ export function runDuration(run: EvaluationRun): string {
   return formatDuration(Math.max(0, ended - started));
 }
 
-export function traceWaterfall(events: EvidenceEvent[]): TraceWaterfall {
+export function traceWaterfall(events: EvidenceEvent[]) {
   const timedEvents = events.flatMap((event) => {
     const startedAt = Date.parse(event.started_at);
     if (!Number.isFinite(startedAt)) return [];
@@ -79,20 +57,9 @@ export function traceWaterfall(events: EvidenceEvent[]): TraceWaterfall {
 export function evidenceCitations(
   result: RuleResult,
   events: EvidenceEvent[],
-): EvidenceCitation[] {
+): EvidenceEvent[] {
   const byId = new Map(events.map((event) => [event.id, event]));
-  return result.evidence_event_ids.flatMap((id) => {
-    const event = byId.get(id);
-    if (!event) return [];
-    return [{
-      id,
-      sequence: event.sequence,
-      eventType: event.event_type,
-      name: event.name,
-      actor: event.actor.id,
-      traceId: event.trace_id,
-    }];
-  });
+  return result.evidence_event_ids.flatMap((id) => byId.get(id) ?? []);
 }
 
 export function citedEventIds(summary: EvaluationSummary | null): Set<string> {

@@ -38,7 +38,7 @@ export function serializeTelemetrySetupForm(data: FormData): TelemetryBoundaryCo
 
 export function telemetryEnvironmentSnippet(
   plaintext: string,
-  endpoint = "http://localhost:4318/v1/traces",
+  endpoint: string,
 ): string {
   return [
     `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${endpoint}`,

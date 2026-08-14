@@ -683,6 +683,7 @@ where
         settle_duration: Duration,
         boundary: Option<&TelemetryTargetBoundary>,
     ) -> Result<(), ApplicationError> {
+        let now = batch.latest_received_at;
         let mut reconciled = None;
         for attempt in 0..8 {
             let mut run = self
@@ -690,9 +691,7 @@ where
                 .get_run(organization_id, eval_run_id)
                 .await?
                 .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
-            let expected_state = run.state;
-            let expected_updated_at = run.updated_at;
-            let now = batch.latest_received_at;
+            let (expected_state, expected_updated_at) = (run.state, run.updated_at);
             let changed = if batch.terminal
                 && matches!(
                     run.state,
@@ -745,16 +744,6 @@ where
                 "evaluation run {eval_run_id} could not be reconciled"
             ))
         })?;
-        self.enqueue_reconciliation_job(&run, batch, boundary).await
-    }
-
-    async fn enqueue_reconciliation_job(
-        &self,
-        run: &EvaluationRun,
-        batch: &CorrelatedRunBatch,
-        boundary: Option<&TelemetryTargetBoundary>,
-    ) -> Result<(), ApplicationError> {
-        let now = batch.latest_received_at;
         let job = if run.state == EvaluationRunState::Settling {
             Some(DurableJob {
                 organization_id: run.organization_id,
