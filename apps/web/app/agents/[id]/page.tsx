@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { ArrowLeft, Braces, Clock3, RadioTower } from "lucide-react";
 import { getAgent, getPolicies } from "@/lib/api";
 import { TargetActions } from "@/components/target-actions";
+import { TelemetrySetup } from "@/components/telemetry-setup";
 import { StateBadge } from "@/components/ui";
 
 export default async function TargetDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -39,6 +40,7 @@ export default async function TargetDetailPage({ params }: { params: Promise<{ i
         </article>
       </section>
 
+      <TelemetrySetup target={target} policies={approvedPolicies} />
       <TargetActions target={target} policies={approvedPolicies} />
     </div>
   );

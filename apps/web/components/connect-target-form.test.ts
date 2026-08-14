@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { serializeTargetForm } from "./connect-target-form";
+import { parseAttributeList, serializeTargetForm } from "./connect-target-form";
 import { buildQuickTestScenario } from "./target-actions";
 
 describe("target form serialization", () => {
@@ -25,7 +25,59 @@ describe("target form serialization", () => {
       reset_endpoint: null,
       auth_secret_ref: null,
       timeout_seconds: 30,
+      otlp_required: false,
+      telemetry_boundary: {
+        boundary_kind: "workflow_execution",
+        external_id_attributes: ["featherlane.external_run.id"],
+        terminal_attribute: null,
+        default_policy_pack_id: null,
+        settle_seconds: 10,
+        idle_timeout_seconds: null,
+        max_duration_seconds: null,
+        conversation_id_is_task_boundary: false,
+      },
     });
+  });
+
+  it("serializes an approved automatic evaluation boundary", () => {
+    const form = new FormData();
+    form.set("name", "Trace Agent");
+    form.set("key", "trace-agent");
+    form.set("version", "git:test");
+    form.set("environment", "staging");
+    form.set("driver_type", "webhook");
+    form.set("endpoint", "http://agent:8091/webhook");
+    form.set("timeout_seconds", "45");
+    form.set("auto_evaluation", "on");
+    form.set("default_policy_pack_id", "policy-1");
+    form.set("boundary_kind", "agent_task");
+    form.set("external_id_attributes", "agent.session.id, gen_ai.conversation.id\nagent.session.id");
+    form.set("terminal_attribute", "agent.session.finished");
+    form.set("settle_seconds", "5");
+    form.set("idle_timeout_seconds", "120");
+    form.set("max_duration_seconds", "900");
+    form.set("conversation_id_is_task_boundary", "on");
+
+    expect(serializeTargetForm(form)).toMatchObject({
+      otlp_required: true,
+      telemetry_boundary: {
+        boundary_kind: "agent_task",
+        external_id_attributes: ["agent.session.id", "gen_ai.conversation.id"],
+        terminal_attribute: "agent.session.finished",
+        default_policy_pack_id: "policy-1",
+        settle_seconds: 5,
+        idle_timeout_seconds: 120,
+        max_duration_seconds: 900,
+        conversation_id_is_task_boundary: true,
+      },
+    });
+  });
+
+  it("normalizes ordered attribute lists without duplicates", () => {
+    expect(parseAttributeList(" workflow.id,trace.session\nworkflow.id ")).toEqual([
+      "workflow.id",
+      "trace.session",
+    ]);
   });
 });
 

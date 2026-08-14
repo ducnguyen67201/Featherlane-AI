@@ -10,7 +10,7 @@ use governance_domain::{
 use governance_evaluator::evaluate_pack;
 use governance_targets::{
     DriverError, RegisteredTarget, RunContext, ScenarioDefinition, TargetDriverRegistry,
-    validate_scenario,
+    TelemetryBoundaryConfig, validate_scenario, validate_telemetry_boundary,
 };
 use governance_telemetry::{
     NormalizationContext, RedactionPolicy, finalize_evidence, normalize_observations,
@@ -111,6 +111,124 @@ pub trait TargetRepository: Send + Sync {
         id: TargetId,
         report: &governance_targets::CapabilityReport,
     ) -> Result<RegisteredTarget, ApplicationError>;
+    async fn save_telemetry_boundary(
+        &self,
+        organization_id: OrganizationId,
+        id: TargetId,
+        config: &TelemetryBoundaryConfig,
+    ) -> Result<RegisteredTarget, ApplicationError>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfigureTargetTelemetryRequest {
+    pub organization_id: OrganizationId,
+    pub target_id: TargetId,
+    pub config: TelemetryBoundaryConfig,
+}
+
+#[derive(Debug)]
+pub struct ConfigureTargetTelemetry<T, P> {
+    targets: T,
+    policy_packs: P,
+}
+
+impl<T, P> ConfigureTargetTelemetry<T, P>
+where
+    T: TargetRepository,
+    P: PolicyPackRepository,
+{
+    pub fn new(targets: T, policy_packs: P) -> Self {
+        Self {
+            targets,
+            policy_packs,
+        }
+    }
+
+    /// Applies a validated automatic-evaluation boundary to a registered target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an application error when the target or policy does not exist,
+    /// the policy is not publishable, the boundary is invalid, or persistence fails.
+    pub async fn execute(
+        &self,
+        request: ConfigureTargetTelemetryRequest,
+    ) -> Result<RegisteredTarget, ApplicationError> {
+        validate_telemetry_policy_binding(
+            &self.policy_packs,
+            request.organization_id,
+            &request.config,
+        )
+        .await?;
+        self.targets
+            .get(request.organization_id, request.target_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(request.target_id.to_string()))?;
+        self.targets
+            .save_telemetry_boundary(request.organization_id, request.target_id, &request.config)
+            .await
+    }
+}
+
+/// Validates the structural boundary and its optional organization-scoped policy binding.
+///
+/// # Errors
+///
+/// Returns an invalid-request error for malformed configuration, not-found for
+/// an unknown policy, or conflict when the policy is not publishable.
+pub async fn validate_telemetry_policy_binding<P: PolicyPackRepository>(
+    policy_packs: &P,
+    organization_id: OrganizationId,
+    config: &TelemetryBoundaryConfig,
+) -> Result<(), ApplicationError> {
+    validate_telemetry_boundary(config)
+        .map_err(|error| ApplicationError::InvalidRequest(error.to_string()))?;
+    let Some(policy_pack_id) = config.default_policy_pack_id else {
+        return Ok(());
+    };
+    let pack = policy_packs
+        .get(organization_id, policy_pack_id)
+        .await?
+        .ok_or_else(|| ApplicationError::NotFound(policy_pack_id.to_string()))?;
+    pack.ensure_publishable()
+        .map_err(|error| ApplicationError::Conflict(error.to_string()))
+}
+
+#[derive(Debug)]
+pub struct RotateTargetTelemetryIngestKey<T, K> {
+    targets: T,
+    keys: K,
+}
+
+impl<T, K> RotateTargetTelemetryIngestKey<T, K>
+where
+    T: TargetRepository,
+    K: TelemetryIngestKeyRepository + Clone,
+{
+    pub fn new(targets: T, keys: K) -> Self {
+        Self { targets, keys }
+    }
+
+    /// Rotates the ingest key for a registered target's trusted manifest identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an application error when the target is unknown or key rotation fails.
+    pub async fn execute(
+        &self,
+        organization_id: OrganizationId,
+        target_id: TargetId,
+        expires_at: Option<OffsetDateTime>,
+    ) -> Result<RotatedTelemetryIngestKey, ApplicationError> {
+        let target = self
+            .targets
+            .get(organization_id, target_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(target_id.to_string()))?;
+        RotateTelemetryIngestKey::new(self.keys.clone())
+            .execute(organization_id, target.manifest.target_id, expires_at)
+            .await
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

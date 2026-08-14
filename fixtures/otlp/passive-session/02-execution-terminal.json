@@ -1,0 +1,41 @@
+{
+  "resourceSpans": [{
+    "resource": {"attributes": [
+      {"key": "service.name", "value": {"stringValue": "refund-workflow"}},
+      {"key": "featherlane.external_run.id", "value": {"stringValue": "session-placeholder"}}
+    ]},
+    "scopeSpans": [{
+      "scope": {"name": "featherlane.passive-fixture", "version": "1.0"},
+      "spans": [
+        {
+          "traceId": "22222222222222222222222222222222",
+          "spanId": "2222222222222221",
+          "name": "issue_refund",
+          "kind": 1,
+          "startTimeUnixNano": "1786597200020000000",
+          "endTimeUnixNano": "1786597200030000000",
+          "links": [{"traceId": "11111111111111111111111111111111", "spanId": "1111111111111111"}],
+          "attributes": [
+            {"key": "featherlane.event.type", "value": {"stringValue": "tool_call"}},
+            {"key": "gen_ai.tool.name", "value": {"stringValue": "issue_refund"}},
+            {"key": "governance.input", "value": {"stringValue": "{\"amount\":700,\"currency\":\"USD\"}"}}
+          ]
+        },
+        {
+          "traceId": "22222222222222222222222222222222",
+          "spanId": "2222222222222222",
+          "parentSpanId": "2222222222222221",
+          "name": "refund completed",
+          "kind": 1,
+          "startTimeUnixNano": "1786597200040000000",
+          "endTimeUnixNano": "1786597200050000000",
+          "attributes": [
+            {"key": "featherlane.event.type", "value": {"stringValue": "final_output"}},
+            {"key": "featherlane.run.terminal", "value": {"boolValue": true}},
+            {"key": "featherlane.run.terminal_state", "value": {"stringValue": "completed"}}
+          ]
+        }
+      ]
+    }]
+  }]
+}

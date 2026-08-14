@@ -171,6 +171,31 @@ impl TargetRepository for SeaOrmTargetRepository {
             .map_err(repository_error)?;
         target_from_model(model)
     }
+
+    async fn save_telemetry_boundary(
+        &self,
+        organization_id: OrganizationId,
+        id: TargetId,
+        config: &governance_targets::TelemetryBoundaryConfig,
+    ) -> Result<RegisteredTarget, ApplicationError> {
+        let model = targets::Entity::find()
+            .filter(targets::Column::OrganizationId.eq(organization_id.0))
+            .filter(targets::Column::Id.eq(id.0))
+            .one(&self.database)
+            .await
+            .map_err(repository_error)?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))?;
+        let mut capabilities: StoredTargetCapabilities =
+            serde_json::from_value(model.capabilities.clone()).map_err(serialization_error)?;
+        capabilities.telemetry_boundary = config.clone();
+        let mut active: targets::ActiveModel = model.into();
+        active.capabilities = Set(serde_json::to_value(capabilities).map_err(serialization_error)?);
+        let model = active
+            .update(&self.database)
+            .await
+            .map_err(repository_error)?;
+        target_from_model(model)
+    }
 }
 
 fn target_from_model(model: targets::Model) -> Result<RegisteredTarget, ApplicationError> {

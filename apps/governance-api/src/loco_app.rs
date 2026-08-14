@@ -9,10 +9,11 @@ use axum::{
 };
 use governance_application::{
     ActivityPoint, ApplicationError, CancelEvaluationRun, CompleteEvaluationRun, CompletionRequest,
-    CreateEvaluationRun, CreateEvaluationRunRequest, DashboardSnapshot, EvaluationRepository,
-    EvaluationRunRepository, EvidenceBundleRepository, LiveEvaluationRepository,
-    PolicyPackRepository, RotateTelemetryIngestKey, RunListItem, RunTargetEvaluation,
-    RunTargetEvaluationRequest, TargetRepository, TelemetryIngestKeyRepository,
+    ConfigureTargetTelemetry, ConfigureTargetTelemetryRequest, CreateEvaluationRun,
+    CreateEvaluationRunRequest, DashboardSnapshot, EvaluationRepository, EvaluationRunRepository,
+    EvidenceBundleRepository, LiveEvaluationRepository, PolicyPackRepository,
+    RotateTargetTelemetryIngestKey, RunListItem, RunTargetEvaluation, RunTargetEvaluationRequest,
+    TargetRepository, TelemetryIngestKeyRepository, validate_telemetry_policy_binding,
 };
 use governance_domain::{
     EvalRunId, PolicyPackApproval, PolicyPackId, PolicyPackStatusChange, RunVerdict, TargetId,
@@ -42,9 +43,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    ApprovePolicyPackRequest, CompleteEvaluationRequest, CreateEvaluationRequest,
-    CreateTargetRequest, CreatedEvaluationRun, EvaluationRunDetail, HealthResponse,
-    PolicyImportRequest, PolicyPackLifecycleRequest, PolicyPackView, RotateTelemetryKeyRequest,
+    ApprovePolicyPackRequest, CompleteEvaluationRequest, ConfigureTelemetryBoundaryRequest,
+    CreateEvaluationRequest, CreateTargetRequest, CreatedEvaluationRun, EvaluationRunDetail,
+    HealthResponse, PolicyImportRequest, PolicyPackLifecycleRequest, PolicyPackView,
+    RotateTelemetryKeyRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -182,6 +184,10 @@ fn api_routes() -> Routes {
         .add("/v1/targets", post(loco_create_target))
         .add("/v1/targets/{id}", get(loco_target))
         .add("/v1/targets/{id}/validate", post(loco_validate_target))
+        .add(
+            "/v1/targets/{id}/telemetry-boundary",
+            patch(loco_configure_telemetry_boundary),
+        )
         .add("/v1/evaluations", get(loco_evaluations))
         .add("/v1/evaluations", post(loco_create_evaluation))
         .add("/v1/evaluations/{id}", get(loco_evaluation))
@@ -462,6 +468,17 @@ async fn loco_create_target(
     State(context): State<AppContext>,
     Json(request): Json<CreateTargetRequest>,
 ) -> Response {
+    let organization_id = super::default_organization_id();
+    let policy_packs = SeaOrmPolicyPackRepository::new(context.db.clone());
+    if let Err(error) = validate_telemetry_policy_binding(
+        &policy_packs,
+        organization_id,
+        &request.telemetry_boundary,
+    )
+    .await
+    {
+        return application_error(error);
+    }
     let capability = CapabilityReport {
         target_id: request.key.clone(),
         reachable: false,
@@ -470,12 +487,10 @@ async fn loco_create_target(
         issues: Vec::new(),
         checked_at: OffsetDateTime::now_utc(),
     };
-    let mut target =
-        match super::build_registered_target(super::default_organization_id(), request, capability)
-        {
-            Ok(target) => target,
-            Err(error) => return error.into_response(),
-        };
+    let mut target = match super::build_registered_target(organization_id, request, capability) {
+        Ok(target) => target,
+        Err(error) => return error.into_response(),
+    };
     let drivers = DefaultDriverRegistry::default();
     target.capability = match drivers
         .driver_for(target.manifest.driver_type)
@@ -492,6 +507,30 @@ async fn loco_create_target(
             Json(super::target_detail_view(&target, None)),
         )
             .into_response(),
+        Err(error) => application_error(error),
+    }
+}
+
+async fn loco_configure_telemetry_boundary(
+    State(context): State<AppContext>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfigureTelemetryBoundaryRequest>,
+) -> Response {
+    let Some(id) = parse_target_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid target identifier");
+    };
+    let organization_id = super::default_organization_id();
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let policies = SeaOrmPolicyPackRepository::new(context.db);
+    match ConfigureTargetTelemetry::new(targets, policies)
+        .execute(ConfigureTargetTelemetryRequest {
+            organization_id,
+            target_id: id,
+            config: request.telemetry_boundary,
+        })
+        .await
+    {
+        Ok(target) => Json(super::target_detail_view(&target, None)).into_response(),
         Err(error) => application_error(error),
     }
 }
@@ -703,8 +742,12 @@ async fn loco_rotate_telemetry_key(
     Path(target_id): Path<String>,
     Json(request): Json<RotateTelemetryKeyRequest>,
 ) -> Response {
-    let repository = SeaOrmEvaluationRunRepository::new(context.db);
-    match RotateTelemetryIngestKey::new(repository)
+    let Some(target_id) = parse_target_id(&target_id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid target identifier");
+    };
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let keys = SeaOrmEvaluationRunRepository::new(context.db);
+    match RotateTargetTelemetryIngestKey::new(targets, keys)
         .execute(
             super::default_organization_id(),
             target_id,
@@ -721,11 +764,21 @@ async fn loco_revoke_telemetry_key(
     State(context): State<AppContext>,
     Path(target_id): Path<String>,
 ) -> Response {
-    let repository = SeaOrmEvaluationRunRepository::new(context.db);
-    match repository
+    let Some(target_id) = parse_target_id(&target_id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid target identifier");
+    };
+    let organization_id = super::default_organization_id();
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let target = match targets.get(organization_id, target_id).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "target was not found"),
+        Err(error) => return application_error(error),
+    };
+    let keys = SeaOrmEvaluationRunRepository::new(context.db);
+    match keys
         .revoke_target_keys(
-            super::default_organization_id(),
-            &target_id,
+            organization_id,
+            &target.manifest.target_id,
             OffsetDateTime::now_utc(),
         )
         .await

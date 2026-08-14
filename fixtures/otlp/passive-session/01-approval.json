@@ -1,0 +1,25 @@
+{
+  "resourceSpans": [{
+    "resource": {"attributes": [
+      {"key": "service.name", "value": {"stringValue": "approval-service"}},
+      {"key": "featherlane.external_run.id", "value": {"stringValue": "session-placeholder"}}
+    ]},
+    "scopeSpans": [{
+      "scope": {"name": "featherlane.passive-fixture", "version": "1.0"},
+      "spans": [{
+        "traceId": "11111111111111111111111111111111",
+        "spanId": "1111111111111111",
+        "name": "approval",
+        "kind": 1,
+        "startTimeUnixNano": "1786597200000000000",
+        "endTimeUnixNano": "1786597200010000000",
+        "attributes": [
+          {"key": "featherlane.event.type", "value": {"stringValue": "human_approval_decision"}},
+          {"key": "decision", "value": {"stringValue": "approved"}},
+          {"key": "governance.actor.type", "value": {"stringValue": "human"}},
+          {"key": "governance.actor.id", "value": {"stringValue": "fixture-approver"}}
+        ]
+      }]
+    }]
+  }]
+}

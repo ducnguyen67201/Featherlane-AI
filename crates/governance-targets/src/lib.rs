@@ -11,6 +11,7 @@ pub use driver::{
 pub use manifest::{
     CapabilityReport, DriverType, EvidenceMode, ManifestError, RegisteredTarget, TargetEnvironment,
     TargetManifest, TelemetryBoundaryConfig, validate_manifest, validate_registration,
+    validate_telemetry_boundary,
 };
 pub use scenario::{
     RunContext, ScenarioDefinition, ScenarioError, TargetOutput, TargetResponseEnvelope,

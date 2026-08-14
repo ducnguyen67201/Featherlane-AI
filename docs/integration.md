@@ -80,10 +80,39 @@ attributes, approved default policy pack, and finite timeouts. For example:
 }
 ```
 
+Configure this from **Agents → target → Automatic trace evaluation**. The
+target-scoped ingest key supplies trusted organization and agent identity; a
+span cannot select another target or policy. The selected default policy must
+be approved. It is pinned by ID, version, and content hash when the first span
+for a new external session creates the run, so later configuration changes do
+not alter an evaluation already in progress.
+
 The first span with that configured external ID atomically finds or creates the
 run. `gen_ai.conversation.id` is considered only when it appears in the target's
 attribute list and `conversation_id_is_task_boundary` is true. A long-lived chat
 session must not be treated as an evaluation run by default.
+
+Put the external ID on every span or resource in the business session. Traces
+from different services may use different trace IDs; the authenticated target,
+boundary kind, and external session ID group them into one evaluation. Emit the
+configured terminal boolean only after the whole task/workflow/call has ended.
+Featherlane then keeps accepting late exporter batches through `settle_seconds`,
+finalizes one immutable bundle, and evaluates it once. A terminal retry is
+idempotent and spans received after finalization remain diagnostics.
+
+To exercise this end to end against a running local Compose stack and an
+approved database policy:
+
+```bash
+POLICY_PACK_ID=<approved-policy-uuid> \
+  ./scripts/smoke-passive-auto-evaluation.sh
+```
+
+The smoke path registers a uniquely named agent, rotates a one-time target key,
+sends approval in trace A and execution/terminal evidence in linked trace B,
+then waits for one completed two-trace evaluation. It requires `bash`, `curl`,
+and `jq`; it never prints the ingest token. Set `EXPECT_VERDICT=PASS` when the
+chosen policy and fixture are expected to pass.
 
 ## Human approval and terminal events
 

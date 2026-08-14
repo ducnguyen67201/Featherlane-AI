@@ -134,4 +134,52 @@ fn target_versions_are_trimmed_before_persistence() {
         .expect("target should be valid");
 
     assert_eq!(target.manifest.target_version, "git:abc123");
+    let view = target_view(&target, None);
+    assert!(!view.auto_evaluation_enabled);
+    assert_eq!(view.automatic_boundary_kind, None);
+    assert_eq!(view.default_policy_pack_id, None);
+}
+
+#[test]
+fn target_view_exposes_valid_automatic_evaluation_binding() {
+    let policy_pack_id = PolicyPackId::new();
+    let request = CreateTargetRequest {
+        name: "Observed agent".to_owned(),
+        key: "observed-agent".to_owned(),
+        version: "git:trace".to_owned(),
+        environment: TargetEnvironment::Staging,
+        driver_type: DriverType::HttpText,
+        endpoint: "http://127.0.0.1:8091/messages".to_owned(),
+        reset_endpoint: None,
+        status_endpoint: None,
+        terminal_response_key: None,
+        auth_secret_ref: None,
+        timeout_seconds: 30,
+        otlp_required: true,
+        telemetry_boundary: governance_targets::TelemetryBoundaryConfig {
+            boundary_kind: RunBoundaryKind::WorkflowExecution,
+            default_policy_pack_id: Some(policy_pack_id),
+            idle_timeout_seconds: Some(300),
+            max_duration_seconds: Some(3_600),
+            ..governance_targets::TelemetryBoundaryConfig::default()
+        },
+    };
+    let capability = CapabilityReport {
+        target_id: request.key.clone(),
+        reachable: true,
+        reset_supported: false,
+        trace_context_supported: true,
+        issues: vec![],
+        checked_at: OffsetDateTime::now_utc(),
+    };
+    let target = build_registered_target(default_organization_id(), request, capability)
+        .expect("automatic target should be structurally valid");
+
+    let view = target_view(&target, None);
+    assert!(view.auto_evaluation_enabled);
+    assert_eq!(
+        view.automatic_boundary_kind,
+        Some(RunBoundaryKind::WorkflowExecution)
+    );
+    assert_eq!(view.default_policy_pack_id, Some(policy_pack_id));
 }

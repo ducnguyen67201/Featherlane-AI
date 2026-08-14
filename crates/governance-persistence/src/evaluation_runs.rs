@@ -100,15 +100,28 @@ impl EvaluationRunRepository for SeaOrmEvaluationRunRepository {
         &self,
         organization_id: OrganizationId,
     ) -> Result<Vec<EvaluationRun>, ApplicationError> {
-        eval_runs::Entity::find()
+        let models = eval_runs::Entity::find()
             .filter(eval_runs::Column::OrganizationId.eq(organization_id.0))
             .order_by_desc(eval_runs::Column::CreatedAt)
             .all(&self.database)
             .await
-            .map_err(repository_error)?
-            .into_iter()
-            .map(run_from_model)
-            .collect()
+            .map_err(repository_error)?;
+        let mut runs = Vec::with_capacity(models.len());
+        for model in models {
+            if model.policy_pack_id.is_none()
+                || model.scenario_id.is_none()
+                || model.primary_invocation_id.is_none()
+            {
+                tracing::warn!(
+                    organization_id = %organization_id,
+                    eval_run_id = %model.id,
+                    "skipping legacy evaluation without correlated-run identity"
+                );
+                continue;
+            }
+            runs.push(run_from_model(model)?);
+        }
+        Ok(runs)
     }
 
     async fn get_run_by_external_id(

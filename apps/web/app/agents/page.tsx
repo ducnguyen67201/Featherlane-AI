@@ -10,7 +10,7 @@ export default async function AgentsPage() {
       <PageHeader
         eyebrow="Execution lane / Targets"
         title="Connected agents"
-        description="Drive any SDK or workflow through a small HTTP contract, then evaluate its returned evidence."
+        description="Drive a test wrapper directly or observe standard OTLP traces and evaluate each completed agent session automatically."
         action={<Link className="primary-button" href="/agents/new"><Plus size={16} />Connect target</Link>}
       />
       {agents.length === 0 ? (
@@ -32,6 +32,7 @@ export default async function AgentsPage() {
               <dl>
                 <div><dt><Cable size={14} />Adapter</dt><dd>{agent.driver.replaceAll("_", " ")}</dd></div>
                 <div><dt><RadioTower size={14} />Trace quality</dt><dd>{agent.latest_trace_quality?.replaceAll("_", " ") ?? "No runs"}</dd></div>
+                <div><dt><Database size={14} />Automatic evaluation</dt><dd>{agent.auto_evaluation_enabled ? agent.automatic_boundary_kind?.replaceAll("_", " ") : "Not configured"}</dd></div>
                 <div><dt><RotateCcw size={14} />Last evaluated</dt><dd>{agent.last_evaluated ? new Date(agent.last_evaluated).toLocaleString() : "Never"}</dd></div>
               </dl>
               <div className="target-meta"><span>{agent.environment}</span><span>Checked {new Date(agent.checked_at).toLocaleString()}</span></div>
@@ -41,10 +42,10 @@ export default async function AgentsPage() {
         </section>
       )}
       <section className="panel integration-contract">
-        <div><span>01</span><strong>Send synthetic event</strong><p>HTTP text or a generic webhook payload.</p></div>
-        <div><span>02</span><strong>Propagate context</strong><p>W3C traceparent plus server-owned run and scenario identifiers.</p></div>
-        <div><span>03</span><strong>Return observations</strong><p>Your wrapper maps SDK or workflow events into one inline envelope.</p></div>
-        <div><span>04</span><strong>Evaluate evidence</strong><p>Rules return pass, fail, or inconclusive without controlling the agent.</p></div>
+        <div><span>01</span><strong>Identify the agent</strong><p>A target-scoped ingest key supplies trusted organization and agent identity.</p></div>
+        <div><span>02</span><strong>Group the session</strong><p>One configured attribute correlates every trace in the business execution.</p></div>
+        <div><span>03</span><strong>Signal finished</strong><p>A terminal boolean closes collection after a short settle window.</p></div>
+        <div><span>04</span><strong>Evaluate evidence</strong><p>The assigned policy returns pass, fail, or inconclusive without controlling the agent.</p></div>
       </section>
     </div>
   );

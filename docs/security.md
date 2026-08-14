@@ -57,8 +57,9 @@ Inline observations are assertions supplied by the target wrapper. Featherlane
 redacts sensitive-key content, limits it, assigns trusted correlation IDs, and
 hashes the resulting bundle, but this is test evidence rather than a signed
 attestation. Raw prompt, output, and tool fields can remain sensitive even after
-redaction; retain and authorize them accordingly. Signed provenance and durable
-OTLP correlation are future work.
+redaction; retain and authorize them accordingly. Durable OTLP correlation uses
+target-scoped ingest keys, bounded session identifiers, immutable evidence, and
+organization-scoped persistence; signed provenance remains future work.
 
 Add authentication at the Loco edge, API keys or workload identity for service
 callers, RBAC and organization membership, session revocation and auth audit

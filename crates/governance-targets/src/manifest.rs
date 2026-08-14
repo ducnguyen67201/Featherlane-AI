@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use governance_domain::{OrganizationId, PolicyPackId, RunBoundaryKind, TargetId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -138,6 +140,20 @@ pub enum ManifestError {
     CrossOriginAuthenticatedStatus,
     #[error("terminal_response_key must contain between 1 and 120 characters")]
     InvalidTerminalResponseKey,
+    #[error("automatic telemetry evaluation requires a non-CI session boundary")]
+    InvalidTelemetryBoundaryKind,
+    #[error("automatic telemetry evaluation requires between 1 and 8 unique attribute names")]
+    InvalidExternalIdAttributes,
+    #[error("telemetry attribute names must contain between 1 and 255 non-whitespace characters")]
+    InvalidTelemetryAttribute,
+    #[error("automatic telemetry evaluation requires a terminal boolean attribute")]
+    MissingTerminalAttribute,
+    #[error("telemetry settle_seconds must be at most 300")]
+    InvalidSettleSeconds,
+    #[error(
+        "telemetry timeouts must be between 1 and 86400 seconds, with idle not exceeding max duration"
+    )]
+    InvalidTelemetryTimeout,
 }
 
 /// Validates the user-facing target name and its stored manifest.
@@ -205,7 +221,68 @@ pub fn validate_manifest(manifest: &TargetManifest) -> Result<(), ManifestError>
     if manifest.production_credentials_allowed {
         return Err(ManifestError::ProductionCredentials);
     }
+    validate_telemetry_boundary(&manifest.telemetry_boundary)?;
     Ok(())
+}
+
+/// Validates the passive telemetry boundary when automatic evaluation is enabled.
+///
+/// # Errors
+///
+/// Returns a contract-specific error for ambiguous boundaries, unsafe attribute
+/// names, or durations outside the supported lifecycle bounds.
+pub fn validate_telemetry_boundary(config: &TelemetryBoundaryConfig) -> Result<(), ManifestError> {
+    if config.default_policy_pack_id.is_none() {
+        return Ok(());
+    }
+    if config.boundary_kind == RunBoundaryKind::ExplicitCi {
+        return Err(ManifestError::InvalidTelemetryBoundaryKind);
+    }
+    if config.external_id_attributes.is_empty() || config.external_id_attributes.len() > 8 {
+        return Err(ManifestError::InvalidExternalIdAttributes);
+    }
+    let mut attributes = BTreeSet::new();
+    for attribute in &config.external_id_attributes {
+        if !valid_telemetry_attribute(attribute) {
+            return Err(ManifestError::InvalidTelemetryAttribute);
+        }
+        if !attributes.insert(attribute.as_str()) {
+            return Err(ManifestError::InvalidExternalIdAttributes);
+        }
+    }
+    let terminal_attribute = config
+        .terminal_attribute
+        .as_deref()
+        .ok_or(ManifestError::MissingTerminalAttribute)?;
+    if !valid_telemetry_attribute(terminal_attribute) {
+        return Err(ManifestError::InvalidTelemetryAttribute);
+    }
+    if config.settle_seconds > 300 {
+        return Err(ManifestError::InvalidSettleSeconds);
+    }
+    let timeout_in_bounds = |value: u64| (1..=86_400).contains(&value);
+    if config
+        .idle_timeout_seconds
+        .is_some_and(|value| !timeout_in_bounds(value))
+        || config
+            .max_duration_seconds
+            .is_some_and(|value| !timeout_in_bounds(value))
+        || matches!(
+            (config.idle_timeout_seconds, config.max_duration_seconds),
+            (Some(idle), Some(maximum)) if idle > maximum
+        )
+    {
+        return Err(ManifestError::InvalidTelemetryTimeout);
+    }
+    Ok(())
+}
+
+fn valid_telemetry_attribute(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .chars()
+            .all(|character| !character.is_whitespace() && !character.is_control())
 }
 
 fn valid_slug(value: &str) -> bool {
@@ -312,6 +389,83 @@ mod tests {
         assert_eq!(
             validate_manifest(&value),
             Err(ManifestError::CrossOriginAuthenticatedReset)
+        );
+    }
+
+    fn automatic_boundary() -> TelemetryBoundaryConfig {
+        TelemetryBoundaryConfig {
+            boundary_kind: RunBoundaryKind::WorkflowExecution,
+            default_policy_pack_id: Some(PolicyPackId::new()),
+            idle_timeout_seconds: Some(300),
+            max_duration_seconds: Some(3_600),
+            ..TelemetryBoundaryConfig::default()
+        }
+    }
+
+    #[test]
+    fn canonical_automatic_boundary_is_valid() {
+        assert_eq!(validate_telemetry_boundary(&automatic_boundary()), Ok(()));
+    }
+
+    #[test]
+    fn disabled_automatic_boundary_keeps_backward_compatible_defaults() {
+        let mut config = TelemetryBoundaryConfig::default();
+        config.external_id_attributes.clear();
+        config.terminal_attribute = None;
+        assert_eq!(validate_telemetry_boundary(&config), Ok(()));
+    }
+
+    #[test]
+    fn automatic_boundary_requires_session_and_terminal_attributes() {
+        let mut config = automatic_boundary();
+        config.external_id_attributes.clear();
+        assert_eq!(
+            validate_telemetry_boundary(&config),
+            Err(ManifestError::InvalidExternalIdAttributes)
+        );
+        config.external_id_attributes = vec!["workflow.run.id".to_owned()];
+        config.terminal_attribute = None;
+        assert_eq!(
+            validate_telemetry_boundary(&config),
+            Err(ManifestError::MissingTerminalAttribute)
+        );
+    }
+
+    #[test]
+    fn automatic_boundary_rejects_duplicate_or_unsafe_attributes() {
+        let mut config = automatic_boundary();
+        config.external_id_attributes = vec!["workflow.run.id".to_owned(); 2];
+        assert_eq!(
+            validate_telemetry_boundary(&config),
+            Err(ManifestError::InvalidExternalIdAttributes)
+        );
+        config.external_id_attributes = vec!["workflow run id".to_owned()];
+        assert_eq!(
+            validate_telemetry_boundary(&config),
+            Err(ManifestError::InvalidTelemetryAttribute)
+        );
+    }
+
+    #[test]
+    fn automatic_boundary_rejects_ci_and_invalid_timing() {
+        let mut config = automatic_boundary();
+        config.boundary_kind = RunBoundaryKind::ExplicitCi;
+        assert_eq!(
+            validate_telemetry_boundary(&config),
+            Err(ManifestError::InvalidTelemetryBoundaryKind)
+        );
+        config.boundary_kind = RunBoundaryKind::AgentTask;
+        config.settle_seconds = 301;
+        assert_eq!(
+            validate_telemetry_boundary(&config),
+            Err(ManifestError::InvalidSettleSeconds)
+        );
+        config.settle_seconds = 10;
+        config.idle_timeout_seconds = Some(600);
+        config.max_duration_seconds = Some(300);
+        assert_eq!(
+            validate_telemetry_boundary(&config),
+            Err(ManifestError::InvalidTelemetryTimeout)
         );
     }
 }

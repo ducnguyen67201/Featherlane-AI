@@ -175,6 +175,26 @@ This inline path works with any SDK or workflow behind the small HTTP contract;
 the longer-lived `start`/`complete`/`wait` path above collects standard OTLP
 across multiple traces.
 
+For an already instrumented agent, assign an approved default policy and
+session/terminal attributes under **Agents → Automatic trace evaluation**. The
+target-scoped ingest key identifies the agent, the external session attribute
+groups all related traces, and the terminal signal automatically finalizes and
+evaluates the session—there is no trace picker or manual run-start step.
+
+Run the included two-trace smoke check against the local stack:
+
+```bash
+# With Doppler-managed local secrets
+doppler run -- docker compose up --build -d
+
+POLICY_PACK_ID=<approved-policy-uuid> \
+  ./scripts/smoke-passive-auto-evaluation.sh
+```
+
+Without Doppler, use the `.env`/Compose setup from Quick start and run the same
+smoke script. It requires `bash`, `curl`, and `jq` and exits nonzero unless one
+terminal session becomes one completed evaluation containing two traces.
+
 ## Repository map
 
 ```text

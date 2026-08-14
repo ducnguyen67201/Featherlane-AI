@@ -17,7 +17,8 @@ use governance_domain::{
 };
 use governance_targets::{
     CapabilityReport, DriverType, EvidenceMode, RegisteredTarget, ScenarioDefinition,
-    TargetEnvironment, TargetManifest, validate_registration,
+    TargetEnvironment, TargetManifest, TelemetryBoundaryConfig, validate_registration,
+    validate_telemetry_boundary,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -39,6 +40,9 @@ pub struct TargetView {
     pub checked_at: String,
     pub latest_trace_quality: Option<TraceQualityStatus>,
     pub last_evaluated: Option<String>,
+    pub auto_evaluation_enabled: bool,
+    pub automatic_boundary_kind: Option<RunBoundaryKind>,
+    pub default_policy_pack_id: Option<PolicyPackId>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -175,6 +179,11 @@ pub struct CreateTargetRequest {
     pub otlp_required: bool,
     #[serde(default)]
     pub telemetry_boundary: governance_targets::TelemetryBoundaryConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ConfigureTelemetryBoundaryRequest {
+    pub telemetry_boundary: TelemetryBoundaryConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -363,6 +372,9 @@ pub(crate) fn target_view(
     target: &RegisteredTarget,
     latest: Option<&StoredEvaluationRun>,
 ) -> TargetView {
+    let telemetry_boundary = &target.manifest.telemetry_boundary;
+    let auto_evaluation_enabled = telemetry_boundary.default_policy_pack_id.is_some()
+        && validate_telemetry_boundary(telemetry_boundary).is_ok();
     TargetView {
         id: target.id.to_string(),
         name: target.name.clone(),
@@ -379,6 +391,10 @@ pub(crate) fn target_view(
         checked_at: rfc3339(target.capability.checked_at),
         latest_trace_quality: latest.map(|run| run.evidence.trace_quality),
         last_evaluated: latest.map(|run| rfc3339(run.completed_at)),
+        auto_evaluation_enabled,
+        automatic_boundary_kind: auto_evaluation_enabled
+            .then_some(telemetry_boundary.boundary_kind),
+        default_policy_pack_id: telemetry_boundary.default_policy_pack_id,
     }
 }
 
