@@ -27,7 +27,7 @@ use governance_persistence::{
 use governance_targets::{
     CapabilityReport, DefaultDriverRegistry, DriverError, TargetDriverRegistry,
 };
-use governance_worker::ProcessPolicyImportWorker;
+use governance_worker::{AcquirePolicySourceWorker, ProcessPolicyImportWorker};
 use loco_rs::{
     Result,
     app::{AppContext, Hooks},
@@ -36,7 +36,7 @@ use loco_rs::{
     config::{Config, WorkerMode},
     controller::{AppRoutes, Routes},
     environment::Environment,
-    prelude::{get, patch, post},
+    prelude::{delete, get, patch, post},
     task::Tasks,
 };
 use time::OffsetDateTime;
@@ -78,6 +78,8 @@ impl Hooks for App {
     async fn after_context(context: AppContext) -> Result<AppContext> {
         let policy_imports = crate::policy_imports::PolicyImportServices::from_env()
             .map_err(|error| loco_rs::Error::Message(error.to_string()))?;
+        let source_connectors = governance_config::SourceConnectorConfig::from_env()
+            .map_err(|error| loco_rs::Error::Message(error.to_string()))?;
         let otlp_http = match std::env::var("GOVERNANCE_OTLP_HTTP_ENDPOINT") {
             Ok(endpoint) if !endpoint.trim().is_empty() => endpoint,
             _ if matches!(
@@ -94,6 +96,7 @@ impl Hooks for App {
             }
         };
         context.shared_store.insert(policy_imports);
+        context.shared_store.insert(source_connectors);
         context.shared_store.insert(RuntimeEndpoints { otlp_http });
         Ok(context)
     }
@@ -105,6 +108,9 @@ impl Hooks for App {
     async fn connect_workers(context: &AppContext, queue: &Queue) -> Result<()> {
         queue
             .register(ProcessPolicyImportWorker::build(context))
+            .await?;
+        queue
+            .register(AcquirePolicySourceWorker::build(context))
             .await?;
         Ok(())
     }
@@ -120,6 +126,7 @@ impl Hooks for App {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn api_routes() -> Routes {
     Routes::new()
         .add("/health", get(loco_health))
@@ -180,6 +187,90 @@ fn api_routes() -> Routes {
             "/v1/policy-imports/{id}/compile",
             post(crate::policy_imports::compile_import),
         )
+        .add(
+            "/v1/policy-imports/{id}/ocr-source",
+            post(crate::policy_imports::attach_ocr_source),
+        )
+        .add(
+            "/v1/policy-collections",
+            get(crate::policy_collections::list_collections),
+        )
+        .add(
+            "/v1/policy-collections",
+            post(crate::policy_collections::create_collection),
+        )
+        .add(
+            "/v1/policy-collections/{id}",
+            get(crate::policy_collections::get_collection),
+        )
+        .add(
+            "/v1/policy-collections/{id}/imports",
+            post(crate::policy_collections::add_import),
+        )
+        .add(
+            "/v1/policy-collections/{id}/imports/{import_id}",
+            delete(crate::policy_collections::remove_import),
+        )
+        .add(
+            "/v1/policy-collections/{id}/clone",
+            post(crate::policy_collections::clone_collection),
+        )
+        .add(
+            "/v1/policy-collections/{id}/readiness",
+            get(crate::policy_collections::readiness),
+        )
+        .add(
+            "/v1/policy-collections/{id}/compile",
+            post(crate::policy_collections::compile),
+        )
+        .add(
+            "/v1/policy-collections/{id}/uploads",
+            post(crate::policy_collections::upload_batch),
+        )
+        .add(
+            "/v1/policy-collections/{id}/urls",
+            post(crate::policy_collections::url_batch),
+        )
+        .add(
+            "/v1/policy-collections/{id}/pastes",
+            post(crate::policy_collections::paste_batch),
+        )
+        .add(
+            "/v1/policy-collections/{id}/selections",
+            post(crate::policy_collections::provider_selection_batch),
+        )
+        .add(
+            "/v1/source-ingestion-batches/{id}",
+            get(crate::policy_collections::get_batch),
+        )
+        .add(
+            "/v1/source-connections",
+            get(crate::source_connections::list),
+        )
+        .add(
+            "/v1/source-connections/{provider}/authorize",
+            post(crate::source_connections::authorize),
+        )
+        .add(
+            "/v1/source-connections/{provider}/callback",
+            get(crate::source_connections::callback),
+        )
+        .add(
+            "/v1/source-connections/{id}/picker-token",
+            get(crate::source_connections::picker_token),
+        )
+        .add(
+            "/v1/source-connections/{id}/browse",
+            get(crate::source_connections::browse),
+        )
+        .add(
+            "/v1/source-connections/{id}",
+            delete(crate::source_connections::disconnect),
+        )
+        .add(
+            "/v1/source-connections/{id}/sync",
+            post(crate::source_connections::sync),
+        )
         .add("/v1/targets", get(loco_targets))
         .add("/v1/targets", post(loco_create_target))
         .add("/v1/targets/{id}", get(loco_target))
@@ -218,6 +309,31 @@ async fn loco_health(State(context): State<AppContext>) -> Json<HealthResponse> 
             "durable_queue"
         } else {
             "not_durable"
+        },
+        source_connectors: {
+            let config = context
+                .shared_store
+                .get::<governance_config::SourceConnectorConfig>();
+            crate::SourceConnectorAvailability {
+                google_drive: if config.as_ref().is_some_and(|value| value.google.is_some()) {
+                    "configured"
+                } else {
+                    "unavailable"
+                },
+                microsoft_graph: if config
+                    .as_ref()
+                    .is_some_and(|value| value.microsoft.is_some())
+                {
+                    "configured"
+                } else {
+                    "unavailable"
+                },
+                notion: if config.as_ref().is_some_and(|value| value.notion.is_some()) {
+                    "configured"
+                } else {
+                    "unavailable"
+                },
+            }
         },
     })
 }

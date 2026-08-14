@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use governance_application::{
-    ApplicationError, PolicyImportRepository, PolicyPackRepository, VerifySourceCommand,
+    ApplicationError, PolicyImportRepository, PolicyImportTransformationRecord,
+    PolicyPackRepository, VerifySourceCommand,
 };
 use governance_domain::{
-    CandidateReview, DocumentFormat, ExtractionBatch, ParsedDocument, PolicyBundle,
+    CandidateReview, DocumentFormat, ExtractionBatch, OrganizationId, ParsedDocument, PolicyBundle,
     PolicyCandidate, PolicyCandidateId, PolicyCandidateReviewRecord, PolicyImport,
     PolicyImportCoverage, PolicyImportId, PolicyImportStatus, PolicyPack, PolicyPackId,
     SourceVerificationStatus,
@@ -17,7 +18,9 @@ use time::OffsetDateTime;
 
 use crate::{
     SeaOrmPolicyPackRepository,
-    entities::{policy_candidate_reviews, policy_candidates, policy_imports},
+    entities::{
+        policy_candidate_reviews, policy_candidates, policy_import_transformations, policy_imports,
+    },
     enum_string, persist_bundle, repository_error, serialization_error,
 };
 
@@ -87,6 +90,25 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
         Ok(import.clone())
     }
 
+    async fn create_with_transformation(
+        &self,
+        import: &PolicyImport,
+        transformation: &PolicyImportTransformationRecord,
+    ) -> Result<PolicyImport, ApplicationError> {
+        super::ensure_organization(&self.database, import.organization_id).await?;
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        import_active_model(import)?
+            .insert(&transaction)
+            .await
+            .map_err(repository_error)?;
+        transformation_active_model(transformation)?
+            .insert(&transaction)
+            .await
+            .map_err(repository_error)?;
+        transaction.commit().await.map_err(repository_error)?;
+        Ok(import.clone())
+    }
+
     async fn get(
         &self,
         organization_id: governance_domain::OrganizationId,
@@ -100,6 +122,37 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
             .map_err(repository_error)?
             .map(import_from_model)
             .transpose()
+    }
+
+    async fn list_transformations(
+        &self,
+        organization_id: OrganizationId,
+        id: PolicyImportId,
+    ) -> Result<Vec<governance_domain::PolicyImportTransformation>, ApplicationError> {
+        policy_import_transformations::Entity::find()
+            .filter(policy_import_transformations::Column::OrganizationId.eq(organization_id.0))
+            .filter(policy_import_transformations::Column::PolicyImportId.eq(id.0))
+            .order_by_asc(policy_import_transformations::Column::CreatedAt)
+            .all(&self.database)
+            .await
+            .map_err(repository_error)?
+            .into_iter()
+            .map(|model| {
+                Ok(governance_domain::PolicyImportTransformation {
+                    id: governance_domain::PolicyImportTransformationId(model.id),
+                    organization_id: OrganizationId(model.organization_id),
+                    policy_import_id: PolicyImportId(model.policy_import_id),
+                    kind: enum_from_string(&model.kind)?,
+                    input_sha256: model.input_sha256,
+                    output_sha256: model.output_sha256,
+                    output_mime_type: model.output_mime_type,
+                    processor: model.processor,
+                    processor_version: model.processor_version,
+                    created_by: model.created_by,
+                    created_at: model.created_at,
+                })
+            })
+            .collect()
     }
 
     async fn list(
@@ -638,6 +691,85 @@ impl PolicyImportRepository for SeaOrmPolicyImportRepository {
             .get(organization_id, pack_id)
             .await
     }
+
+    async fn activate_transformation(
+        &self,
+        record: &PolicyImportTransformationRecord,
+    ) -> Result<PolicyImport, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        let model = policy_imports::Entity::find()
+            .filter(
+                policy_imports::Column::OrganizationId.eq(record.transformation.organization_id.0),
+            )
+            .filter(policy_imports::Column::Id.eq(record.transformation.policy_import_id.0))
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .map_err(repository_error)?
+            .ok_or_else(|| {
+                ApplicationError::NotFound(record.transformation.policy_import_id.to_string())
+            })?;
+        if model.status != enum_string(PolicyImportStatus::NeedsOcr)?
+            || model.active_transformation_id.is_some()
+        {
+            return Err(ApplicationError::Conflict(
+                "policy import is not awaiting an OCR transformation".to_owned(),
+            ));
+        }
+        transformation_active_model(record)?
+            .insert(&transaction)
+            .await
+            .map_err(repository_error)?;
+        let now = OffsetDateTime::now_utc();
+        let mut active: policy_imports::ActiveModel = model.into();
+        active.processing_object_key = Set(record.output_object_key.clone());
+        active.processing_content_sha256 = Set(record.transformation.output_sha256.clone());
+        active.processing_mime_type = Set(record.transformation.output_mime_type.clone());
+        active.active_transformation_id = Set(Some(record.transformation.id.0));
+        active.status = Set(enum_string(PolicyImportStatus::Queued)?);
+        active.verification_status = Set(enum_string(SourceVerificationStatus::Pending)?);
+        active.verified_by = Set(None);
+        active.verified_at = Set(None);
+        active.verification_notes = Set(None);
+        active.failure_code = Set(None);
+        active.failure_detail = Set(None);
+        active.completed_at = Set(None);
+        active.updated_at = Set(now);
+        active
+            .update(&transaction)
+            .await
+            .map_err(repository_error)?;
+        transaction.commit().await.map_err(repository_error)?;
+        self.get(
+            record.transformation.organization_id,
+            record.transformation.policy_import_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            ApplicationError::NotFound(record.transformation.policy_import_id.to_string())
+        })
+    }
+}
+
+fn transformation_active_model(
+    record: &PolicyImportTransformationRecord,
+) -> Result<policy_import_transformations::ActiveModel, ApplicationError> {
+    Ok(policy_import_transformations::ActiveModel {
+        id: Set(record.transformation.id.0),
+        organization_id: Set(record.transformation.organization_id.0),
+        policy_import_id: Set(record.transformation.policy_import_id.0),
+        kind: Set(enum_string(record.transformation.kind)?),
+        input_object_key: Set(record.input_object_key.clone()),
+        input_sha256: Set(record.transformation.input_sha256.clone()),
+        output_object_key: Set(record.output_object_key.clone()),
+        output_sha256: Set(record.transformation.output_sha256.clone()),
+        output_mime_type: Set(record.transformation.output_mime_type.clone()),
+        processor: Set(record.transformation.processor.clone()),
+        processor_version: Set(record.transformation.processor_version.clone()),
+        created_by: Set(record.transformation.created_by.clone()),
+        metadata: Set(record.metadata.clone()),
+        created_at: Set(record.transformation.created_at),
+    })
 }
 
 fn import_active_model(
@@ -662,6 +794,14 @@ fn import_active_model(
         byte_length: Set(i64::try_from(import.byte_length).unwrap_or(i64::MAX)),
         content_sha256: Set(import.content_sha256.clone()),
         raw_object_key: Set(import.raw_object_key.clone()),
+        processing_object_key: Set(import.processing_object_key.clone()),
+        processing_content_sha256: Set(import.processing_content_sha256.clone()),
+        processing_mime_type: Set(import.processing_mime_type.clone()),
+        active_transformation_id: Set(import.active_transformation_id.map(|id| id.0)),
+        ingestion_item_id: Set(import.ingestion_item_id.map(|id| id.0)),
+        source_subscription_id: Set(import.source_subscription_id.map(|id| id.0)),
+        external_revision: Set(import.external_revision.clone()),
+        external_modified_at: Set(import.external_modified_at),
         normalized_object_key: Set(import.normalized_object_key.clone()),
         parser_kind: Set(import.parser_kind.clone()),
         parser_version: Set(import.parser_version.clone()),
@@ -708,6 +848,20 @@ fn import_from_model(model: policy_imports::Model) -> Result<PolicyImport, Appli
         byte_length: u64::try_from(model.byte_length).unwrap_or_default(),
         content_sha256: model.content_sha256,
         raw_object_key: model.raw_object_key,
+        processing_object_key: model.processing_object_key,
+        processing_content_sha256: model.processing_content_sha256,
+        processing_mime_type: model.processing_mime_type,
+        active_transformation_id: model
+            .active_transformation_id
+            .map(governance_domain::PolicyImportTransformationId),
+        ingestion_item_id: model
+            .ingestion_item_id
+            .map(governance_domain::SourceIngestionItemId),
+        source_subscription_id: model
+            .source_subscription_id
+            .map(governance_domain::SourceSubscriptionId),
+        external_revision: model.external_revision,
+        external_modified_at: model.external_modified_at,
         normalized_object_key: model.normalized_object_key,
         parser_kind: model.parser_kind,
         parser_version: model.parser_version,

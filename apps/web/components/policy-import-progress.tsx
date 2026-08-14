@@ -13,6 +13,7 @@ export function PolicyImportProgress({ initialImport }: { initialImport: PolicyI
   const [policyImport, setPolicyImport] = useState(initialImport);
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [ocrFile, setOcrFile] = useState<File | null>(null);
   const [visibilityVersion, setVisibilityVersion] = useState(0);
   const [pollVersion, setPollVersion] = useState(0);
 
@@ -61,6 +62,25 @@ export function PolicyImportProgress({ initialImport }: { initialImport: PolicyI
     setRetrying(false);
   }
 
+  async function uploadOcr() {
+    if (!ocrFile) return setError("Choose an OCR-processed PDF, DOCX, or TXT file.");
+    const validation = validateOcrFile(ocrFile);
+    if (validation) return setError(validation);
+    setRetrying(true);
+    setError("");
+    const form = new FormData();
+    form.set("file", ocrFile);
+    const response = await fetch(`/api/policy-imports/${policyImport.id}/ocr-source`, { method: "POST", body: form });
+    const payload = await response.json().catch(() => null) as PolicyImport | { detail?: string } | null;
+    if (!response.ok || !payload || !("status" in payload)) {
+      setError(payload && "detail" in payload ? payload.detail ?? "OCR upload failed." : "OCR upload failed.");
+      setRetrying(false);
+      return;
+    }
+    setPolicyImport(payload);
+    setRetrying(false);
+  }
+
   const progress = importProgress(policyImport.status);
   const readyForReview = ["review_required", "ready_to_compile", "compiled"].includes(policyImport.status);
   const isFailure = policyImport.status.startsWith("failed") || policyImport.status === "needs_ocr";
@@ -89,9 +109,8 @@ export function PolicyImportProgress({ initialImport }: { initialImport: PolicyI
               <RotateCcw size={15} /> {retrying ? "Retrying…" : "Retry extraction"}
             </button>
           )}
-          {(policyImport.status === "needs_ocr" || policyImport.status === "failed_terminal") && (
-            <Link className="secondary-button" href="/policies/imports/new">Upload replacement source</Link>
-          )}
+          {policyImport.status === "needs_ocr" && <div className="ocr-upload"><label className="secondary-button">Choose OCR output<input type="file" accept=".pdf,.docx,.txt" onChange={(event) => setOcrFile(event.target.files?.[0] ?? null)} /></label><button className="primary-button" type="button" onClick={() => void uploadOcr()} disabled={!ocrFile || retrying}>Attach and resume</button></div>}
+          {policyImport.status === "failed_terminal" && <Link className="secondary-button" href="/policies/imports/new">Upload replacement source</Link>}
           {readyForReview && policyImport.status !== "compiled" && (
             <Link className="primary-button" href={`/policies/imports/${policyImport.id}/review`}>Review candidates</Link>
           )}
@@ -103,10 +122,12 @@ export function PolicyImportProgress({ initialImport }: { initialImport: PolicyI
 
       <section className="import-metadata-grid">
         <article><span>Source</span><strong>{policyImport.source_type.replaceAll("_", " ")} · revision {policyImport.revision}</strong><small>{policyImport.jurisdiction} · {policyImport.policy_source_id.slice(0, 12)}…</small></article>
-        <article><span>Artifact</span><strong>{formatBytes(policyImport.byte_length)}</strong><small className="mono">{policyImport.content_sha256.slice(0, 14)}…</small></article>
+        <article><span>Raw artifact</span><strong>{formatBytes(policyImport.byte_length)}</strong><small className="mono">{policyImport.content_sha256.slice(0, 14)}…</small></article>
+        {policyImport.active_transformation_id && <article><span>Processing transformation</span><strong>{policyImport.processing_mime_type}</strong><small className="mono">{policyImport.processing_content_sha256.slice(0, 14)}… · verification reset</small></article>}
         <article><span>Coverage</span><strong>{policyImport.coverage.processed_chunks}/{policyImport.coverage.total_chunks} chunks</strong><small>{policyImport.coverage.failed_chunks.length} failed</small></article>
         <article><span>Candidates</span><strong>{policyImport.candidate_count}</strong><small>{policyImport.model_name ?? "Waiting for extraction"}</small></article>
       </section>
+      {policyImport.transformations.length > 0 && <section className="panel transformation-list"><div className="section-header"><div><h2>Retained transformations</h2><p>The original artifact remains immutable; processing uses the selected derived artifact.</p></div></div>{policyImport.transformations.map((transformation) => <article key={transformation.id}><strong>{transformation.kind.replaceAll("_", " ")}</strong><span>{transformation.processor} {transformation.processor_version} · {transformation.output_mime_type}</span><small className="mono">{transformation.input_sha256.slice(0, 14)}… → {transformation.output_sha256.slice(0, 14)}…</small><small>{transformation.created_by} · {new Date(transformation.created_at).toLocaleString()}</small></article>)}</section>}
     </>
   );
 }
@@ -131,4 +152,9 @@ function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function validateOcrFile(file: File) {
+  if (!file.size || file.size > 25 * 1024 * 1024) return "OCR output must be between 1 byte and 25 MiB.";
+  return /\.(pdf|docx|txt)$/i.test(file.name) ? null : "OCR output must be PDF, DOCX, or TXT.";
 }

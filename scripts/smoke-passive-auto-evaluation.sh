@@ -129,12 +129,14 @@ actual_policy="$(jq -r '.run.policy_pack_id' <<<"${detail}")"
 completion_reason="$(jq -r '.run.completion_reason' <<<"${detail}")"
 trace_count="$(jq -r '.run.trace_count' <<<"${detail}")"
 verdict="$(jq -r '.run.verdict // "pending"' <<<"${detail}")"
+normalized_verdict="$(printf '%s' "${verdict}" | tr '[:lower:]' '[:upper:]')"
+normalized_expected_verdict="$(printf '%s' "${expected_verdict}" | tr '[:lower:]' '[:upper:]')"
 
 [[ "${state}" == "completed" ]] || { echo "ERROR: run ended in state ${state}" >&2; exit 1; }
 [[ "${actual_policy}" == "${policy_pack_id}" ]] || { echo "ERROR: run used unexpected policy" >&2; exit 1; }
 [[ "${completion_reason}" == "terminal_event" ]] || { echo "ERROR: run did not close from terminal telemetry" >&2; exit 1; }
 [[ "${trace_count}" == "2" ]] || { echo "ERROR: expected 2 traces, received ${trace_count}" >&2; exit 1; }
-if [[ -n "${expected_verdict}" && "${verdict^^}" != "${expected_verdict^^}" ]]; then
+if [[ -n "${expected_verdict}" && "${normalized_verdict}" != "${normalized_expected_verdict}" ]]; then
   echo "ERROR: expected verdict ${expected_verdict}, received ${verdict}" >&2
   exit 1
 fi

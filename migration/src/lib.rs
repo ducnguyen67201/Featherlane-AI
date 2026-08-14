@@ -5,6 +5,7 @@ mod m20260813_000002_policy_import_workflow;
 mod m20260813_000002_target_versions;
 mod m20260813_000003_correlated_evaluation_runs;
 mod m20260813_000004_policy_source_lineage;
+mod m20260814_000005_document_ingestion_collections;
 
 #[derive(Debug)]
 pub struct Migrator;
@@ -18,6 +19,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000002_policy_import_workflow::Migration),
             Box::new(m20260813_000003_correlated_evaluation_runs::Migration),
             Box::new(m20260813_000004_policy_source_lineage::Migration),
+            Box::new(m20260814_000005_document_ingestion_collections::Migration),
         ]
     }
 }

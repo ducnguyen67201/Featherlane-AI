@@ -57,12 +57,22 @@ id_type!(PolicyImportId);
 id_type!(PolicySourceId);
 id_type!(PolicyCandidateId);
 id_type!(PolicyCandidateReviewId);
+id_type!(PolicyCollectionId);
+id_type!(SourceConnectionId);
+id_type!(SourceSubscriptionId);
+id_type!(SourceIngestionBatchId);
+id_type!(SourceIngestionItemId);
+id_type!(PolicyImportTransformationId);
 
 mod evaluation_run;
+mod policy_collection;
 mod policy_import;
+mod source_connection;
 
 pub use evaluation_run::*;
+pub use policy_collection::*;
 pub use policy_import::*;
+pub use source_connection::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

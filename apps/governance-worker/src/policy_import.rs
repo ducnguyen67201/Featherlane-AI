@@ -1,10 +1,14 @@
-use governance_application::{PolicyImportRepository, ProcessPolicyImport};
+use governance_application::{
+    PolicyImportRepository, ProcessPolicyImport, SourceIngestionRepository,
+};
 use governance_config::PolicyImportConfig;
-use governance_domain::{OrganizationId, PolicyImportId, PolicyImportStatus};
+use governance_domain::{
+    OrganizationId, PolicyImportId, PolicyImportStatus, SourceIngestionItemStatus,
+};
 use governance_ingestion::{
     ConfiguredPolicyExtractionModel, OpenDalArtifactStore, SafePolicyDocumentParser,
 };
-use governance_persistence::SeaOrmPolicyImportRepository;
+use governance_persistence::{SeaOrmPolicyImportRepository, SeaOrmSourceIngestionRepository};
 use loco_rs::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +21,7 @@ pub struct ProcessPolicyImportArgs {
 #[derive(Clone, Debug)]
 pub struct ProcessPolicyImportWorker {
     repository: SeaOrmPolicyImportRepository,
+    ingestion: SeaOrmSourceIngestionRepository,
     setup: PolicyImportWorkerSetup,
 }
 
@@ -34,6 +39,7 @@ enum PolicyImportWorkerSetup {
     },
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
     fn build(context: &AppContext) -> Self {
@@ -71,6 +77,7 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
         );
         Self {
             repository: SeaOrmPolicyImportRepository::new(context.db.clone()),
+            ingestion: SeaOrmSourceIngestionRepository::new(context.db.clone()),
             setup,
         }
     }
@@ -105,13 +112,99 @@ impl BackgroundWorker<ProcessPolicyImportArgs> for ProcessPolicyImportWorker {
                 {
                     tracing::warn!(policy_import_id = %args.policy_import_id, error = %persistence_error, "failed to persist policy import configuration failure");
                 }
+                if let Ok(Some(import)) = self
+                    .repository
+                    .get(args.organization_id, args.policy_import_id)
+                    .await
+                    && let Some(item_id) = import.ingestion_item_id
+                    && let Ok(item) = self
+                        .ingestion
+                        .update_item(
+                            args.organization_id,
+                            item_id,
+                            SourceIngestionItemStatus::Failed,
+                            Some(args.policy_import_id),
+                            Some((code, detail)),
+                        )
+                        .await
+                {
+                    let _ = self
+                        .ingestion
+                        .recompute_batch(args.organization_id, item.batch_id)
+                        .await;
+                }
                 return Err(loco_rs::Error::Worker(error.clone()));
             }
         };
-        let import = ProcessPolicyImport::new(self.repository.clone(), artifacts, parser, model)
-            .execute(args.organization_id, args.policy_import_id)
+        let queued_import = self
+            .repository
+            .get(args.organization_id, args.policy_import_id)
             .await
             .map_err(|error| loco_rs::Error::Worker(error.to_string()))?;
+        if let Some(item_id) = queued_import
+            .as_ref()
+            .and_then(|import| import.ingestion_item_id)
+        {
+            let _ = self
+                .ingestion
+                .update_item(
+                    args.organization_id,
+                    item_id,
+                    SourceIngestionItemStatus::Processing,
+                    Some(args.policy_import_id),
+                    None,
+                )
+                .await;
+        }
+        let result = ProcessPolicyImport::new(self.repository.clone(), artifacts, parser, model)
+            .execute(args.organization_id, args.policy_import_id)
+            .await;
+        let import = match result {
+            Ok(import) => import,
+            Err(error) => {
+                if let Some(item_id) = queued_import.and_then(|import| import.ingestion_item_id)
+                    && let Ok(item) = self
+                        .ingestion
+                        .update_item(
+                            args.organization_id,
+                            item_id,
+                            SourceIngestionItemStatus::Failed,
+                            Some(args.policy_import_id),
+                            Some(("processing_failed", "policy source processing failed")),
+                        )
+                        .await
+                {
+                    let _ = self
+                        .ingestion
+                        .recompute_batch(args.organization_id, item.batch_id)
+                        .await;
+                }
+                return Err(loco_rs::Error::Worker(error.to_string()));
+            }
+        };
+        if let Some(item_id) = import.ingestion_item_id {
+            let item_status = if import.status == PolicyImportStatus::NeedsOcr {
+                SourceIngestionItemStatus::Blocked
+            } else {
+                SourceIngestionItemStatus::ReviewRequired
+            };
+            if let Ok(item) = self
+                .ingestion
+                .update_item(
+                    import.organization_id,
+                    item_id,
+                    item_status,
+                    Some(import.id),
+                    None,
+                )
+                .await
+            {
+                let _ = self
+                    .ingestion
+                    .recompute_batch(import.organization_id, item.batch_id)
+                    .await;
+            }
+        }
         tracing::info!(
             policy_import_id = %import.id,
             organization_id = %import.organization_id,

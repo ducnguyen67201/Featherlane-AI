@@ -336,7 +336,7 @@ export interface PolicyImport {
   revision: number;
   supersedes_import_id: string | null;
   status: PolicyImportStatus;
-  input_kind: "file" | "pasted_text";
+  input_kind: "file" | "pasted_text" | "url" | "google_drive" | "microsoft_graph" | "notion";
   source_type: "primary_law" | "official_guidance" | "standard" | "company_policy" | "expert_interpretation";
   title: string;
   jurisdiction: string;
@@ -346,6 +346,23 @@ export interface PolicyImport {
   detected_mime_type: string;
   byte_length: number;
   content_sha256: string;
+  processing_content_sha256: string;
+  processing_mime_type: string;
+  active_transformation_id: string | null;
+  transformations: Array<{
+    id: string;
+    kind: "html_to_text" | "notion_markdown" | "manual_ocr";
+    input_sha256: string;
+    output_sha256: string;
+    output_mime_type: string;
+    processor: string;
+    processor_version: string;
+    created_by: string;
+    created_at: string;
+  }>;
+  ingestion_item_id: string | null;
+  source_subscription_id: string | null;
+  external_revision: string | null;
   parser_kind: string | null;
   parser_version: string | null;
   model_provider: string | null;
@@ -363,6 +380,70 @@ export interface PolicyImport {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+}
+
+export interface PolicyCollection {
+  id: string;
+  organization_id: string;
+  key: string;
+  version: number;
+  title: string;
+  status: "draft" | "compiled";
+  compiled_policy_pack_id: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PolicyCollectionMember {
+  policy_collection_id: string;
+  policy_import_id: string;
+  policy_source_id: string;
+  position: number;
+  added_at: string;
+}
+
+export interface PolicyCollectionDetail {
+  collection: PolicyCollection;
+  members: PolicyCollectionMember[];
+  batches: SourceIngestionBatch[];
+}
+
+export interface PolicyCollectionReadiness {
+  source_count: number;
+  review_complete_count: number;
+  approved_rule_count: number;
+  blockers: Array<{ policy_import_id: string; title: string; blockers: string[] }>;
+  collection_blockers: string[];
+}
+
+export interface SourceConnection {
+  id: string;
+  provider: "google_drive" | "microsoft_graph" | "notion";
+  display_label: string;
+  status: "active" | "reauthorization_required" | "disconnected";
+  granted_scopes: string[];
+  last_sync_at: string | null;
+}
+
+export interface SourceIngestionBatch {
+  id: string;
+  policy_collection_id: string | null;
+  kind: "upload" | "paste" | "url" | "google_drive" | "microsoft_graph" | "notion" | "sync";
+  status: "pending" | "running" | "partial" | "complete" | "failed";
+  total_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  unchanged_count: number;
+}
+
+export interface SourceIngestionItem {
+  id: string;
+  client_item_key: string;
+  status: "pending" | "acquiring" | "queued" | "processing" | "review_required" | "unchanged" | "blocked" | "failed";
+  policy_import_id: string | null;
+  failure_code: string | null;
+  failure_detail: string | null;
 }
 
 export interface SourceLocator {

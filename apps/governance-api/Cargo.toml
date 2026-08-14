@@ -10,6 +10,7 @@ async-trait.workspace = true
 axum.workspace = true
 governance-application.workspace = true
 governance-config.workspace = true
+governance-connectors.workspace = true
 governance-corpus.workspace = true
 governance-domain.workspace = true
 governance-evaluator.workspace = true
@@ -22,15 +23,19 @@ governance-worker = { path = "../governance-worker" }
 governance-migration = { path = "../../migration" }
 http.workspace = true
 loco-rs.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 time.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

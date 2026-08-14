@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Check, FileCheck2, LoaderCircle, Plus, ShieldCheck, X } from "lucide-react";
@@ -13,12 +14,13 @@ const DEFAULT_RULE: RuleSuggestion = {
   evidence_required: [],
 };
 
-export function PolicyReviewWorkspace({ initialImport, initialCandidates, reviewerIdentity, compiledPackStatus, eventTypes }: {
+export function PolicyReviewWorkspace({ initialImport, initialCandidates, reviewerIdentity, compiledPackStatus, eventTypes, collectionId }: {
   initialImport: PolicyImport;
   initialCandidates: PolicyCandidate[];
   reviewerIdentity: string;
   compiledPackStatus: string | null;
   eventTypes: string[];
+  collectionId?: string;
 }) {
   const router = useRouter();
   const [policyImport, setPolicyImport] = useState(initialImport);
@@ -117,6 +119,7 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates, review
 
   return (
     <>
+      {collectionId && <div className="source-revision-notice"><ShieldCheck size={18} /><div><strong>This source belongs to a policy collection</strong><span>Review remains source-specific; compilation happens after every collection member is complete.</span></div><Link className="secondary-button" href={`/policies/collections/${collectionId}`}>Back to collection</Link></div>}
       <section className={`review-toolbar panel${compiled ? " compiled" : ""}`}>
         <div><span>Signed-in reviewer</span><input value={reviewerIdentity} readOnly aria-label="Reviewer identity" /></div>
         <div><span>Source verification</span><StateBadge state={policyImport.verification_status} /></div>
@@ -188,7 +191,7 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates, review
         </form>
       </details>}
 
-      {!compiled && <form className="panel compile-panel" onSubmit={(event) => { event.preventDefault(); void compile(event.currentTarget); }}>
+      {!compiled && !collectionId && <form className="panel compile-panel" onSubmit={(event) => { event.preventDefault(); void compile(event.currentTarget); }}>
         <div><ShieldCheck size={21} /><div><h2>Compile approved candidates</h2><p>Creates a database-backed draft pack. Publishing remains a separate policy-owner action.</p></div></div>
         <label className="field"><span>Pack key</span><input name="key" required defaultValue={slug(policyImport.title)} /></label>
         <label className="field"><span>Version</span><input name="version" type="number" min="1" required defaultValue={policyImport.revision} /></label>
@@ -198,6 +201,7 @@ export function PolicyReviewWorkspace({ initialImport, initialCandidates, review
           {policyImport.status === "compiled" ? "Compiled" : "Compile draft pack"}
         </button>
       </form>}
+      {!compiled && collectionId && ready && candidates.every((candidate) => candidate.status !== "approved") && <div className="boundary-callout review-boundary"><ShieldCheck size={18} /><div><strong>This source is review-complete with zero approved rules.</strong><p>That is valid inside a collection when another reviewed source contributes at least one approved deterministic rule.</p></div></div>}
 
       <div className="boundary-callout review-boundary"><ShieldCheck size={18} /><div><strong>Suggestions are not published until human review and pack approval.</strong><p>Compilation creates a draft only. A policy owner must still use the existing pack approval step before any evaluation can select it.</p></div></div>
 

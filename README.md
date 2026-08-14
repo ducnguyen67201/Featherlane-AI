@@ -12,7 +12,7 @@ and get `PASS`, `FAIL`, or `INCONCLUSIVE` with the evidence behind each result.
 
 - end-to-end HTTP and webhook agent evaluations;
 - passive, multi-trace OTLP ingestion grouped into one business-level run;
-- PDF, DOCX, TXT, and pasted-policy ingestion with grounded human review;
+- collection-first file, paste, public URL, Drive, Microsoft 365, and Notion ingestion with grounded human review;
 - deterministic ordering, absence, count, approval, and terminal-state checks;
 - JSON, JUnit, HTML, API, and web-console results.
 
@@ -74,7 +74,34 @@ The evaluator and worker resolve approved packs by database ID. Files under
 `fixtures/policies` and `fixtures/policy-sources` are examples only and are never
 loaded as runtime policy definitions.
 
-## Import, review, and compile a policy source
+## Gather, review, and compile a policy collection
+
+Use **Policies → Create policy collection** to reserve the pack key, version,
+and title, then add up to 25 files (25 MiB each / 100 MiB total), paste text,
+or submit public HTTPS URLs. Each document remains an independent immutable
+`PolicyImport`; source verification and candidate decisions stay document-local,
+while the collection compiles their exact revisions into one deterministic pack.
+
+Scanned PDFs pause at `needs_ocr`. Upload a reviewer-produced PDF, DOCX, or TXT
+OCR output from the import page. Both artifact hashes and the transformation are
+retained, source verification resets, and processing resumes.
+
+Connector callbacks are `/api/source-connections/google_drive/callback`,
+`/api/source-connections/microsoft_graph/callback`, and
+`/api/source-connections/notion/callback` on the configured callback base. Google
+uses `drive.file` with explicit Picker selection; Microsoft requests delegated
+read-only file/site scopes; Notion can access only pages shared with the
+integration. Generate the console key separately from Better Auth and generate
+each connector encryption key with `openssl rand -base64 32`. Enable the Google
+Picker API and set its restricted browser key/project number as
+`NEXT_PUBLIC_GOOGLE_PICKER_API_KEY` and `NEXT_PUBLIC_GOOGLE_PICKER_APP_ID`; these
+two identifiers are public by design, while OAuth client secrets and refresh
+tokens remain server-only.
+
+Only explicit selections and manual sync are in scope. Recursive/scheduled
+crawling and real-corpus synchronization are separate, deferred work.
+
+### Legacy single-source import
 
 Use **Policies → Import policy source** in the console. Choose a PDF, DOCX,
 UTF-8 TXT file, or pasted text and submit its provenance metadata. The API stores

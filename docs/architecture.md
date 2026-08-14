@@ -66,6 +66,15 @@ Policy persistence is aggregate-based and transactional:
 - `sources` and `obligations` store provenance and extracted requirements;
 - `policy_pack_sources` preserves the exact source set used by a pack;
 - `policy_reviews` stores human publication decisions.
+- `policy_collections` and `policy_collection_imports` freeze the exact source revisions in a multi-source pack;
+- `source_ingestion_batches` and `source_ingestion_items` retain partial acquisition progress;
+- `source_connections` and `source_subscriptions` retain encrypted credentials and explicit remote lineage;
+- `policy_import_transformations` records HTML/Notion preparation and manual OCR without replacing raw evidence.
+
+Collection compilation locks membership, imports, and candidates in stable UUID
+order, rechecks the optimistic review snapshot, and commits the pack and source
+assignments atomically. A stable source ID is reused in later pack versions, and
+multi-source obligations use `s_<policy-source-prefix>__<candidate-key>`.
 
 The source workflow writes the raw artifact first, queues an ID-only job, then
 uses compare-and-set state transitions (`queued → parsing → extracting →
@@ -77,9 +86,9 @@ supported deterministic rules. Both active and passive evaluation load rules by
 policy-pack ID from PostgreSQL. No executable policy is loaded from a repository
 file, environment variable, worker payload, or frontend fallback.
 
-The current worker parses embedded text only. Scanned PDFs transition to
-`needs_ocr`; OCR is intentionally not performed silently because its output must
-be retained and reviewed as a distinct evidence transformation.
+The worker parses embedded text only. Scanned PDFs transition to `needs_ocr`;
+reviewers may attach retained OCR output, after which verification is required
+again. OCR is never performed or trusted silently.
 
 ## Evaluation semantics
 

@@ -1,5 +1,8 @@
+mod console_auth;
 pub mod loco_app;
+mod policy_collections;
 mod policy_imports;
+mod source_connections;
 
 use axum::{
     Json, Router,
@@ -294,6 +297,14 @@ pub struct HealthResponse {
     pub service: &'static str,
     pub version: &'static str,
     pub policy_import_worker: &'static str,
+    pub source_connectors: SourceConnectorAvailability,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SourceConnectorAvailability {
+    pub google_drive: &'static str,
+    pub microsoft_graph: &'static str,
+    pub notion: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -502,6 +513,11 @@ pub(crate) async fn health() -> Json<HealthResponse> {
         service: "governance-api",
         version: env!("CARGO_PKG_VERSION"),
         policy_import_worker: "not_checked",
+        source_connectors: SourceConnectorAvailability {
+            google_drive: "unavailable",
+            microsoft_graph: "unavailable",
+            notion: "unavailable",
+        },
     })
 }
 

@@ -31,6 +31,7 @@ impl OpenDalArtifactStore {
                 "object-store credentials are not configured".to_owned(),
             ));
         }
+        opendal::install_default();
         let builder = services::S3::default()
             .bucket(&config.object_store_bucket)
             .region(&config.object_store_region)
@@ -122,6 +123,34 @@ mod tests {
             .expect("write should work");
         assert_eq!(
             store.get("org/import/raw").await.expect("read should work"),
+            b"policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_s3_store_round_trips_when_contract_endpoint_is_supplied() {
+        let Ok(endpoint) = std::env::var("TEST_OBJECT_STORE_URL") else {
+            return;
+        };
+        let mut config = PolicyImportConfig::from_env().expect("base policy config should load");
+        config.object_store_url = endpoint;
+        config.object_store_bucket =
+            std::env::var("TEST_OBJECT_STORE_BUCKET").unwrap_or_else(|_| "featherlane".to_owned());
+        config.object_store_access_key_id =
+            std::env::var("TEST_OBJECT_STORE_ACCESS_KEY_ID").expect("test access key");
+        config.object_store_secret_access_key =
+            std::env::var("TEST_OBJECT_STORE_SECRET_ACCESS_KEY").expect("test secret key");
+        let store = OpenDalArtifactStore::from_config(&config).expect("S3 store should build");
+        let key = "validation/opendal-contract-probe";
+        store
+            .put(key, b"policy".to_vec())
+            .await
+            .expect("S3-compatible write should work");
+        assert_eq!(
+            store
+                .get(key)
+                .await
+                .expect("S3-compatible read should work"),
             b"policy"
         );
     }

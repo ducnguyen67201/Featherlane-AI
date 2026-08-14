@@ -7,6 +7,11 @@
 - bounded multipart policy uploads with magic-byte format checks and sanitized filenames;
 - ZIP entry/count and decompression limits for DOCX; encrypted and oversized PDFs fail closed;
 - content-addressed object keys and SHA-256 verification before every worker parse;
+- public URL acquisition requires HTTPS, rejects userinfo and any non-public DNS answer, pins a validated address, revalidates every redirect, and bounds streamed bytes;
+- provider tokens use AES-256-GCM with random 96-bit nonces, versioned keys, and organization/connection/provider/key-version associated data;
+- OAuth state is hashed, expiring, actor/provider/redirect-bound, and single-use; Google and Microsoft use S256 PKCE;
+- the owner-bound, `no-store` Google Picker access token is the only provider token intentionally returned to a browser;
+- collection, batch, connector, Picker, and OCR endpoints require the server-only console key and session-derived actor;
 - ID-only PostgreSQL queue payloads and compare-and-set import state transitions;
 - source text is untrusted data: extraction has no tools, uses strict structured output,
   verifies exact excerpt substrings, deduplicates candidates, and requires human review;
@@ -45,6 +50,11 @@ or organization. Any Google account can access the single MVP organization, and
 stateless sessions cannot be individually revoked before their eight-hour
 expiry. Direct Loco `/v1/*` endpoints also remain unauthenticated so the CLI and
 service integrations keep their current contract.
+
+The new credential-bearing routes have a scoped console-to-API boundary. Older
+pack, target, evaluation, and legacy import endpoints still need complete RBAC
+or workload identity before public hosting; the shared console key is not an
+organization-membership system.
 
 Target endpoints are trusted self-hosted administrator configuration, not a
 safe multi-tenant URL-fetch feature. Private/container hostnames are deliberately
