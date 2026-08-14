@@ -80,10 +80,39 @@ attributes, approved default policy pack, and finite timeouts. For example:
 }
 ```
 
+Configure this from **Agents → target → Automatic trace evaluation**. The
+target-scoped ingest key supplies trusted organization and agent identity; a
+span cannot select another target or policy. The selected default policy must
+be approved. It is pinned by ID, version, and content hash when the first span
+for a new external session creates the run, so later configuration changes do
+not alter an evaluation already in progress.
+
 The first span with that configured external ID atomically finds or creates the
 run. `gen_ai.conversation.id` is considered only when it appears in the target's
 attribute list and `conversation_id_is_task_boundary` is true. A long-lived chat
 session must not be treated as an evaluation run by default.
+
+Put the external ID on every span or resource in the business session. Traces
+from different services may use different trace IDs; the authenticated target,
+boundary kind, and external session ID group them into one evaluation. Emit the
+configured terminal boolean only after the whole task/workflow/call has ended.
+Featherlane then keeps accepting late exporter batches through `settle_seconds`,
+finalizes one immutable bundle, and evaluates it once. A terminal retry is
+idempotent and spans received after finalization remain diagnostics.
+
+To exercise this end to end against a running local Compose stack and an
+approved database policy:
+
+```bash
+POLICY_PACK_ID=<approved-policy-uuid> \
+  ./scripts/smoke-passive-auto-evaluation.sh
+```
+
+The smoke path registers a uniquely named agent, rotates a one-time target key,
+sends approval in trace A and execution/terminal evidence in linked trace B,
+then waits for one completed two-trace evaluation. It requires `bash`, `curl`,
+and `jq`; it never prints the ingest token. Set `EXPECT_VERDICT=PASS` when the
+chosen policy and fixture are expected to pass.
 
 ## Human approval and terminal events
 
@@ -122,3 +151,34 @@ The sample requests in `fixtures/otlp/correlated-run/` put approval in trace A
 and execution/terminal events in linked trace B. Send `02-execution.json` first,
 then `01-approval.json`, and retry either file to exercise out-of-order and
 idempotent ingestion.
+
+## Synchronous inline target adapters
+
+For CI jobs that can finish in one bounded HTTP exchange, register a staging,
+preview, or sandbox target through the console or `POST /v1/targets`. The
+adapter is protocol-based rather than SDK-specific:
+
+- `http_text` accepts a `user_text` scenario event and sends a session ID plus
+  message.
+- `webhook` accepts `webhook` or `system` events and preserves the configured
+  JSON payload.
+
+Every request propagates `traceparent`, W3C `baggage`, and the canonical
+evaluation, invocation, and scenario headers. The target returns a bounded
+`schema_version: "1.0"` envelope with normalized observations, side effects,
+and an explicit terminal flag. Missing terminal evidence becomes
+`INCONCLUSIVE`; it never becomes a vacuous pass.
+
+Run a committed scenario from CI with:
+
+```bash
+FEATHERLANE_API_URL=http://127.0.0.1:8080 cargo run -p gov-eval -- run \
+  --target-id TARGET_UUID \
+  --policy-pack-id POLICY_PACK_ID \
+  --scenario fixtures/scenarios/refund-approval.json \
+  --format junit --fail-on-inconclusive > governance-junit.xml
+```
+
+Use this synchronous path for fast resettable test targets. Use the correlated
+OTLP run lifecycle above for asynchronous workflows, multiple traces, retries,
+or passive production observation.

@@ -1,13 +1,8 @@
-export type WireVerdict = "pass" | "fail" | "inconclusive";
+export type WireVerdict = "pass" | "fail" | "inconclusive" | "PASS" | "FAIL" | "INCONCLUSIVE";
 export type Verdict = "PASS" | "FAIL" | "INCONCLUSIVE";
 
 export function displayVerdict(verdict: WireVerdict): Verdict {
-  const display: Record<WireVerdict, Verdict> = {
-    pass: "PASS",
-    fail: "FAIL",
-    inconclusive: "INCONCLUSIVE",
-  };
-  return display[verdict];
+  return verdict.toUpperCase() as Verdict;
 }
 export type TraceQuality = "complete" | "degraded" | "insufficient";
 
@@ -73,6 +68,7 @@ export interface EvaluationRun {
 }
 
 export interface RuleResult {
+  id?: string;
   rule_id: string;
   severity: string;
   status: string;
@@ -81,6 +77,7 @@ export interface RuleResult {
 }
 
 export interface EvaluationSummary {
+  eval_run_id?: string;
   verdict: WireVerdict;
   results: RuleResult[];
   passed: number;
@@ -89,14 +86,35 @@ export interface EvaluationSummary {
 }
 
 export interface EvidenceEvent {
+  schema_version?: string;
   id: string;
+  trace_id: string;
+  source_span_id: string | null;
+  parent_event_id: string | null;
+  linked_event_ids: string[];
+  invocation_id?: string;
+  scenario_id?: string;
   sequence: number;
+  started_at: string;
+  ended_at: string | null;
   event_type: string;
   name: string;
   actor: { actor_type: string; id: string };
+  input: unknown;
+  output: unknown;
+  attributes: Record<string, unknown>;
+  redacted: boolean;
 }
 
 export interface EvidenceBundle {
+  schema_version?: string;
+  evidence_sha256?: string;
+  target_version?: string;
+  trace_ids?: string[];
+  invocation_ids?: string[];
+  completion_reason?: string | null;
+  terminal_state?: string | null;
+  finalized_at?: string | null;
   trace_quality: TraceQuality;
   trace_defects: Array<{ code: string; message: string; blocking: boolean }>;
   events: EvidenceEvent[];
@@ -144,11 +162,21 @@ export interface Evaluation {
   failed: number;
   inconclusive: number;
   duration_ms: number;
-  cost_usd: number;
+  cost_usd: number | null;
   created_at: string;
   trace_quality: TraceQuality;
   findings: Finding[];
   timeline: TimelineItem[];
+  summary: LegacyEvaluationSummary;
+}
+
+export interface LegacyEvaluationSummary {
+  eval_run_id: string;
+  verdict: Verdict;
+  results: Array<Finding & { id: string; evidence_event_ids: string[] }>;
+  passed: number;
+  failed: number;
+  inconclusive: number;
 }
 
 export interface PolicyPack {
@@ -189,8 +217,77 @@ export interface AgentTarget {
   driver: string;
   environment: string;
   status: string;
-  trace_coverage: number;
-  last_evaluated: string;
+  issues: string[];
+  checked_at: string;
+  latest_trace_quality: TraceQuality | null;
+  last_evaluated: string | null;
+  auto_evaluation_enabled: boolean;
+  automatic_boundary_kind: RunBoundaryKind | null;
+  default_policy_pack_id: string | null;
+}
+
+export type DriverType = "http_text" | "webhook";
+export type TargetEnvironment = "staging" | "preview" | "sandbox";
+export type RunBoundaryKind = "workflow_execution" | "agent_task" | "voice_call" | "explicit_ci";
+
+export interface TelemetryBoundaryConfig {
+  boundary_kind: RunBoundaryKind;
+  external_id_attributes: string[];
+  terminal_attribute: string | null;
+  default_policy_pack_id: string | null;
+  settle_seconds: number;
+  idle_timeout_seconds: number | null;
+  max_duration_seconds: number | null;
+  conversation_id_is_task_boundary: boolean;
+}
+
+export interface TargetManifest {
+  schema_version: "1.0";
+  target_id: string;
+  target_version: string;
+  driver_type: DriverType;
+  endpoint: string;
+  reset_endpoint: string | null;
+  status_endpoint: string | null;
+  terminal_response_key: string | null;
+  auth_secret_ref: string | null;
+  timeout_seconds: number;
+  evidence_mode: "inline";
+  otlp_required: boolean;
+  production_credentials_allowed: false;
+  telemetry_boundary: TelemetryBoundaryConfig;
+}
+
+export interface AgentTargetDetail extends AgentTarget {
+  manifest: TargetManifest;
+}
+
+export interface CreateTargetInput {
+  name: string;
+  key: string;
+  version: string;
+  environment: TargetEnvironment;
+  driver_type: DriverType;
+  endpoint: string;
+  reset_endpoint: string | null;
+  auth_secret_ref: string | null;
+  timeout_seconds: number;
+  otlp_required: boolean;
+  telemetry_boundary: TelemetryBoundaryConfig;
+}
+
+export interface RotatedTelemetryIngestKey {
+  plaintext: string;
+}
+
+export interface ScenarioDefinition {
+  schema_version: "1.0";
+  name: string;
+  events: Array<
+    | { type: "user_text"; text: string }
+    | { type: "webhook"; payload: unknown }
+    | { type: "system"; payload: unknown }
+  >;
 }
 
 export interface Jurisdiction {

@@ -114,6 +114,13 @@ struct CorrelatedRunBatch {
     terminal_state: Option<String>,
 }
 
+#[derive(Debug)]
+enum PassiveRunResolution {
+    Assigned(Box<EvaluationRun>),
+    Unassigned,
+    PolicyConfigurationDrift,
+}
+
 #[derive(Clone, Debug)]
 pub struct TelemetryIngestIdentity {
     pub organization_id: OrganizationId,
@@ -460,6 +467,7 @@ where
         let mut result = IngestBatchResult::default();
         let mut authorized_runs = BTreeMap::new();
         let mut correlated_runs = BTreeMap::<EvalRunId, CorrelatedRunBatch>::new();
+        let mut policy_drift_warning_emitted = false;
         for mut span in spans {
             if self.limits.validate_span(&span).is_err() {
                 result.rejected += 1;
@@ -488,51 +496,29 @@ where
                 if let (Some(target), Some(external_run_id)) =
                     (boundary.as_ref(), correlation.external_run_id.as_deref())
                 {
-                    let run = if let Some(run) = self
-                        .runs
-                        .get_run_by_external_id(
-                            identity.organization_id,
-                            &identity.target_id,
-                            target.config.boundary_kind,
-                            external_run_id,
-                        )
+                    match self
+                        .resolve_passive_run(identity, target, external_run_id, &correlation)
                         .await?
                     {
-                        Some(run)
-                    } else if let Some(policy_pack_id) = target.config.default_policy_pack_id {
-                        Some(
-                            CreateEvaluationRun::new(
-                                self.policy_packs.clone(),
-                                self.runs.clone(),
-                                self.jobs.clone(),
-                            )
-                            .execute(CreateEvaluationRunRequest {
-                                organization_id: identity.organization_id,
-                                target_id: identity.target_id.clone(),
-                                target_version: target.target_version.clone(),
-                                policy_pack_id,
-                                scenario_id: correlation.scenario_id.unwrap_or_default(),
-                                rule_ids: Vec::new(),
-                                boundary_kind: target.config.boundary_kind,
-                                external_run_id: Some(external_run_id.to_owned()),
-                                invocation_id: correlation.invocation_id,
-                                max_duration_seconds: target
-                                    .config
-                                    .max_duration_seconds
-                                    .unwrap_or(self.max_run_duration_seconds)
-                                    .min(self.max_run_duration_seconds),
-                            })
-                            .await?,
-                        )
-                    } else {
-                        None
-                    };
-                    if let Some(run) = run {
-                        correlation.eval_run_id = Some(run.id);
-                        correlation.invocation_id = correlation
-                            .invocation_id
-                            .or(Some(run.primary_invocation_id));
-                        correlation.scenario_id = correlation.scenario_id.or(Some(run.scenario_id));
+                        PassiveRunResolution::Assigned(run) => {
+                            correlation.eval_run_id = Some(run.id);
+                            correlation.invocation_id = correlation
+                                .invocation_id
+                                .or(Some(run.primary_invocation_id));
+                            correlation.scenario_id =
+                                correlation.scenario_id.or(Some(run.scenario_id));
+                        }
+                        PassiveRunResolution::PolicyConfigurationDrift => {
+                            if !policy_drift_warning_emitted {
+                                tracing::warn!(
+                                    organization_id = %identity.organization_id,
+                                    target_id = %identity.target_id,
+                                    "automatic evaluation policy is unavailable; telemetry remains unassigned"
+                                );
+                                policy_drift_warning_emitted = true;
+                            }
+                        }
+                        PassiveRunResolution::Unassigned => {}
                     }
                 }
             }
@@ -627,6 +613,68 @@ where
         Ok(result)
     }
 
+    async fn resolve_passive_run(
+        &self,
+        identity: &TelemetryIngestIdentity,
+        target: &TelemetryTargetBoundary,
+        external_run_id: &str,
+        correlation: &CorrelationCandidate,
+    ) -> Result<PassiveRunResolution, ApplicationError> {
+        if let Some(run) = self
+            .runs
+            .get_run_by_external_id(
+                identity.organization_id,
+                &identity.target_id,
+                target.config.boundary_kind,
+                external_run_id,
+            )
+            .await?
+        {
+            return Ok(PassiveRunResolution::Assigned(Box::new(run)));
+        }
+        let Some(policy_pack_id) = target.config.default_policy_pack_id else {
+            return Ok(PassiveRunResolution::Unassigned);
+        };
+        let created = CreateEvaluationRun::new(
+            self.policy_packs.clone(),
+            self.runs.clone(),
+            self.jobs.clone(),
+        )
+        .execute(CreateEvaluationRunRequest {
+            organization_id: identity.organization_id,
+            target_id: identity.target_id.clone(),
+            target_version: target.target_version.clone(),
+            policy_pack_id,
+            scenario_id: correlation.scenario_id.unwrap_or_default(),
+            rule_ids: Vec::new(),
+            boundary_kind: target.config.boundary_kind,
+            external_run_id: Some(external_run_id.to_owned()),
+            invocation_id: correlation.invocation_id,
+            max_duration_seconds: target
+                .config
+                .max_duration_seconds
+                .unwrap_or(self.max_run_duration_seconds)
+                .min(self.max_run_duration_seconds),
+        })
+        .await;
+        match created {
+            Ok(run) => {
+                tracing::info!(
+                    organization_id = %identity.organization_id,
+                    target_id = %identity.target_id,
+                    eval_run_id = %run.id,
+                    boundary_kind = ?run.boundary_kind,
+                    "automatic evaluation run resolved from telemetry"
+                );
+                Ok(PassiveRunResolution::Assigned(Box::new(run)))
+            }
+            Err(ApplicationError::NotFound(_) | ApplicationError::Conflict(_)) => {
+                Ok(PassiveRunResolution::PolicyConfigurationDrift)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn reconcile_correlated_run(
         &self,
         organization_id: OrganizationId,
@@ -635,6 +683,7 @@ where
         settle_duration: Duration,
         boundary: Option<&TelemetryTargetBoundary>,
     ) -> Result<(), ApplicationError> {
+        let now = batch.latest_received_at;
         let mut reconciled = None;
         for attempt in 0..8 {
             let mut run = self
@@ -642,9 +691,7 @@ where
                 .get_run(organization_id, eval_run_id)
                 .await?
                 .ok_or_else(|| ApplicationError::NotFound(eval_run_id.to_string()))?;
-            let expected_state = run.state;
-            let expected_updated_at = run.updated_at;
-            let now = batch.latest_received_at;
+            let (expected_state, expected_updated_at) = (run.state, run.updated_at);
             let changed = if batch.terminal
                 && matches!(
                     run.state,
@@ -697,7 +744,6 @@ where
                 "evaluation run {eval_run_id} could not be reconciled"
             ))
         })?;
-        let now = batch.latest_received_at;
         let job = if run.state == EvaluationRunState::Settling {
             Some(DurableJob {
                 organization_id: run.organization_id,
@@ -724,6 +770,15 @@ where
         };
         if let Some(job) = job {
             self.jobs.enqueue(&job).await?;
+            if batch.terminal && run.state == EvaluationRunState::Settling {
+                tracing::info!(
+                    organization_id = %run.organization_id,
+                    target_id = %run.target_id,
+                    eval_run_id = %run.id,
+                    boundary_kind = ?run.boundary_kind,
+                    "terminal telemetry scheduled automatic evaluation finalization"
+                );
+            }
         }
         Ok(())
     }

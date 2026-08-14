@@ -874,7 +874,10 @@ fn application_error(error: governance_application::ApplicationError) -> Respons
         governance_application::ApplicationError::NotFound(_) => StatusCode::NOT_FOUND,
         governance_application::ApplicationError::Forbidden(_) => StatusCode::FORBIDDEN,
         governance_application::ApplicationError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-        governance_application::ApplicationError::Repository(_) => {
+        governance_application::ApplicationError::Repository(_)
+        | governance_application::ApplicationError::TargetTransport(_)
+        | governance_application::ApplicationError::TargetTimeout(_)
+        | governance_application::ApplicationError::TargetContract(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };

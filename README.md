@@ -160,6 +160,41 @@ cargo run -p gov-eval -- evaluate \
 Exit code `0` means pass, `1` means fail (or strict inconclusive), and `2` means
 invalid input, timeout, or an operational error.
 
+For a synchronous staging or sandbox target, register the generic `http_text`
+or `webhook` manifest once, then drive a committed scenario directly from CI:
+
+```bash
+cargo run -p gov-eval -- run \
+  --target-id TARGET_UUID \
+  --policy-pack-id POLICY_PACK_ID \
+  --scenario fixtures/scenarios/refund-approval.json \
+  --format junit --fail-on-inconclusive > governance-junit.xml
+```
+
+This inline path works with any SDK or workflow behind the small HTTP contract;
+the longer-lived `start`/`complete`/`wait` path above collects standard OTLP
+across multiple traces.
+
+For an already instrumented agent, assign an approved default policy and
+session/terminal attributes under **Agents → Automatic trace evaluation**. The
+target-scoped ingest key identifies the agent, the external session attribute
+groups all related traces, and the terminal signal automatically finalizes and
+evaluates the session—there is no trace picker or manual run-start step.
+
+Run the included two-trace smoke check against the local stack:
+
+```bash
+# With Doppler-managed local secrets
+doppler run -- docker compose up --build -d
+
+POLICY_PACK_ID=<approved-policy-uuid> \
+  ./scripts/smoke-passive-auto-evaluation.sh
+```
+
+Without Doppler, use the `.env`/Compose setup from Quick start and run the same
+smoke script. It requires `bash`, `curl`, and `jq` and exits nonzero unless one
+terminal session becomes one completed evaluation containing two traces.
+
 ## Repository map
 
 ```text

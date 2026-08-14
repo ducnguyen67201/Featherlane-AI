@@ -17,6 +17,7 @@ governance-ingestion.workspace = true
 governance-persistence.workspace = true
 governance-policy.workspace = true
 governance-telemetry.workspace = true
+governance-targets.workspace = true
 governance-worker = { path = "../governance-worker" }
 governance-migration = { path = "../../migration" }
 http.workspace = true

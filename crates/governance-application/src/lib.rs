@@ -2,12 +2,22 @@
 
 use async_trait::async_trait;
 use governance_domain::{
-    EvalRunId, EvaluationSummary, EvidenceBundle, OrganizationId, PolicyBundle, PolicyPack,
-    PolicyPackApproval, PolicyPackId, PolicyPackStatusChange, RuleResult, RunVerdict,
+    Actor, ActorType, EvalRunId, EvaluationSummary, EventType, EvidenceBundle, InvocationId,
+    ObservedEvent, OrganizationId, PolicyBundle, PolicyPack, PolicyPackApproval, PolicyPackId,
+    PolicyPackStatusChange, RuleResult, RunVerdict, ScenarioId, TargetId, TraceDefect,
+    TraceQualityStatus,
 };
 use governance_evaluator::evaluate_pack;
+use governance_targets::{
+    DriverError, RegisteredTarget, RunContext, ScenarioDefinition, TargetDriverRegistry,
+    TelemetryBoundaryConfig, validate_scenario, validate_telemetry_boundary,
+};
+use governance_telemetry::{
+    NormalizationContext, RedactionPolicy, finalize_evidence, normalize_observations,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use time::OffsetDateTime;
 
 mod evaluation_runs;
 mod policy_import;
@@ -25,10 +35,16 @@ pub enum ApplicationError {
     Forbidden(String),
     #[error("invalid application request: {0}")]
     InvalidRequest(String),
-    #[error("resource state conflicts with this operation: {0}")]
+    #[error("application state conflict: {0}")]
     Conflict(String),
     #[error("required service is unavailable: {0}")]
     Unavailable(String),
+    #[error("target transport failed: {0}")]
+    TargetTransport(String),
+    #[error("target request timed out: {0}")]
+    TargetTimeout(String),
+    #[error("target integration contract failed: {0}")]
+    TargetContract(String),
 }
 
 #[async_trait]
@@ -77,6 +93,385 @@ pub trait EvaluationRepository: Send + Sync {
     ) -> Result<Option<EvaluationSummary>, ApplicationError>;
 }
 
+#[async_trait]
+pub trait TargetRepository: Send + Sync {
+    async fn create(&self, target: &RegisteredTarget) -> Result<(), ApplicationError>;
+    async fn get(
+        &self,
+        organization_id: OrganizationId,
+        id: TargetId,
+    ) -> Result<Option<RegisteredTarget>, ApplicationError>;
+    async fn list(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<Vec<RegisteredTarget>, ApplicationError>;
+    async fn save_capability_report(
+        &self,
+        organization_id: OrganizationId,
+        id: TargetId,
+        report: &governance_targets::CapabilityReport,
+    ) -> Result<RegisteredTarget, ApplicationError>;
+    async fn save_telemetry_boundary(
+        &self,
+        organization_id: OrganizationId,
+        id: TargetId,
+        config: &TelemetryBoundaryConfig,
+    ) -> Result<RegisteredTarget, ApplicationError>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfigureTargetTelemetryRequest {
+    pub organization_id: OrganizationId,
+    pub target_id: TargetId,
+    pub config: TelemetryBoundaryConfig,
+}
+
+#[derive(Debug)]
+pub struct ConfigureTargetTelemetry<T, P> {
+    targets: T,
+    policy_packs: P,
+}
+
+impl<T, P> ConfigureTargetTelemetry<T, P>
+where
+    T: TargetRepository,
+    P: PolicyPackRepository,
+{
+    pub fn new(targets: T, policy_packs: P) -> Self {
+        Self {
+            targets,
+            policy_packs,
+        }
+    }
+
+    /// Applies a validated automatic-evaluation boundary to a registered target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an application error when the target or policy does not exist,
+    /// the policy is not publishable, the boundary is invalid, or persistence fails.
+    pub async fn execute(
+        &self,
+        request: ConfigureTargetTelemetryRequest,
+    ) -> Result<RegisteredTarget, ApplicationError> {
+        validate_telemetry_policy_binding(
+            &self.policy_packs,
+            request.organization_id,
+            &request.config,
+        )
+        .await?;
+        self.targets
+            .save_telemetry_boundary(request.organization_id, request.target_id, &request.config)
+            .await
+    }
+}
+
+/// Validates the structural boundary and its optional organization-scoped policy binding.
+///
+/// # Errors
+///
+/// Returns an invalid-request error for malformed configuration, not-found for
+/// an unknown policy, or conflict when the policy is not publishable.
+pub async fn validate_telemetry_policy_binding<P: PolicyPackRepository>(
+    policy_packs: &P,
+    organization_id: OrganizationId,
+    config: &TelemetryBoundaryConfig,
+) -> Result<(), ApplicationError> {
+    validate_telemetry_boundary(config)
+        .map_err(|error| ApplicationError::InvalidRequest(error.to_string()))?;
+    let Some(policy_pack_id) = config.default_policy_pack_id else {
+        return Ok(());
+    };
+    let pack = policy_packs
+        .get(organization_id, policy_pack_id)
+        .await?
+        .ok_or_else(|| ApplicationError::NotFound(policy_pack_id.to_string()))?;
+    pack.ensure_publishable()
+        .map_err(|error| ApplicationError::Conflict(error.to_string()))
+}
+
+#[derive(Debug)]
+pub struct RotateTargetTelemetryIngestKey<T, K> {
+    targets: T,
+    keys: K,
+}
+
+impl<T, K> RotateTargetTelemetryIngestKey<T, K>
+where
+    T: TargetRepository,
+    K: TelemetryIngestKeyRepository + Clone,
+{
+    pub fn new(targets: T, keys: K) -> Self {
+        Self { targets, keys }
+    }
+
+    /// Rotates the ingest key for a registered target's trusted manifest identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an application error when the target is unknown or key rotation fails.
+    pub async fn execute(
+        &self,
+        organization_id: OrganizationId,
+        target_id: TargetId,
+        expires_at: Option<OffsetDateTime>,
+    ) -> Result<RotatedTelemetryIngestKey, ApplicationError> {
+        let target = self
+            .targets
+            .get(organization_id, target_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(target_id.to_string()))?;
+        RotateTelemetryIngestKey::new(self.keys.clone())
+            .execute(organization_id, target.manifest.target_id, expires_at)
+            .await
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredEvaluationRun {
+    pub organization_id: OrganizationId,
+    pub target_id: TargetId,
+    pub target_name: String,
+    pub target_version: String,
+    pub policy_pack_id: PolicyPackId,
+    pub policy_pack_key: String,
+    pub policy_pack_version: u32,
+    pub policy_content_sha256: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub completed_at: OffsetDateTime,
+    pub evidence: EvidenceBundle,
+    pub summary: EvaluationSummary,
+}
+
+impl StoredEvaluationRun {
+    pub fn duration_ms(&self) -> u64 {
+        u64::try_from((self.completed_at - self.created_at).whole_milliseconds())
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+pub trait LiveEvaluationRepository: Send + Sync {
+    async fn save_run(&self, run: &StoredEvaluationRun) -> Result<(), ApplicationError>;
+    async fn get_run(
+        &self,
+        organization_id: OrganizationId,
+        eval_run_id: EvalRunId,
+    ) -> Result<Option<StoredEvaluationRun>, ApplicationError>;
+    async fn list_runs(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<Vec<StoredEvaluationRun>, ApplicationError>;
+    async fn latest_by_target(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<std::collections::BTreeMap<TargetId, StoredEvaluationRun>, ApplicationError>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunTargetEvaluationRequest {
+    pub target_id: TargetId,
+    pub policy_pack_id: PolicyPackId,
+    pub scenario: ScenarioDefinition,
+}
+
+#[derive(Debug)]
+pub struct RunTargetEvaluation<T, P, E, D> {
+    targets: T,
+    policy_packs: P,
+    evaluations: E,
+    drivers: D,
+}
+
+impl<T, P, E, D> RunTargetEvaluation<T, P, E, D>
+where
+    T: TargetRepository,
+    P: PolicyPackRepository,
+    E: LiveEvaluationRepository,
+    D: TargetDriverRegistry,
+{
+    pub fn new(targets: T, policy_packs: P, evaluations: E, drivers: D) -> Self {
+        Self {
+            targets,
+            policy_packs,
+            evaluations,
+            drivers,
+        }
+    }
+
+    /// Drives a registered target and persists the resulting evaluation evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request is invalid, a resource cannot be loaded,
+    /// target execution fails, or the completed run cannot be persisted.
+    #[allow(clippy::too_many_lines)]
+    pub async fn execute(
+        &self,
+        organization_id: OrganizationId,
+        request: RunTargetEvaluationRequest,
+    ) -> Result<StoredEvaluationRun, ApplicationError> {
+        validate_scenario(&request.scenario)
+            .map_err(|error| ApplicationError::InvalidRequest(error.to_string()))?;
+        let target = self
+            .targets
+            .get(organization_id, request.target_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(request.target_id.to_string()))?;
+        let pack = self
+            .policy_packs
+            .get(organization_id, request.policy_pack_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(request.policy_pack_id.to_string()))?;
+        pack.ensure_publishable()
+            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
+
+        let created_at = OffsetDateTime::now_utc();
+        let context = RunContext {
+            eval_run_id: EvalRunId::new(),
+            invocation_id: InvocationId::new(),
+            scenario_id: ScenarioId::new(),
+        };
+        let driver = self.drivers.driver_for(target.manifest.driver_type);
+        let session = driver.start_session(context);
+        driver
+            .reset(&target.manifest, &session)
+            .await
+            .map_err(application_driver_error)?;
+
+        let mut observations = Vec::new();
+        let mut side_effects = Vec::new();
+        let mut terminal = false;
+        let mut terminal_state = None;
+        for event in &request.scenario.events {
+            observations.push(ObservedEvent {
+                event_type: EventType::ScenarioInput,
+                name: request.scenario.name.clone(),
+                actor: Actor {
+                    actor_type: ActorType::User,
+                    id: "synthetic-user".to_owned(),
+                },
+                input: event.evidence_input(),
+                output: serde_json::Value::Null,
+                attributes: std::collections::BTreeMap::new(),
+            });
+            let mut output = driver
+                .send(&target.manifest, &session, event)
+                .await
+                .map_err(application_driver_error)?;
+            terminal = output.terminal;
+            terminal_state.clone_from(&output.terminal_state);
+            if let Some(state) = &output.terminal_state
+                && let Some(final_event) = output
+                    .events
+                    .iter_mut()
+                    .rev()
+                    .find(|event| event.event_type == EventType::FinalOutput)
+            {
+                final_event
+                    .attributes
+                    .insert("terminal_state".to_owned(), serde_json::json!(state));
+            }
+            observations.extend(output.events);
+            side_effects.extend(output.side_effects);
+        }
+
+        if !terminal {
+            for observation in &mut observations {
+                if observation.event_type == EventType::FinalOutput {
+                    observation.event_type = EventType::AgentStart;
+                    observation.attributes.remove("terminal_state");
+                }
+            }
+        }
+
+        let trace_id = session.traceparent.split('-').nth(1).unwrap_or("unknown");
+        let normalization_context = NormalizationContext {
+            organization_id,
+            eval_run_id: context.eval_run_id,
+            invocation_id: context.invocation_id,
+            scenario_id: context.scenario_id,
+        };
+        let redaction_policy = RedactionPolicy::default();
+        for side_effect in &mut side_effects {
+            redaction_policy.redact_value(side_effect);
+        }
+        let events = normalize_observations(
+            normalization_context,
+            trace_id,
+            &target.manifest.target_id,
+            observations,
+            &redaction_policy,
+        )
+        .map_err(|error| ApplicationError::TargetContract(error.to_string()))?;
+        let mut evidence = finalize_evidence(
+            normalization_context,
+            target.manifest.target_version.clone(),
+            terminal_state,
+            events,
+            side_effects,
+        );
+        if !terminal {
+            evidence.trace_quality = TraceQualityStatus::Insufficient;
+            if !evidence
+                .trace_defects
+                .iter()
+                .any(|defect| defect.code == "non_terminal")
+            {
+                evidence.trace_defects.push(TraceDefect {
+                    code: "non_terminal".to_owned(),
+                    message: "Target response did not declare a terminal result".to_owned(),
+                    blocking: true,
+                });
+            }
+        }
+        let summary = evaluate_pack(evidence.eval_run_id, &pack.rules, &evidence);
+        let completed_at = OffsetDateTime::now_utc();
+        let run = StoredEvaluationRun {
+            organization_id,
+            target_id: target.id,
+            target_name: target.name,
+            target_version: target.manifest.target_version,
+            policy_pack_id: pack.id,
+            policy_pack_key: pack.key,
+            policy_pack_version: pack.version,
+            policy_content_sha256: pack.content_sha256,
+            created_at,
+            completed_at,
+            evidence,
+            summary,
+        };
+        self.evaluations.save_run(&run).await?;
+        tracing::info!(
+            eval_run_id = %run.summary.eval_run_id,
+            target_id = %run.target_id,
+            verdict = ?run.summary.verdict,
+            duration_ms = run.duration_ms(),
+            "live target evaluation completed"
+        );
+        Ok(run)
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Required as a direct `map_err` adapter.
+fn application_driver_error(error: DriverError) -> ApplicationError {
+    let message = error.to_string();
+    match error {
+        DriverError::Timeout => ApplicationError::TargetTimeout(message),
+        DriverError::Transport | DriverError::Rejected(_) => {
+            ApplicationError::TargetTransport(message)
+        }
+        DriverError::UnsafeConfiguration(_)
+        | DriverError::UnsupportedEvent
+        | DriverError::ResponseTooLarge
+        | DriverError::InvalidResponse
+        | DriverError::Contract(_)
+        | DriverError::MissingSecretReference(_) => ApplicationError::TargetContract(message),
+    }
+}
+
 #[derive(Debug)]
 pub struct EvaluateEvidence<P, E> {
     policy_packs: P,
@@ -113,7 +508,7 @@ where
             .await?
             .ok_or_else(|| ApplicationError::NotFound(policy_pack_id.to_string()))?;
         pack.ensure_publishable()
-            .map_err(|error| ApplicationError::InvalidRequest(error.to_string()))?;
+            .map_err(|error| ApplicationError::Conflict(error.to_string()))?;
         let summary = evaluate_pack(evidence.eval_run_id, &pack.rules, evidence);
         self.evaluations
             .save_summary(organization_id, &summary)

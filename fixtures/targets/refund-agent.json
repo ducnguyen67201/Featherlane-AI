@@ -1,0 +1,11 @@
+{
+  "name": "Refund Agent",
+  "key": "refund-agent-staging",
+  "version": "git:local",
+  "environment": "staging",
+  "driver_type": "http_text",
+  "endpoint": "http://refund-agent:8091/v1/messages",
+  "reset_endpoint": null,
+  "auth_secret_ref": null,
+  "timeout_seconds": 30
+}

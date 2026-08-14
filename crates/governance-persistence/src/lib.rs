@@ -2,18 +2,23 @@
 
 pub mod entities;
 mod evaluation_runs;
+mod live_evaluations;
 mod policy_imports;
 
 pub use evaluation_runs::SeaOrmEvaluationRunRepository;
+pub use live_evaluations::SeaOrmEvaluationRepository;
 pub use policy_imports::SeaOrmPolicyImportRepository;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
-use governance_application::{ApplicationError, EvaluationRepository, PolicyPackRepository};
+use governance_application::{ApplicationError, PolicyPackRepository, TargetRepository};
 use governance_domain::{
-    CompiledRule, EvalRunId, EvaluationSummary, OrganizationId, PolicyBundle, PolicyPack,
-    PolicyPackApproval, PolicyPackId, PolicyPackStatusChange, ReviewStatus,
+    CompiledRule, OrganizationId, PolicyBundle, PolicyPack, PolicyPackApproval, PolicyPackId,
+    PolicyPackStatusChange, ReviewStatus, TargetId,
+};
+use governance_targets::{
+    CapabilityReport, EvidenceMode, RegisteredTarget, TargetEnvironment, TargetManifest,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
@@ -23,9 +28,204 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::entities::{
-    eval_runs, obligations, organizations, policy_pack_sources, policy_packs, policy_reviews,
-    policy_rules, rule_results, sources,
+    obligations, organizations, policy_pack_sources, policy_packs, policy_reviews, policy_rules,
+    sources, targets,
 };
+
+#[derive(Clone, Debug)]
+pub struct SeaOrmTargetRepository {
+    database: DatabaseConnection,
+}
+
+impl SeaOrmTargetRepository {
+    pub fn new(database: DatabaseConnection) -> Self {
+        Self { database }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct StoredTargetCapabilities {
+    name: String,
+    environment: TargetEnvironment,
+    reset_endpoint: Option<String>,
+    #[serde(default)]
+    status_endpoint: Option<String>,
+    #[serde(default)]
+    terminal_response_key: Option<String>,
+    auth_secret_ref: Option<String>,
+    timeout_seconds: u64,
+    evidence_mode: EvidenceMode,
+    #[serde(default)]
+    otlp_required: bool,
+    production_credentials_allowed: bool,
+    #[serde(default)]
+    telemetry_boundary: governance_targets::TelemetryBoundaryConfig,
+    capability: CapabilityReport,
+}
+
+#[async_trait]
+impl TargetRepository for SeaOrmTargetRepository {
+    async fn create(&self, target: &RegisteredTarget) -> Result<(), ApplicationError> {
+        let transaction = self.database.begin().await.map_err(repository_error)?;
+        ensure_organization(&transaction, target.organization_id).await?;
+        let duplicate = targets::Entity::find()
+            .filter(targets::Column::OrganizationId.eq(target.organization_id.0))
+            .filter(targets::Column::Key.eq(&target.manifest.target_id))
+            .filter(targets::Column::Version.eq(&target.manifest.target_version))
+            .one(&transaction)
+            .await
+            .map_err(repository_error)?;
+        if duplicate.is_some() {
+            return Err(ApplicationError::Conflict(format!(
+                "target {} version {} already exists",
+                target.manifest.target_id, target.manifest.target_version
+            )));
+        }
+        let capabilities = StoredTargetCapabilities {
+            name: target.name.clone(),
+            environment: target.environment,
+            reset_endpoint: target.manifest.reset_endpoint.clone(),
+            status_endpoint: target.manifest.status_endpoint.clone(),
+            terminal_response_key: target.manifest.terminal_response_key.clone(),
+            auth_secret_ref: target.manifest.auth_secret_ref.clone(),
+            timeout_seconds: target.manifest.timeout_seconds,
+            evidence_mode: target.manifest.evidence_mode,
+            otlp_required: target.manifest.otlp_required,
+            production_credentials_allowed: target.manifest.production_credentials_allowed,
+            telemetry_boundary: target.manifest.telemetry_boundary.clone(),
+            capability: target.capability.clone(),
+        };
+        targets::ActiveModel {
+            id: Set(target.id.0),
+            organization_id: Set(target.organization_id.0),
+            key: Set(target.manifest.target_id.clone()),
+            version: Set(target.manifest.target_version.clone()),
+            driver_type: Set(enum_string(target.manifest.driver_type)?),
+            endpoint: Set(target.manifest.endpoint.clone()),
+            capabilities: Set(serde_json::to_value(capabilities).map_err(serialization_error)?),
+            created_at: Set(target.created_at),
+        }
+        .insert(&transaction)
+        .await
+        .map_err(|error| {
+            target_insert_error(
+                error,
+                &target.manifest.target_id,
+                &target.manifest.target_version,
+            )
+        })?;
+        transaction.commit().await.map_err(repository_error)
+    }
+
+    async fn get(
+        &self,
+        organization_id: OrganizationId,
+        id: TargetId,
+    ) -> Result<Option<RegisteredTarget>, ApplicationError> {
+        targets::Entity::find()
+            .filter(targets::Column::OrganizationId.eq(organization_id.0))
+            .filter(targets::Column::Id.eq(id.0))
+            .one(&self.database)
+            .await
+            .map_err(repository_error)?
+            .map(target_from_model)
+            .transpose()
+    }
+
+    async fn list(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<Vec<RegisteredTarget>, ApplicationError> {
+        targets::Entity::find()
+            .filter(targets::Column::OrganizationId.eq(organization_id.0))
+            .order_by_desc(targets::Column::CreatedAt)
+            .all(&self.database)
+            .await
+            .map_err(repository_error)?
+            .into_iter()
+            .map(target_from_model)
+            .collect()
+    }
+
+    async fn save_capability_report(
+        &self,
+        organization_id: OrganizationId,
+        id: TargetId,
+        report: &CapabilityReport,
+    ) -> Result<RegisteredTarget, ApplicationError> {
+        let model = targets::Entity::find()
+            .filter(targets::Column::OrganizationId.eq(organization_id.0))
+            .filter(targets::Column::Id.eq(id.0))
+            .one(&self.database)
+            .await
+            .map_err(repository_error)?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))?;
+        let mut capabilities: StoredTargetCapabilities =
+            serde_json::from_value(model.capabilities.clone()).map_err(serialization_error)?;
+        capabilities.capability = report.clone();
+        let mut active: targets::ActiveModel = model.into();
+        active.capabilities = Set(serde_json::to_value(capabilities).map_err(serialization_error)?);
+        let model = active
+            .update(&self.database)
+            .await
+            .map_err(repository_error)?;
+        target_from_model(model)
+    }
+
+    async fn save_telemetry_boundary(
+        &self,
+        organization_id: OrganizationId,
+        id: TargetId,
+        config: &governance_targets::TelemetryBoundaryConfig,
+    ) -> Result<RegisteredTarget, ApplicationError> {
+        let model = targets::Entity::find()
+            .filter(targets::Column::OrganizationId.eq(organization_id.0))
+            .filter(targets::Column::Id.eq(id.0))
+            .one(&self.database)
+            .await
+            .map_err(repository_error)?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))?;
+        let mut capabilities: StoredTargetCapabilities =
+            serde_json::from_value(model.capabilities.clone()).map_err(serialization_error)?;
+        capabilities.telemetry_boundary = config.clone();
+        let mut active: targets::ActiveModel = model.into();
+        active.capabilities = Set(serde_json::to_value(capabilities).map_err(serialization_error)?);
+        let model = active
+            .update(&self.database)
+            .await
+            .map_err(repository_error)?;
+        target_from_model(model)
+    }
+}
+
+fn target_from_model(model: targets::Model) -> Result<RegisteredTarget, ApplicationError> {
+    let capabilities: StoredTargetCapabilities =
+        serde_json::from_value(model.capabilities).map_err(serialization_error)?;
+    Ok(RegisteredTarget {
+        id: TargetId(model.id),
+        organization_id: OrganizationId(model.organization_id),
+        name: capabilities.name,
+        environment: capabilities.environment,
+        manifest: TargetManifest {
+            schema_version: "1.0".to_owned(),
+            target_id: model.key,
+            target_version: model.version,
+            driver_type: enum_from_string(&model.driver_type)?,
+            endpoint: model.endpoint,
+            reset_endpoint: capabilities.reset_endpoint,
+            status_endpoint: capabilities.status_endpoint,
+            terminal_response_key: capabilities.terminal_response_key,
+            auth_secret_ref: capabilities.auth_secret_ref,
+            timeout_seconds: capabilities.timeout_seconds,
+            evidence_mode: capabilities.evidence_mode,
+            otlp_required: capabilities.otlp_required,
+            production_credentials_allowed: capabilities.production_credentials_allowed,
+            telemetry_boundary: capabilities.telemetry_boundary,
+        },
+        capability: capabilities.capability,
+        created_at: model.created_at,
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct SeaOrmPolicyPackRepository {
@@ -188,7 +388,7 @@ impl PolicyPackRepository for SeaOrmPolicyPackRepository {
             .map_err(repository_error)?
             .ok_or_else(|| ApplicationError::NotFound(id.to_string()))?;
         if model.status != "draft" {
-            return Err(ApplicationError::InvalidRequest(
+            return Err(ApplicationError::Conflict(
                 "only a draft policy version can be approved".to_owned(),
             ));
         }
@@ -203,7 +403,7 @@ impl PolicyPackRepository for SeaOrmPolicyPackRepository {
             .map(|link| link.source_id)
             .collect();
         if source_ids.is_empty() {
-            return Err(ApplicationError::InvalidRequest(
+            return Err(ApplicationError::Conflict(
                 "a policy pack needs at least one persisted source before approval".to_owned(),
             ));
         }
@@ -218,7 +418,7 @@ impl PolicyPackRepository for SeaOrmPolicyPackRepository {
                 .iter()
                 .any(|obligation| obligation.review_status != "approved")
         {
-            return Err(ApplicationError::InvalidRequest(
+            return Err(ApplicationError::Conflict(
                 "every extracted obligation must have a persisted human approval".to_owned(),
             ));
         }
@@ -443,7 +643,7 @@ async fn ensure_version_available<C: ConnectionTrait>(
         .await
         .map_err(repository_error)?;
     if duplicate.is_some() {
-        return Err(ApplicationError::InvalidRequest(format!(
+        return Err(ApplicationError::Conflict(format!(
             "policy pack {} version {} already exists and is immutable",
             pack.key, pack.version
         )));
@@ -595,128 +795,6 @@ fn rule_from_model(model: policy_rules::Model) -> Result<CompiledRule, Applicati
     serde_json::from_value(model.rule_payload).map_err(serialization_error)
 }
 
-#[derive(Clone, Debug)]
-pub struct SeaOrmEvaluationRepository {
-    database: DatabaseConnection,
-}
-
-impl SeaOrmEvaluationRepository {
-    pub fn new(database: DatabaseConnection) -> Self {
-        Self { database }
-    }
-}
-
-#[async_trait]
-impl EvaluationRepository for SeaOrmEvaluationRepository {
-    async fn save_summary(
-        &self,
-        organization_id: OrganizationId,
-        summary: &EvaluationSummary,
-    ) -> Result<(), ApplicationError> {
-        let payload = serde_json::to_value(summary).map_err(serialization_error)?;
-        let now = OffsetDateTime::now_utc();
-        let transaction = self.database.begin().await.map_err(repository_error)?;
-        let existing = eval_runs::Entity::find()
-            .filter(eval_runs::Column::OrganizationId.eq(organization_id.0))
-            .filter(eval_runs::Column::Id.eq(summary.eval_run_id.0))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(repository_error)?;
-        if let Some(existing) = existing {
-            if let Some(stored) = existing.summary.as_ref() {
-                let stored: EvaluationSummary =
-                    serde_json::from_value(stored.clone()).map_err(serialization_error)?;
-                return if stored == *summary {
-                    Ok(())
-                } else {
-                    Err(ApplicationError::Conflict(
-                        "run already has a different evaluation summary".to_owned(),
-                    ))
-                };
-            }
-            let mut active: eval_runs::ActiveModel = existing.into();
-            active.verdict = Set(Some(enum_string(summary.verdict)?));
-            active.summary = Set(Some(payload));
-            active.completed_at = Set(Some(now));
-            active.updated_at = Set(now);
-            active
-                .update(&transaction)
-                .await
-                .map_err(repository_error)?;
-        } else {
-            eval_runs::ActiveModel {
-                id: Set(summary.eval_run_id.0),
-                organization_id: Set(organization_id.0),
-                target_id: Set("unknown".to_owned()),
-                target_version: Set(Some("legacy".to_owned())),
-                policy_pack_key: Set("unknown".to_owned()),
-                policy_pack_id: Set(None),
-                policy_pack_version: Set(Some(0)),
-                policy_content_sha256: Set(Some("legacy".to_owned())),
-                scenario_id: Set(Some(summary.eval_run_id.0)),
-                rule_ids: Set(serde_json::json!([])),
-                boundary_kind: Set("explicit_ci".to_owned()),
-                external_run_id: Set(None),
-                primary_invocation_id: Set(Some(summary.eval_run_id.0)),
-                state: Set("completed".to_owned()),
-                completion_reason: Set(None),
-                terminal_state: Set(None),
-                verdict: Set(Some(enum_string(summary.verdict)?)),
-                summary: Set(Some(payload)),
-                settle_until: Set(None),
-                hard_deadline_at: Set(Some(now)),
-                last_seen_at: Set(None),
-                finalized_at: Set(Some(now)),
-                updated_at: Set(now),
-                span_count: Set(0),
-                trace_count: Set(0),
-                event_count: Set(0),
-                trace_quality: Set(None),
-                evidence_sha256: Set(None),
-                created_at: Set(now),
-                completed_at: Set(Some(now)),
-            }
-            .insert(&transaction)
-            .await
-            .map_err(repository_error)?;
-        }
-        for result in &summary.results {
-            rule_results::ActiveModel {
-                id: Set(result.id.0),
-                organization_id: Set(organization_id.0),
-                eval_run_id: Set(summary.eval_run_id.0),
-                rule_id: Set(result.rule_id.clone()),
-                severity: Set(enum_string(result.severity)?),
-                status: Set(enum_string(result.status)?),
-                payload: Set(serde_json::to_value(result).map_err(serialization_error)?),
-                created_at: Set(now),
-            }
-            .insert(&transaction)
-            .await
-            .map_err(repository_error)?;
-        }
-        transaction.commit().await.map_err(repository_error)
-    }
-
-    async fn get_summary(
-        &self,
-        organization_id: OrganizationId,
-        eval_run_id: EvalRunId,
-    ) -> Result<Option<EvaluationSummary>, ApplicationError> {
-        let model = eval_runs::Entity::find()
-            .filter(eval_runs::Column::OrganizationId.eq(organization_id.0))
-            .filter(eval_runs::Column::Id.eq(eval_run_id.0))
-            .one(&self.database)
-            .await
-            .map_err(repository_error)?;
-        model
-            .and_then(|model| model.summary)
-            .map(|summary| serde_json::from_value(summary).map_err(serialization_error))
-            .transpose()
-    }
-}
-
 fn enum_string<T: serde::Serialize>(value: T) -> Result<String, ApplicationError> {
     serde_json::to_value(value)
         .map_err(serialization_error)?
@@ -743,6 +821,16 @@ fn serialization_error(error: serde_json::Error) -> ApplicationError {
 #[allow(clippy::needless_pass_by_value)] // Required as a direct `map_err` adapter.
 fn repository_error(error: sea_orm::DbErr) -> ApplicationError {
     ApplicationError::Repository(error.to_string())
+}
+
+#[allow(clippy::needless_pass_by_value)] // Required as an insert error adapter.
+fn target_insert_error(error: sea_orm::DbErr, key: &str, version: &str) -> ApplicationError {
+    let detail = error.to_string();
+    if detail.contains("uq_targets_org_key_version") || detail.contains("duplicate key") {
+        ApplicationError::Conflict(format!("target {key} version {version} already exists"))
+    } else {
+        ApplicationError::Repository(detail)
+    }
 }
 
 #[cfg(test)]

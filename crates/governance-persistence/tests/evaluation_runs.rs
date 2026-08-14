@@ -1,23 +1,30 @@
 use std::collections::BTreeMap;
 
 use governance_application::{
-    CompleteEvaluationRun, CompletionRequest, DurableJobRepository, EvaluateFinalizedRun,
+    CompleteEvaluationRun, CompletionRequest, ConfigureTargetTelemetry,
+    ConfigureTargetTelemetryRequest, DurableJobRepository, EvaluateFinalizedRun,
     EvaluationRunRepository, EvidenceBundleRepository, FinalizeEvaluationRun, IngestTelemetryBatch,
-    RotateTelemetryIngestKey, SpanInsert, SpanInsertOutcome, TelemetryIngestKeyRepository,
-    TelemetrySpanRepository,
+    RotateTargetTelemetryIngestKey, RotateTelemetryIngestKey, SpanInsert, SpanInsertOutcome,
+    TargetRepository, TelemetryIngestKeyRepository, TelemetrySpanRepository,
 };
 use governance_domain::{
     CompletionReason, EvalRunId, EvaluationRun, EvaluationRunState, InvocationId, OrganizationId,
-    PolicyPackId, RunBoundaryKind, ScenarioId,
+    PolicyPackId, RunBoundaryKind, ScenarioId, TargetId,
 };
 use governance_migration::Migrator;
 use governance_persistence::{
     SeaOrmEvaluationRepository, SeaOrmEvaluationRunRepository, SeaOrmPolicyPackRepository,
-    entities::{jobs, policy_rules, rule_results, targets},
+    SeaOrmTargetRepository,
+    entities::{eval_runs, jobs, policy_rules, rule_results, targets},
+};
+use governance_targets::{
+    CapabilityReport, DriverType, EvidenceMode, RegisteredTarget, TargetEnvironment,
+    TargetManifest, TelemetryBoundaryConfig,
 };
 use governance_telemetry::{
-    ATTR_EVAL_RUN_ID, ATTR_EVENT_TYPE, ATTR_INVOCATION_ID, ATTR_SCENARIO_ID, CorrelationCandidate,
-    ObservedSpan, RedactionPolicy, SpanLink, TelemetryLimits,
+    ATTR_EVAL_RUN_ID, ATTR_EVENT_TYPE, ATTR_EXTERNAL_RUN_ID, ATTR_INVOCATION_ID, ATTR_SCENARIO_ID,
+    ATTR_TERMINAL_STATE, CorrelationCandidate, ObservedSpan, RedactionPolicy, SpanLink,
+    TelemetryLimits,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
@@ -26,6 +33,69 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
+
+static MIGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn apply_migrations(database: &DatabaseConnection) {
+    let _guard = MIGRATION_LOCK.lock().await;
+    Migrator::up(database, None)
+        .await
+        .expect("migrations should apply");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evaluation_list_skips_unmappable_legacy_rows() {
+    let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+        return;
+    };
+    let database = Database::connect(database_url)
+        .await
+        .expect("test database should connect");
+    apply_migrations(&database).await;
+    let organization_id = OrganizationId::new();
+    let eval_run_id = EvalRunId::new();
+    let mut cleanup = EvaluationCleanup {
+        database: database.clone(),
+        organization_ids: vec![organization_id],
+        active: true,
+    };
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!(
+                "INSERT INTO organizations(id,name,created_at) VALUES ('{organization_id}','legacy list test',now())"
+            ),
+        ))
+        .await
+        .expect("test organization should insert");
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!(
+                "INSERT INTO eval_runs(id,organization_id,target_id,policy_pack_key,verdict,summary,created_at,completed_at,\
+                    target_version,policy_pack_version,policy_content_sha256,scenario_id,primary_invocation_id,hard_deadline_at) \
+                 VALUES ('{eval_run_id}','{organization_id}','legacy-target','removed-policy','pass','{{}}'::jsonb,now(),now(),\
+                    'legacy',0,'legacy','{eval_run_id}','{eval_run_id}',now())"
+            ),
+        ))
+        .await
+        .expect("legacy evaluation should insert");
+
+    let runs = SeaOrmEvaluationRunRepository::new(database.clone())
+        .list_runs(organization_id)
+        .await
+        .expect("legacy rows should not break the evaluation list");
+    assert!(runs.is_empty());
+
+    cleanup.active = false;
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!("DELETE FROM organizations WHERE id = '{organization_id}'"),
+        ))
+        .await
+        .expect("test records should clean up");
+}
 
 struct EvaluationCleanup {
     database: DatabaseConnection,
@@ -63,6 +133,188 @@ impl Drop for EvaluationCleanup {
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
+async fn telemetry_boundary_update_preserves_target_connection_and_capability() {
+    let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+        return;
+    };
+    let database = Database::connect(database_url)
+        .await
+        .expect("test database should connect");
+    apply_migrations(&database).await;
+    let organization_id = OrganizationId::new();
+    let mut cleanup = EvaluationCleanup {
+        database: database.clone(),
+        organization_ids: vec![organization_id],
+        active: true,
+    };
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!(
+                "INSERT INTO organizations(id,name,created_at) VALUES ('{organization_id}','target config test',now())"
+            ),
+        ))
+        .await
+        .expect("test organization should insert");
+    let target_id = TargetId::new();
+    let policy_pack_id = PolicyPackId::new();
+    let checked_at = OffsetDateTime::now_utc();
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!(
+                "INSERT INTO policy_packs(id,organization_id,key,version,title,status,content_sha256,published_at,created_at) \
+                 VALUES ('{policy_pack_id}','{organization_id}','target-policy',1,'Target policy','approved','target-policy-sha',now(),now())"
+            ),
+        ))
+        .await
+        .expect("target policy should insert");
+    let rule_payload = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../fixtures/policies/refund-governance.import.json"
+    ))
+    .expect("policy fixture should parse")["rules"][0]
+        .clone();
+    policy_rules::ActiveModel {
+        id: Set(uuid::Uuid::now_v7()),
+        organization_id: Set(organization_id.0),
+        policy_pack_id: Set(policy_pack_id.0),
+        rule_id: Set("refund_requires_prior_approval".to_owned()),
+        rule_version: Set(1),
+        position: Set(0),
+        obligation_key: Set("INTERNAL-REFUND-004".to_owned()),
+        severity: Set("critical".to_owned()),
+        rule_payload: Set(rule_payload),
+        created_at: Set(checked_at),
+    }
+    .insert(&database)
+    .await
+    .expect("target policy rule should insert");
+    let target = RegisteredTarget {
+        id: target_id,
+        organization_id,
+        name: "Trace Agent".to_owned(),
+        environment: TargetEnvironment::Staging,
+        manifest: TargetManifest {
+            schema_version: "1.0".to_owned(),
+            target_id: "trace-agent".to_owned(),
+            target_version: "git:before".to_owned(),
+            driver_type: DriverType::Webhook,
+            endpoint: "http://127.0.0.1:8099/webhook".to_owned(),
+            reset_endpoint: Some("http://127.0.0.1:8099/reset".to_owned()),
+            status_endpoint: None,
+            terminal_response_key: None,
+            auth_secret_ref: Some("TRACE_AGENT_TOKEN".to_owned()),
+            timeout_seconds: 45,
+            evidence_mode: EvidenceMode::Inline,
+            otlp_required: false,
+            production_credentials_allowed: false,
+            telemetry_boundary: TelemetryBoundaryConfig::default(),
+        },
+        capability: CapabilityReport {
+            target_id: "trace-agent".to_owned(),
+            reachable: true,
+            reset_supported: true,
+            trace_context_supported: true,
+            issues: vec!["fixture capability".to_owned()],
+            checked_at,
+        },
+        created_at: checked_at,
+    };
+    let targets = SeaOrmTargetRepository::new(database.clone());
+    targets
+        .create(&target)
+        .await
+        .expect("target should persist");
+    let configured = TelemetryBoundaryConfig {
+        boundary_kind: RunBoundaryKind::AgentTask,
+        external_id_attributes: vec!["agent.session.id".to_owned()],
+        terminal_attribute: Some("agent.session.finished".to_owned()),
+        default_policy_pack_id: Some(policy_pack_id),
+        settle_seconds: 4,
+        idle_timeout_seconds: Some(90),
+        max_duration_seconds: Some(600),
+        conversation_id_is_task_boundary: false,
+    };
+    let updated = ConfigureTargetTelemetry::new(
+        targets.clone(),
+        SeaOrmPolicyPackRepository::new(database.clone()),
+    )
+    .execute(ConfigureTargetTelemetryRequest {
+        organization_id,
+        target_id,
+        config: configured.clone(),
+    })
+    .await
+    .expect("telemetry boundary should update");
+    assert_eq!(updated.manifest.telemetry_boundary, configured);
+    assert_eq!(updated.name, target.name);
+    assert_eq!(updated.manifest.target_id, target.manifest.target_id);
+    assert_eq!(
+        updated.manifest.target_version,
+        target.manifest.target_version
+    );
+    assert_eq!(updated.manifest.endpoint, target.manifest.endpoint);
+    assert_eq!(
+        updated.manifest.auth_secret_ref,
+        target.manifest.auth_secret_ref
+    );
+    assert_eq!(updated.capability, target.capability);
+    let mut invalid_config = configured.clone();
+    invalid_config.default_policy_pack_id = Some(PolicyPackId::new());
+    assert!(matches!(
+        ConfigureTargetTelemetry::new(
+            targets.clone(),
+            SeaOrmPolicyPackRepository::new(database.clone()),
+        )
+        .execute(ConfigureTargetTelemetryRequest {
+            organization_id,
+            target_id,
+            config: invalid_config,
+        })
+        .await,
+        Err(governance_application::ApplicationError::NotFound(_))
+    ));
+    assert_eq!(
+        targets
+            .get(organization_id, target_id)
+            .await
+            .expect("target should reload")
+            .expect("target should still exist")
+            .manifest
+            .telemetry_boundary,
+        configured
+    );
+    let keys = SeaOrmEvaluationRunRepository::new(database.clone());
+    let rotated = RotateTargetTelemetryIngestKey::new(targets, keys.clone())
+        .execute(organization_id, target_id, None)
+        .await
+        .expect("target-scoped ingest key should rotate");
+    assert_eq!(rotated.key.target_id, target.manifest.target_id);
+    assert_eq!(
+        keys.resolve_key(
+            &rotated.key.token_prefix,
+            &rotated.key.token_sha256,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("target-scoped key should resolve")
+        .expect("target-scoped key should be active")
+        .target_id,
+        "trace-agent"
+    );
+
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!("DELETE FROM organizations WHERE id = '{organization_id}'"),
+        ))
+        .await
+        .expect("test records should clean up");
+    cleanup.active = false;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
     let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
         return;
@@ -70,9 +322,7 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
     let database = Database::connect(database_url)
         .await
         .expect("test database should connect");
-    Migrator::up(&database, None)
-        .await
-        .expect("migrations should apply");
+    apply_migrations(&database).await;
     let repository = SeaOrmEvaluationRunRepository::new(database.clone());
     let organization_id = OrganizationId::new();
     let other_organization_id = OrganizationId::new();
@@ -624,6 +874,261 @@ async fn correlated_run_is_tenant_safe_idempotent_and_immutable() {
         .execute_raw(Statement::from_string(
             database.get_database_backend(),
             format!("DELETE FROM organizations WHERE id IN ('{organization_id}','{other_organization_id}')"),
+        ))
+        .await
+        .expect("test records should clean up");
+    cleanup.active = false;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn passive_terminal_session_evaluates_two_traces_once() {
+    let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+        return;
+    };
+    let database = Database::connect(database_url)
+        .await
+        .expect("test database should connect");
+    apply_migrations(&database).await;
+    let organization_id = OrganizationId::new();
+    let policy_pack_id = PolicyPackId::new();
+    let mut cleanup = EvaluationCleanup {
+        database: database.clone(),
+        organization_ids: vec![organization_id],
+        active: true,
+    };
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!(
+                "INSERT INTO organizations(id,name,created_at) VALUES ('{organization_id}','passive terminal test',now())"
+            ),
+        ))
+        .await
+        .expect("test organization should insert");
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!(
+                "INSERT INTO policy_packs(id,organization_id,key,version,title,status,content_sha256,published_at,created_at) \
+                 VALUES ('{policy_pack_id}','{organization_id}','passive-pack',1,'Passive','approved','passive-policy-sha',now(),now())"
+            ),
+        ))
+        .await
+        .expect("test policy pack should insert");
+    let rule_payload = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../fixtures/policies/refund-governance.import.json"
+    ))
+    .expect("policy fixture should parse")["rules"][0]
+        .clone();
+    policy_rules::ActiveModel {
+        id: Set(uuid::Uuid::now_v7()),
+        organization_id: Set(organization_id.0),
+        policy_pack_id: Set(policy_pack_id.0),
+        rule_id: Set("refund_requires_prior_approval".to_owned()),
+        rule_version: Set(1),
+        position: Set(0),
+        obligation_key: Set("INTERNAL-REFUND-004".to_owned()),
+        severity: Set("critical".to_owned()),
+        rule_payload: Set(rule_payload),
+        created_at: Set(OffsetDateTime::now_utc()),
+    }
+    .insert(&database)
+    .await
+    .expect("test policy rule should insert");
+    targets::ActiveModel {
+        id: Set(uuid::Uuid::now_v7()),
+        organization_id: Set(organization_id.0),
+        key: Set("passive-terminal-agent".to_owned()),
+        version: Set("git:passive-terminal".to_owned()),
+        driver_type: Set("http_text".to_owned()),
+        endpoint: Set("http://127.0.0.1:1".to_owned()),
+        capabilities: Set(json!({
+            "telemetry_boundary": {
+                "boundary_kind": "workflow_execution",
+                "external_id_attributes": [ATTR_EXTERNAL_RUN_ID],
+                "terminal_attribute": "workflow.completed",
+                "default_policy_pack_id": policy_pack_id,
+                "settle_seconds": 0,
+                "idle_timeout_seconds": 60,
+                "max_duration_seconds": 300,
+                "conversation_id_is_task_boundary": false
+            }
+        })),
+        created_at: Set(OffsetDateTime::now_utc()),
+    }
+    .insert(&database)
+    .await
+    .expect("passive target should insert");
+
+    let mut approval = observed_span_for_target(
+        "11111111111111111111111111111111",
+        "1111111111111111",
+        "human_approval_decision",
+    );
+    approval
+        .resource_attributes
+        .insert(ATTR_EXTERNAL_RUN_ID.to_owned(), json!("session-42"));
+    approval
+        .attributes
+        .insert("decision".to_owned(), json!("approved"));
+    approval
+        .attributes
+        .insert("governance.actor.id".to_owned(), json!("fixture-approver"));
+    approval
+        .attributes
+        .insert("governance.actor.type".to_owned(), json!("human"));
+    let mut tool = observed_span_for_target(
+        "22222222222222222222222222222222",
+        "2222222222222221",
+        "tool_call",
+    );
+    tool.resource_attributes
+        .insert(ATTR_EXTERNAL_RUN_ID.to_owned(), json!("session-42"));
+    tool.attributes.insert(
+        "governance.input".to_owned(),
+        json!(r#"{"amount":700,"currency":"USD"}"#),
+    );
+    tool.links.push(SpanLink {
+        trace_id: approval.trace_id.clone(),
+        span_id: approval.span_id.clone(),
+    });
+    let mut terminal = observed_span_for_target(
+        "22222222222222222222222222222222",
+        "2222222222222222",
+        "final_output",
+    );
+    terminal.parent_span_id = Some(tool.span_id.clone());
+    terminal
+        .resource_attributes
+        .insert(ATTR_EXTERNAL_RUN_ID.to_owned(), json!("session-42"));
+    terminal
+        .attributes
+        .insert("workflow.completed".to_owned(), json!(true));
+    terminal
+        .attributes
+        .insert(ATTR_TERMINAL_STATE.to_owned(), json!("completed"));
+
+    let repository = SeaOrmEvaluationRunRepository::new(database.clone());
+    let ingest = IngestTelemetryBatch::new(
+        SeaOrmPolicyPackRepository::new(database.clone()),
+        repository.clone(),
+        repository.clone(),
+        repository.clone(),
+        repository.clone(),
+        RedactionPolicy::default(),
+        TelemetryLimits::default(),
+        10,
+        300,
+        3_600,
+    );
+    let identity = governance_application::TelemetryIngestIdentity {
+        organization_id,
+        target_id: "passive-terminal-agent".to_owned(),
+    };
+    ingest
+        .execute(&identity, vec![approval])
+        .await
+        .expect("approval trace should ingest");
+    let terminal_outcome = ingest
+        .execute(&identity, vec![tool, terminal.clone()])
+        .await
+        .expect("execution and terminal trace should ingest");
+    assert_eq!(terminal_outcome.accepted, 2);
+
+    let run = repository
+        .get_run_by_external_id(
+            organization_id,
+            "passive-terminal-agent",
+            RunBoundaryKind::WorkflowExecution,
+            "session-42",
+        )
+        .await
+        .expect("automatic run lookup should succeed")
+        .expect("automatic run should exist");
+    assert_eq!(run.state, EvaluationRunState::Settling);
+    assert_eq!(run.completion_reason, Some(CompletionReason::TerminalEvent));
+    assert_eq!(run.policy_pack_id, policy_pack_id);
+    assert_eq!(run.target_version, "git:passive-terminal");
+    assert_eq!(
+        eval_runs::Entity::find()
+            .filter(eval_runs::Column::OrganizationId.eq(organization_id.0))
+            .filter(eval_runs::Column::TargetId.eq("passive-terminal-agent"))
+            .filter(eval_runs::Column::ExternalRunId.eq("session-42"))
+            .count(&database)
+            .await
+            .expect("automatic run count should load"),
+        1
+    );
+    assert_eq!(
+        jobs::Entity::find()
+            .filter(jobs::Column::OrganizationId.eq(organization_id.0))
+            .filter(jobs::Column::DedupeKey.eq(format!("finalize:{}", run.id)))
+            .count(&database)
+            .await
+            .expect("finalize job count should load"),
+        1
+    );
+
+    let finalizer = FinalizeEvaluationRun::new(
+        repository.clone(),
+        repository.clone(),
+        repository.clone(),
+        repository.clone(),
+    );
+    let evidence = finalizer
+        .execute(organization_id, run.id)
+        .await
+        .expect("automatic run should finalize");
+    assert_eq!(evidence.trace_ids.len(), 2);
+    assert_eq!(evidence.events.len(), 3);
+    let evaluator = EvaluateFinalizedRun::new(
+        SeaOrmPolicyPackRepository::new(database.clone()),
+        repository.clone(),
+        repository.clone(),
+        SeaOrmEvaluationRepository::new(database.clone()),
+    );
+    let summary = evaluator
+        .execute(organization_id, run.id)
+        .await
+        .expect("automatic run should evaluate");
+    assert_eq!(summary.results.len(), 1);
+    assert_eq!(
+        repository
+            .get_run(organization_id, run.id)
+            .await
+            .expect("completed run should load")
+            .expect("completed run should exist")
+            .state,
+        EvaluationRunState::Completed
+    );
+
+    let retry = ingest
+        .execute(&identity, vec![terminal])
+        .await
+        .expect("terminal retry should remain idempotent");
+    assert_eq!(retry.duplicates, 1);
+    assert_eq!(
+        eval_runs::Entity::find()
+            .filter(eval_runs::Column::OrganizationId.eq(organization_id.0))
+            .filter(eval_runs::Column::TargetId.eq("passive-terminal-agent"))
+            .count(&database)
+            .await
+            .expect("run count after retry should load"),
+        1
+    );
+    assert_eq!(
+        evaluator
+            .execute(organization_id, run.id)
+            .await
+            .expect("evaluation replay should succeed"),
+        summary
+    );
+
+    database
+        .execute_raw(Statement::from_string(
+            database.get_database_backend(),
+            format!("DELETE FROM organizations WHERE id = '{organization_id}'"),
         ))
         .await
         .expect("test records should clean up");

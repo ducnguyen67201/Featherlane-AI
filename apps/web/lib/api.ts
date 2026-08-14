@@ -1,6 +1,7 @@
 import {
   displayVerdict,
   type AgentTarget,
+  type AgentTargetDetail,
   type Corpus,
   type DashboardSnapshot,
   type EvaluationRun,
@@ -19,6 +20,18 @@ const API_URL = process.env.GOVERNANCE_API_URL ?? "http://127.0.0.1:8080";
 async function getJson<T>(path: string, fallback: T): Promise<T> {
   const result = await getLiveJson<T>(path);
   return result.data ?? fallback;
+}
+
+async function getJsonRequired<T>(path: string): Promise<T> {
+  await requireSession();
+  const response = await fetch(`${API_URL}${path}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(3_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Governance API request failed with status ${response.status}.`);
+  }
+  return (await response.json()) as T;
 }
 
 export function getOverview(): Promise<DashboardSnapshot> {
@@ -60,7 +73,18 @@ export function getPolicyPack(id: string): Promise<PolicyPackDetail | null> {
 }
 
 export function getAgents(): Promise<AgentTarget[]> {
-  return getJson("/v1/targets", seed.agents);
+  return getJsonRequired("/v1/targets");
+}
+
+export async function getAgent(id: string): Promise<AgentTargetDetail | null> {
+  await requireSession();
+  const response = await fetch(`${API_URL}/v1/targets/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(3_000),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Governance API request failed with status ${response.status}.`);
+  return (await response.json()) as AgentTargetDetail;
 }
 
 export function getCorpus(setName: string): Promise<Corpus> {

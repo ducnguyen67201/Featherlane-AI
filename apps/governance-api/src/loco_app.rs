@@ -8,15 +8,24 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use governance_application::{
-    CancelEvaluationRun, CompleteEvaluationRun, CompletionRequest, CreateEvaluationRun,
+    ActivityPoint, ApplicationError, CancelEvaluationRun, CompleteEvaluationRun, CompletionRequest,
+    ConfigureTargetTelemetry, ConfigureTargetTelemetryRequest, CreateEvaluationRun,
     CreateEvaluationRunRequest, DashboardSnapshot, EvaluationRepository, EvaluationRunRepository,
-    EvidenceBundleRepository, PolicyPackRepository, RotateTelemetryIngestKey,
-    TelemetryIngestKeyRepository,
+    EvidenceBundleRepository, LiveEvaluationRepository, PolicyPackRepository,
+    RotateTargetTelemetryIngestKey, RunListItem, RunTargetEvaluation, RunTargetEvaluationRequest,
+    TargetRepository, TelemetryIngestKeyRepository, validate_telemetry_policy_binding,
 };
-use governance_domain::{EvalRunId, PolicyPackApproval, PolicyPackId, PolicyPackStatusChange};
+use governance_domain::{
+    EvalRunId, PolicyPackApproval, PolicyPackId, PolicyPackStatusChange, RunVerdict, TargetId,
+    TraceQualityStatus,
+};
 use governance_migration::Migrator;
 use governance_persistence::{
     SeaOrmEvaluationRepository, SeaOrmEvaluationRunRepository, SeaOrmPolicyPackRepository,
+    SeaOrmTargetRepository,
+};
+use governance_targets::{
+    CapabilityReport, DefaultDriverRegistry, DriverError, TargetDriverRegistry,
 };
 use governance_worker::ProcessPolicyImportWorker;
 use loco_rs::{
@@ -34,9 +43,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    ApprovePolicyPackRequest, CompleteEvaluationRequest, CreateEvaluationRequest,
-    CreatedEvaluationRun, EvaluationRunDetail, HealthResponse, PolicyImportRequest,
-    PolicyPackLifecycleRequest, PolicyPackView, RotateTelemetryKeyRequest, TargetView,
+    ApprovePolicyPackRequest, CompleteEvaluationRequest, ConfigureTelemetryBoundaryRequest,
+    CreateEvaluationRequest, CreateTargetRequest, CreatedEvaluationRun, EvaluationRunDetail,
+    HealthResponse, PolicyImportRequest, PolicyPackLifecycleRequest, PolicyPackView,
+    RotateTelemetryKeyRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -171,6 +181,13 @@ fn api_routes() -> Routes {
             post(crate::policy_imports::compile_import),
         )
         .add("/v1/targets", get(loco_targets))
+        .add("/v1/targets", post(loco_create_target))
+        .add("/v1/targets/{id}", get(loco_target))
+        .add("/v1/targets/{id}/validate", post(loco_validate_target))
+        .add(
+            "/v1/targets/{id}/telemetry-boundary",
+            patch(loco_configure_telemetry_boundary),
+        )
         .add("/v1/evaluations", get(loco_evaluations))
         .add("/v1/evaluations", post(loco_create_evaluation))
         .add("/v1/evaluations/{id}", get(loco_evaluation))
@@ -231,17 +248,69 @@ async fn loco_event_types() -> Json<Vec<governance_domain::EventType>> {
 }
 
 async fn loco_overview(State(context): State<AppContext>) -> Response {
-    let mut snapshot: DashboardSnapshot =
-        super::overview(axum::extract::State(super::demo_state()))
-            .await
-            .0;
-    let repository = SeaOrmPolicyPackRepository::new(context.db);
-    match repository.list(super::default_organization_id()).await {
-        Ok(packs) => {
-            snapshot.policy_packs = u32::try_from(packs.len()).unwrap_or(u32::MAX);
-            Json(snapshot).into_response()
-        }
-        Err(error) => database_error(error),
+    let organization_id = super::default_organization_id();
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let policies = SeaOrmPolicyPackRepository::new(context.db.clone());
+    let evaluations = SeaOrmEvaluationRepository::new(context.db);
+    let result = async {
+        let targets = targets.list(organization_id).await?;
+        let policies = policies.list(organization_id).await?;
+        let runs = evaluations.list_runs(organization_id).await?;
+        let now = OffsetDateTime::now_utc();
+        let cutoff = now - time::Duration::days(30);
+        let recent_30d = runs
+            .iter()
+            .filter(|run| run.created_at >= cutoff)
+            .collect::<Vec<_>>();
+        let completed = recent_30d
+            .iter()
+            .filter(|run| run.evidence.trace_quality == TraceQualityStatus::Complete)
+            .count();
+        let passed = recent_30d
+            .iter()
+            .filter(|run| run.summary.verdict == RunVerdict::Pass)
+            .count();
+        let recent_runs = runs
+            .iter()
+            .take(5)
+            .map(|run| RunListItem {
+                id: run.summary.eval_run_id,
+                target: run.target_name.clone(),
+                policy_pack: run.policy_pack_key.clone(),
+                verdict: run.summary.verdict,
+                passed: run.summary.passed,
+                failed: run.summary.failed,
+                inconclusive: run.summary.inconclusive,
+                duration_ms: run.duration_ms(),
+                created_at: super::rfc3339(run.created_at),
+            })
+            .collect();
+        let count = recent_30d.len();
+        let activity_inputs = recent_30d
+            .iter()
+            .map(|run| (run.created_at, run.summary.verdict))
+            .collect::<Vec<_>>();
+        Ok::<_, ApplicationError>(DashboardSnapshot {
+            active_agents: u32::try_from(targets.len()).unwrap_or(u32::MAX),
+            policy_packs: u32::try_from(policies.len()).unwrap_or(u32::MAX),
+            evaluations_30d: u32::try_from(count).unwrap_or(u32::MAX),
+            pass_rate: percentage(passed, count),
+            open_findings: u32::try_from(
+                recent_30d
+                    .iter()
+                    .map(|run| run.summary.failed)
+                    .sum::<usize>(),
+            )
+            .unwrap_or(u32::MAX),
+            trace_coverage: percentage(completed, count),
+            recent_runs,
+            daily_activity: daily_activity(&activity_inputs, now),
+        })
+    }
+    .await;
+    match result {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => application_error(error),
     }
 }
 
@@ -268,7 +337,7 @@ async fn loco_policy_packs(State(context): State<AppContext>) -> Response {
     .await;
     match result {
         Ok(packs) => Json(packs).into_response(),
-        Err(error) => database_error(error),
+        Err(error) => application_error(error),
     }
 }
 
@@ -280,7 +349,7 @@ async fn loco_policy_pack(State(context): State<AppContext>, Path(id): Path<Stri
     match repository.get(super::default_organization_id(), id).await {
         Ok(Some(pack)) => Json(pack).into_response(),
         Ok(None) => problem(StatusCode::NOT_FOUND, "policy pack was not found"),
-        Err(error) => database_error(error),
+        Err(error) => application_error(error),
     }
 }
 
@@ -295,7 +364,7 @@ async fn loco_import_policy_pack(
     let repository = SeaOrmPolicyPackRepository::new(context.db);
     match repository.save_bundle(&bundle).await {
         Ok(()) => (StatusCode::CREATED, Json(bundle.pack)).into_response(),
-        Err(error) => database_error(error),
+        Err(error) => application_error(error),
     }
 }
 
@@ -321,7 +390,7 @@ async fn loco_approve_policy_pack(
         .await
     {
         Ok(pack) => Json(pack).into_response(),
-        Err(error) => database_error(error),
+        Err(error) => application_error(error),
     }
 }
 
@@ -370,19 +439,161 @@ async fn transition_policy_pack(
     };
     match result {
         Ok(pack) => Json(pack).into_response(),
-        Err(error) => database_error(error),
+        Err(error) => application_error(error),
     }
 }
 
-async fn loco_targets() -> Json<Vec<TargetView>> {
-    super::targets(axum::extract::State(super::demo_state())).await
+async fn loco_targets(State(context): State<AppContext>) -> Response {
+    let organization_id = super::default_organization_id();
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let evaluations = SeaOrmEvaluationRepository::new(context.db);
+    let result = async {
+        let items = targets.list(organization_id).await?;
+        let latest = evaluations.latest_by_target(organization_id).await?;
+        Ok::<_, ApplicationError>(
+            items
+                .iter()
+                .map(|target| super::target_view(target, latest.get(&target.id)))
+                .collect::<Vec<_>>(),
+        )
+    }
+    .await;
+    match result {
+        Ok(targets) => Json(targets).into_response(),
+        Err(error) => application_error(error),
+    }
+}
+
+async fn loco_create_target(
+    State(context): State<AppContext>,
+    Json(request): Json<CreateTargetRequest>,
+) -> Response {
+    let organization_id = super::default_organization_id();
+    let policy_packs = SeaOrmPolicyPackRepository::new(context.db.clone());
+    if let Err(error) = validate_telemetry_policy_binding(
+        &policy_packs,
+        organization_id,
+        &request.telemetry_boundary,
+    )
+    .await
+    {
+        return application_error(error);
+    }
+    let capability = CapabilityReport {
+        target_id: request.key.clone(),
+        reachable: false,
+        reset_supported: request.reset_endpoint.is_some(),
+        trace_context_supported: true,
+        issues: Vec::new(),
+        checked_at: OffsetDateTime::now_utc(),
+    };
+    let mut target = match super::build_registered_target(organization_id, request, capability) {
+        Ok(target) => target,
+        Err(error) => return error.into_response(),
+    };
+    let drivers = DefaultDriverRegistry::default();
+    target.capability = match drivers
+        .driver_for(target.manifest.driver_type)
+        .validate(&target.manifest)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => return driver_error(error),
+    };
+    let repository = SeaOrmTargetRepository::new(context.db);
+    match repository.create(&target).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(super::target_detail_view(&target, None)),
+        )
+            .into_response(),
+        Err(error) => application_error(error),
+    }
+}
+
+async fn loco_configure_telemetry_boundary(
+    State(context): State<AppContext>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfigureTelemetryBoundaryRequest>,
+) -> Response {
+    let Some(id) = parse_target_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid target identifier");
+    };
+    let organization_id = super::default_organization_id();
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let policies = SeaOrmPolicyPackRepository::new(context.db);
+    match ConfigureTargetTelemetry::new(targets, policies)
+        .execute(ConfigureTargetTelemetryRequest {
+            organization_id,
+            target_id: id,
+            config: request.telemetry_boundary,
+        })
+        .await
+    {
+        Ok(target) => Json(super::target_detail_view(&target, None)).into_response(),
+        Err(error) => application_error(error),
+    }
+}
+
+async fn loco_target(State(context): State<AppContext>, Path(id): Path<String>) -> Response {
+    let Some(id) = parse_target_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid target identifier");
+    };
+    let organization_id = super::default_organization_id();
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let evaluations = SeaOrmEvaluationRepository::new(context.db);
+    let result = async {
+        let target = targets
+            .get(organization_id, id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(id.to_string()))?;
+        let latest = evaluations.latest_by_target(organization_id).await?;
+        Ok::<_, ApplicationError>(super::target_detail_view(&target, latest.get(&id)))
+    }
+    .await;
+    match result {
+        Ok(target) => Json(target).into_response(),
+        Err(error) => application_error(error),
+    }
+}
+
+async fn loco_validate_target(
+    State(context): State<AppContext>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(id) = parse_target_id(&id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid target identifier");
+    };
+    let organization_id = super::default_organization_id();
+    let repository = SeaOrmTargetRepository::new(context.db);
+    let target = match repository.get(organization_id, id).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "target was not found"),
+        Err(error) => return application_error(error),
+    };
+    let drivers = DefaultDriverRegistry::default();
+    let report = match drivers
+        .driver_for(target.manifest.driver_type)
+        .validate(&target.manifest)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => return driver_error(error),
+    };
+    match repository
+        .save_capability_report(organization_id, id, &report)
+        .await
+    {
+        Ok(target) => Json(super::target_detail_view(&target, None)).into_response(),
+        Err(error) => application_error(error),
+    }
 }
 
 async fn loco_evaluations(State(context): State<AppContext>) -> Response {
     let repository = SeaOrmEvaluationRunRepository::new(context.db);
     match repository.list_runs(super::default_organization_id()).await {
         Ok(runs) => Json(runs).into_response(),
-        Err(error) => database_error(error),
+        Err(error) => application_error(error),
     }
 }
 
@@ -395,16 +606,16 @@ async fn loco_evaluation(State(context): State<AppContext>, Path(id): Path<Strin
     let run = match runs.get_run(organization_id, id).await {
         Ok(Some(run)) => run,
         Ok(None) => return problem(StatusCode::NOT_FOUND, "evaluation was not found"),
-        Err(error) => return database_error(error),
+        Err(error) => return application_error(error),
     };
     let summaries = SeaOrmEvaluationRepository::new(context.db);
     let summary = match summaries.get_summary(organization_id, id).await {
         Ok(summary) => summary,
-        Err(error) => return database_error(error),
+        Err(error) => return application_error(error),
     };
     let evidence = match runs.get_bundle(organization_id, id).await {
         Ok(evidence) => evidence,
-        Err(error) => return database_error(error),
+        Err(error) => return application_error(error),
     };
     Json(EvaluationRunDetail {
         run,
@@ -418,41 +629,69 @@ async fn loco_create_evaluation(
     State(context): State<AppContext>,
     Json(request): Json<CreateEvaluationRequest>,
 ) -> Response {
-    let Some(endpoint) = context
-        .shared_store
-        .get::<RuntimeEndpoints>()
-        .map(|endpoints| endpoints.otlp_http)
-    else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "telemetry endpoint configuration was not initialized",
-        );
-    };
     let organization_id = super::default_organization_id();
-    let policy_repository = SeaOrmPolicyPackRepository::new(context.db.clone());
-    let runs = SeaOrmEvaluationRunRepository::new(context.db.clone());
-    let command = CreateEvaluationRunRequest {
-        organization_id,
-        target_id: request.target_id,
-        target_version: request.target_version,
-        policy_pack_id: request.policy_pack_id,
-        scenario_id: request.scenario_id,
-        rule_ids: request.rule_ids,
-        boundary_kind: request.boundary_kind,
-        external_run_id: request.external_run_id,
-        invocation_id: request.invocation_id,
-        max_duration_seconds: request.max_duration_seconds,
-    };
-    match CreateEvaluationRun::new(policy_repository, runs.clone(), runs)
-        .execute(command)
-        .await
-    {
-        Ok(run) => (
-            StatusCode::CREATED,
-            Json(CreatedEvaluationRun::new(run, endpoint)),
-        )
-            .into_response(),
-        Err(error) => database_error(error),
+    match request {
+        CreateEvaluationRequest::Live(request) => {
+            let use_case = RunTargetEvaluation::new(
+                SeaOrmTargetRepository::new(context.db.clone()),
+                SeaOrmPolicyPackRepository::new(context.db.clone()),
+                SeaOrmEvaluationRepository::new(context.db),
+                DefaultDriverRegistry::default(),
+            );
+            match use_case
+                .execute(
+                    organization_id,
+                    RunTargetEvaluationRequest {
+                        target_id: request.target_id,
+                        policy_pack_id: request.policy_pack_id,
+                        scenario: request.scenario,
+                    },
+                )
+                .await
+            {
+                Ok(run) => {
+                    (StatusCode::CREATED, Json(super::evaluation_view(&run))).into_response()
+                }
+                Err(error) => application_error(error),
+            }
+        }
+        CreateEvaluationRequest::Correlated(request) => {
+            let Some(endpoint) = context
+                .shared_store
+                .get::<RuntimeEndpoints>()
+                .map(|endpoints| endpoints.otlp_http)
+            else {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "telemetry endpoint configuration was not initialized",
+                );
+            };
+            let policies = SeaOrmPolicyPackRepository::new(context.db.clone());
+            let runs = SeaOrmEvaluationRunRepository::new(context.db.clone());
+            let command = CreateEvaluationRunRequest {
+                organization_id,
+                target_id: request.target_id,
+                target_version: request.target_version,
+                policy_pack_id: request.policy_pack_id,
+                scenario_id: request.scenario_id,
+                rule_ids: request.rule_ids,
+                boundary_kind: request.boundary_kind,
+                external_run_id: request.external_run_id,
+                invocation_id: request.invocation_id,
+                max_duration_seconds: request.max_duration_seconds,
+            };
+            match CreateEvaluationRun::new(policies, runs.clone(), runs)
+                .execute(command)
+                .await
+            {
+                Ok(run) => (
+                    StatusCode::CREATED,
+                    Json(CreatedEvaluationRun::new(run, endpoint)),
+                )
+                    .into_response(),
+                Err(error) => application_error(error),
+            }
+        }
     }
 }
 
@@ -503,8 +742,12 @@ async fn loco_rotate_telemetry_key(
     Path(target_id): Path<String>,
     Json(request): Json<RotateTelemetryKeyRequest>,
 ) -> Response {
-    let repository = SeaOrmEvaluationRunRepository::new(context.db);
-    match RotateTelemetryIngestKey::new(repository)
+    let Some(target_id) = parse_target_id(&target_id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid target identifier");
+    };
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let keys = SeaOrmEvaluationRunRepository::new(context.db);
+    match RotateTargetTelemetryIngestKey::new(targets, keys)
         .execute(
             super::default_organization_id(),
             target_id,
@@ -521,11 +764,21 @@ async fn loco_revoke_telemetry_key(
     State(context): State<AppContext>,
     Path(target_id): Path<String>,
 ) -> Response {
-    let repository = SeaOrmEvaluationRunRepository::new(context.db);
-    match repository
+    let Some(target_id) = parse_target_id(&target_id) else {
+        return problem(StatusCode::BAD_REQUEST, "invalid target identifier");
+    };
+    let organization_id = super::default_organization_id();
+    let targets = SeaOrmTargetRepository::new(context.db.clone());
+    let target = match targets.get(organization_id, target_id).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "target was not found"),
+        Err(error) => return application_error(error),
+    };
+    let keys = SeaOrmEvaluationRunRepository::new(context.db);
+    match keys
         .revoke_target_keys(
-            super::default_organization_id(),
-            &target_id,
+            organization_id,
+            &target.manifest.target_id,
             OffsetDateTime::now_utc(),
         )
         .await
@@ -550,20 +803,86 @@ fn parse_eval_run_id(value: &str) -> Option<EvalRunId> {
     Uuid::parse_str(value).ok().map(EvalRunId)
 }
 
+fn parse_target_id(value: &str) -> Option<TargetId> {
+    Uuid::parse_str(value).ok().map(TargetId)
+}
+
+fn percentage(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        let numerator = u32::try_from(numerator).unwrap_or(u32::MAX);
+        let denominator = u32::try_from(denominator).unwrap_or(u32::MAX);
+        100.0 * f64::from(numerator) / f64::from(denominator)
+    }
+}
+
+fn daily_activity(
+    runs: &[(OffsetDateTime, RunVerdict)],
+    now: OffsetDateTime,
+) -> Vec<ActivityPoint> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    (0..7)
+        .rev()
+        .map(|days_ago| {
+            let date = (now - time::Duration::days(days_ago)).date();
+            let mut point = ActivityPoint {
+                day: date.to_string(),
+                passed: 0,
+                failed: 0,
+                inconclusive: 0,
+            };
+            for (_, verdict) in runs
+                .iter()
+                .filter(|(created_at, _)| created_at.date() == date)
+            {
+                match verdict {
+                    RunVerdict::Pass => point.passed += 1,
+                    RunVerdict::Fail => point.failed += 1,
+                    RunVerdict::Inconclusive => point.inconclusive += 1,
+                }
+            }
+            point
+        })
+        .collect()
+}
+
 #[allow(clippy::needless_pass_by_value)] // Keeps match arms usable as direct error adapters.
-pub(crate) fn database_error(error: governance_application::ApplicationError) -> Response {
+fn application_error(error: ApplicationError) -> Response {
     let detail = error.to_string();
     let status = match error {
-        governance_application::ApplicationError::NotFound(_) => StatusCode::NOT_FOUND,
-        governance_application::ApplicationError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-        governance_application::ApplicationError::Conflict(_) => StatusCode::CONFLICT,
-        governance_application::ApplicationError::Forbidden(_) => StatusCode::FORBIDDEN,
-        governance_application::ApplicationError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-        governance_application::ApplicationError::Repository(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        ApplicationError::NotFound(_) => StatusCode::NOT_FOUND,
+        ApplicationError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        ApplicationError::Conflict(_) => StatusCode::CONFLICT,
+        ApplicationError::Forbidden(_) => StatusCode::FORBIDDEN,
+        ApplicationError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ApplicationError::Repository(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ApplicationError::TargetTransport(_) => StatusCode::BAD_GATEWAY,
+        ApplicationError::TargetTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        ApplicationError::TargetContract(_) => StatusCode::UNPROCESSABLE_ENTITY,
     };
     problem(status, &detail)
+}
+
+pub(crate) fn database_error(error: ApplicationError) -> Response {
+    application_error(error)
+}
+
+#[allow(clippy::needless_pass_by_value)] // Keeps direct driver error mapping concise.
+fn driver_error(error: DriverError) -> Response {
+    let status = match error {
+        DriverError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        DriverError::Transport | DriverError::Rejected(_) => StatusCode::BAD_GATEWAY,
+        DriverError::UnsafeConfiguration(_)
+        | DriverError::UnsupportedEvent
+        | DriverError::ResponseTooLarge
+        | DriverError::InvalidResponse
+        | DriverError::Contract(_)
+        | DriverError::MissingSecretReference(_) => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    problem(status, &error.to_string())
 }
 
 pub(crate) fn problem(status: StatusCode, detail: &str) -> Response {
@@ -580,4 +899,41 @@ pub(crate) fn problem(status: StatusCode, detail: &str) -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use time::macros::datetime;
+
+    use super::*;
+
+    #[test]
+    fn activity_groups_real_runs_into_the_last_seven_days() {
+        let now = datetime!(2026-08-13 12:00 UTC);
+        let points = daily_activity(
+            &[
+                (datetime!(2026-08-13 10:00 UTC), RunVerdict::Pass),
+                (datetime!(2026-08-13 11:00 UTC), RunVerdict::Fail),
+                (datetime!(2026-08-12 10:00 UTC), RunVerdict::Inconclusive),
+            ],
+            now,
+        );
+
+        assert_eq!(points.len(), 7);
+        assert_eq!(points[5].inconclusive, 1);
+        assert_eq!(points[6].passed, 1);
+        assert_eq!(points[6].failed, 1);
+    }
+
+    #[test]
+    fn application_errors_preserve_bad_request_and_conflict_statuses() {
+        assert_eq!(
+            application_error(ApplicationError::InvalidRequest("bad scenario".to_owned())).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            application_error(ApplicationError::Conflict("unapproved policy".to_owned())).status(),
+            StatusCode::CONFLICT
+        );
+    }
 }

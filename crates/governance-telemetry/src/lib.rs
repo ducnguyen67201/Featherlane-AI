@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use governance_domain::{
     Actor, ActorType, CompletionReason, EvalRunId, EventId, EventType, EvidenceBundle,
-    InvocationId, NormalizedEvent, OrganizationId, ScenarioId, TraceDefect, TraceQualityStatus,
+    InvocationId, NormalizedEvent, ObservedEvent, OrganizationId, ScenarioId, TraceDefect,
+    TraceQualityStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -199,6 +200,7 @@ impl Default for RedactionPolicy {
                 LEGACY_INVOCATION_ID.to_owned(),
                 LEGACY_SCENARIO_ID.to_owned(),
                 LEGACY_TERMINAL_STATE.to_owned(),
+                "terminal_state".to_owned(),
                 "decision".to_owned(),
                 "retry_attempt".to_owned(),
                 "service.name".to_owned(),
@@ -215,7 +217,81 @@ impl Default for RedactionPolicy {
     }
 }
 
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum NormalizationError {
+    #[error("inline evidence contains more than 1000 observations")]
+    TooManyObservations,
+    #[error("inline evidence contains an empty event name")]
+    EmptyEventName,
+}
+
+/// Converts untrusted wrapper observations into server-owned normalized events.
+///
+/// # Errors
+///
+/// Returns an error when the observation count exceeds the contract limit or
+/// an observation has no name.
+pub fn normalize_observations(
+    context: NormalizationContext,
+    trace_id: &str,
+    target_id: &str,
+    mut observations: Vec<ObservedEvent>,
+    policy: &RedactionPolicy,
+) -> Result<Vec<NormalizedEvent>, NormalizationError> {
+    if observations.len() > 1_000 {
+        return Err(NormalizationError::TooManyObservations);
+    }
+    if observations
+        .iter()
+        .any(|event| event.name.trim().is_empty())
+    {
+        return Err(NormalizationError::EmptyEventName);
+    }
+    let ids: Vec<EventId> = observations.iter().map(|_| EventId::new()).collect();
+    let root_id = ids.first().copied();
+    let now = OffsetDateTime::now_utc();
+    Ok(observations
+        .iter_mut()
+        .enumerate()
+        .map(|(index, observation)| {
+            redact_nested(&mut observation.input, &policy.sensitive_key_fragments);
+            redact_nested(&mut observation.output, &policy.sensitive_key_fragments);
+            policy.redact_attributes(&mut observation.attributes);
+            if observation.actor.id.trim().is_empty() {
+                target_id.clone_into(&mut observation.actor.id);
+            }
+            NormalizedEvent {
+                schema_version: "1.0".to_owned(),
+                organization_id: context.organization_id,
+                eval_run_id: context.eval_run_id,
+                invocation_id: context.invocation_id,
+                scenario_id: context.scenario_id,
+                trace_id: trace_id.to_owned(),
+                id: ids[index],
+                parent_event_id: if index == 0 { None } else { root_id },
+                linked_event_ids: Vec::new(),
+                sequence: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                started_at: now,
+                ended_at: Some(now),
+                actor: observation.actor.clone(),
+                event_type: observation.event_type,
+                name: observation.name.clone(),
+                input: observation.input.clone(),
+                output: observation.output.clone(),
+                attributes: observation.attributes.clone(),
+                source_span_id: None,
+                redacted: true,
+            }
+        })
+        .collect())
+}
+
 impl RedactionPolicy {
+    /// Removes secret-like keys recursively from an evidence value.
+    pub fn redact_value(&self, value: &mut Value) {
+        redact_nested(value, &self.sensitive_key_fragments);
+    }
+
     #[must_use]
     pub fn with_allowed_attributes(mut self, attributes: impl IntoIterator<Item = String>) -> Self {
         self.allowed_attributes.extend(attributes);
@@ -634,6 +710,67 @@ fn quality_from_defects(defects: &[TraceDefect]) -> TraceQualityStatus {
         TraceQualityStatus::Complete
     } else {
         TraceQualityStatus::Degraded
+    }
+}
+
+/// Finalizes already-normalized inline target observations into an evidence bundle.
+#[must_use]
+pub fn finalize_evidence(
+    context: NormalizationContext,
+    target_version: String,
+    terminal_state: Option<String>,
+    events: Vec<NormalizedEvent>,
+    side_effects: Vec<Value>,
+) -> EvidenceBundle {
+    let (trace_quality, trace_defects) = assess_trace_quality(&events);
+    let mut trace_ids = events
+        .iter()
+        .map(|event| event.trace_id.clone())
+        .collect::<Vec<_>>();
+    trace_ids.sort();
+    trace_ids.dedup();
+    let mut invocation_ids = events
+        .iter()
+        .map(|event| event.invocation_id)
+        .collect::<Vec<_>>();
+    invocation_ids.push(context.invocation_id);
+    invocation_ids.sort();
+    invocation_ids.dedup();
+    let completion_reason = terminal_state
+        .as_ref()
+        .map(|_| CompletionReason::TargetTerminalResponse);
+    let finalized_at = OffsetDateTime::now_utc();
+    let canonical = serde_json::to_vec(&(
+        "1.1",
+        target_version.as_str(),
+        &trace_ids,
+        &invocation_ids,
+        completion_reason,
+        terminal_state.as_deref(),
+        &events,
+        &side_effects,
+        &trace_defects,
+    ))
+    .unwrap_or_default();
+    let evidence_sha256 = format!("{:x}", Sha256::digest(canonical));
+    EvidenceBundle {
+        schema_version: "1.1".to_owned(),
+        organization_id: context.organization_id,
+        eval_run_id: context.eval_run_id,
+        invocation_id: context.invocation_id,
+        invocation_ids,
+        scenario_id: context.scenario_id,
+        target_version,
+        policy_content_sha256: String::new(),
+        trace_ids,
+        completion_reason,
+        terminal_state,
+        events,
+        side_effects,
+        trace_quality,
+        trace_defects,
+        finalized_at: Some(finalized_at),
+        evidence_sha256,
     }
 }
 
@@ -1135,6 +1272,72 @@ mod tests {
                 .trace_defects
                 .iter()
                 .any(|defect| defect.code == "causal_cycle")
+        );
+    }
+
+    #[test]
+    fn inline_normalization_owns_context_and_redacts_nested_secrets() {
+        let context = NormalizationContext {
+            organization_id: OrganizationId::new(),
+            eval_run_id: EvalRunId::new(),
+            invocation_id: InvocationId::new(),
+            scenario_id: ScenarioId::new(),
+        };
+        let observations = vec![ObservedEvent {
+            event_type: EventType::FinalOutput,
+            name: "done".to_owned(),
+            actor: Actor {
+                actor_type: ActorType::Agent,
+                id: String::new(),
+            },
+            input: serde_json::json!({"nested": {"api_key": "remove", "safe": true}}),
+            output: serde_json::json!({"token": "remove", "message": "ok"}),
+            attributes: BTreeMap::from([
+                ("terminal_state".to_owned(), serde_json::json!("completed")),
+                ("raw.prompt".to_owned(), serde_json::json!("remove")),
+            ]),
+        }];
+        let events = normalize_observations(
+            context,
+            "server-trace",
+            "registered-target",
+            observations,
+            &RedactionPolicy::default(),
+        )
+        .expect("observations should normalize");
+        assert_eq!(events[0].organization_id, context.organization_id);
+        assert_eq!(events[0].eval_run_id, context.eval_run_id);
+        assert_eq!(events[0].trace_id, "server-trace");
+        assert_eq!(events[0].actor.id, "registered-target");
+        assert_eq!(
+            events[0].input,
+            serde_json::json!({"nested": {"safe": true}})
+        );
+        assert_eq!(events[0].output, serde_json::json!({"message": "ok"}));
+        assert_eq!(
+            events[0].attributes,
+            BTreeMap::from([("terminal_state".to_owned(), serde_json::json!("completed"))])
+        );
+    }
+
+    #[test]
+    fn side_effect_values_are_recursively_redacted() {
+        let mut side_effect = serde_json::json!({
+            "destination": "sandbox-ledger",
+            "request": {
+                "authorization": "Bearer remove",
+                "payload": [{"api_key": "remove", "amount": 700}]
+            }
+        });
+
+        RedactionPolicy::default().redact_value(&mut side_effect);
+
+        assert_eq!(
+            side_effect,
+            serde_json::json!({
+                "destination": "sandbox-ledger",
+                "request": {"payload": [{"amount": 700}]}
+            })
         );
     }
 }

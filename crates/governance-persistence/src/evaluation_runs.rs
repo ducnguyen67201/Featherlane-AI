@@ -102,6 +102,9 @@ impl EvaluationRunRepository for SeaOrmEvaluationRunRepository {
     ) -> Result<Vec<EvaluationRun>, ApplicationError> {
         eval_runs::Entity::find()
             .filter(eval_runs::Column::OrganizationId.eq(organization_id.0))
+            .filter(eval_runs::Column::PolicyPackId.is_not_null())
+            .filter(eval_runs::Column::ScenarioId.is_not_null())
+            .filter(eval_runs::Column::PrimaryInvocationId.is_not_null())
             .order_by_desc(eval_runs::Column::CreatedAt)
             .all(&self.database)
             .await

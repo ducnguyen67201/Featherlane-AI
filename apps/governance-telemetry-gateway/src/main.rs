@@ -399,9 +399,11 @@ fn ingest_error(error: &ApplicationError) -> GatewayError {
         }
         ApplicationError::Forbidden(_) => GatewayError::Unauthorized,
         ApplicationError::Conflict(_) => GatewayError::Conflict,
-        ApplicationError::Repository(_) | ApplicationError::Unavailable(_) => {
-            GatewayError::Unavailable(error.to_string())
-        }
+        ApplicationError::Repository(_)
+        | ApplicationError::Unavailable(_)
+        | ApplicationError::TargetTransport(_)
+        | ApplicationError::TargetTimeout(_)
+        | ApplicationError::TargetContract(_) => GatewayError::Unavailable(error.to_string()),
     }
 }
 
@@ -474,5 +476,36 @@ mod tests {
             approval.spans[0].trace_id
         );
         assert_ne!(execution.spans[0].trace_id, approval.spans[0].trace_id);
+    }
+
+    #[test]
+    fn passive_fixture_uses_external_session_and_terminal_without_eval_run_id() {
+        let execution: ExportTraceServiceRequest = serde_json::from_slice(include_bytes!(
+            "../../../fixtures/otlp/passive-session/02-execution-terminal.json"
+        ))
+        .expect("passive execution fixture");
+        let execution = convert_request(execution);
+
+        assert_eq!(execution.rejected, 0);
+        assert_eq!(execution.spans.len(), 2);
+        assert_eq!(
+            execution.spans[0]
+                .resource_attributes
+                .get("featherlane.external_run.id")
+                .and_then(serde_json::Value::as_str),
+            Some("session-placeholder")
+        );
+        assert!(
+            !execution.spans[0]
+                .attributes
+                .contains_key("featherlane.eval_run.id")
+        );
+        assert_eq!(
+            execution.spans[1]
+                .attributes
+                .get("featherlane.run.terminal")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 }
